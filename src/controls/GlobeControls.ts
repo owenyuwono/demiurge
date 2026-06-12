@@ -21,14 +21,13 @@ const _DEFAULT_AXIS = new Vector3(0, 1, 0)
 const _ORIGIN = new Vector3(0, 0, 0)
 
 // Tunables -----------------------------------------------------------------------
-const PLANET_R      = 20_000
-const DEFAULT_MIN_ALT = 500
-const DEFAULT_MAX_ALT = 160_000  // 8 × radius
+const DEFAULT_PLANET_R  = 20_000
+const DEFAULT_MIN_ALT   = 500
+const DEFAULT_MAX_ALT   = 160_000  // 8 × default radius
 
 const DRAG_RAD_PER_PX  = 0.0035  // base angular sensitivity
-const DIST_FACTOR_MIN  = 0.02
+const DIST_FACTOR_MIN  = 0.004
 const DIST_FACTOR_MAX  = 1.2
-const DIST_FACTOR_REF  = 20_000  // altitude at which distFactor = 1.0
 
 const INERTIA_K  = 4.5  // exponential decay constant for angular velocity coasting
 const ZOOM_K     = 7.0  // exponential damp constant for r → targetR
@@ -53,6 +52,7 @@ export class GlobeControls {
   private readonly _opts: {
     getAltitude?: (pos: Vector3) => number
     getPolarAxis?: () => Vector3
+    radius:       number
     minAltitude:  number
     maxAltitude:  number
   }
@@ -99,6 +99,7 @@ export class GlobeControls {
     opts?: {
       getAltitude?: (pos: Vector3) => number
       getPolarAxis?: () => Vector3
+      radius?: number
       minAltitude?: number
       maxAltitude?: number
     },
@@ -108,6 +109,7 @@ export class GlobeControls {
     this._opts   = {
       getAltitude:  opts?.getAltitude,
       getPolarAxis: opts?.getPolarAxis,
+      radius:       opts?.radius       ?? DEFAULT_PLANET_R,
       minAltitude:  opts?.minAltitude  ?? DEFAULT_MIN_ALT,
       maxAltitude:  opts?.maxAltitude  ?? DEFAULT_MAX_ALT,
     }
@@ -164,9 +166,9 @@ export class GlobeControls {
     // ---- Altitude for distFactor --------------------------------------------
     const rawAlt = this._opts.getAltitude
       ? this._opts.getAltitude(cam.position)
-      : (this._r - PLANET_R)
+      : (this._r - this._opts.radius)
     const altitude   = Math.max(rawAlt, 1)
-    const distFactor = Math.min(Math.max(altitude / DIST_FACTOR_REF, DIST_FACTOR_MIN), DIST_FACTOR_MAX)
+    const distFactor = Math.min(Math.max(altitude / this._opts.radius, DIST_FACTOR_MIN), DIST_FACTOR_MAX)
 
     // ---- Keyboard angular input ---------------------------------------------
     if (!this._isDragging) {
@@ -202,7 +204,7 @@ export class GlobeControls {
     // Re-clamp altitude against live terrain so we don't clip mountains
     const liveAlt = this._opts.getAltitude
       ? this._opts.getAltitude(cam.position)
-      : (this._r - PLANET_R)
+      : (this._r - this._opts.radius)
     if (liveAlt < this._opts.minAltitude) {
       // Push r out to honour minAltitude
       const surfR = this._r - liveAlt            // approx surface radius at camera column
@@ -267,7 +269,7 @@ export class GlobeControls {
     _s.e2.crossVectors(_s.a, _s.e1)
 
     const r = pos.length()
-    if (r < 1e-6) return { r: PLANET_R + DEFAULT_MIN_ALT, theta: 0, phi: Math.PI / 2 }
+    if (r < 1e-6) return { r: this._opts.radius + this._opts.minAltitude, theta: 0, phi: Math.PI / 2 }
 
     _s.p.copy(pos).divideScalar(r)  // unit direction p̂
     const cosPhiVal = Math.min(Math.max(_s.p.dot(_s.a), -1), 1)
@@ -311,9 +313,9 @@ export class GlobeControls {
     // which was last set in update(). Approximate is fine here.
     const approxAlt  = this._opts.getAltitude
       ? this._opts.getAltitude(this._camera.position)
-      : (this._r - PLANET_R)
+      : (this._r - this._opts.radius)
     const distFactor = Math.min(
-      Math.max(Math.max(approxAlt, 1) / DIST_FACTOR_REF, DIST_FACTOR_MIN),
+      Math.max(Math.max(approxAlt, 1) / this._opts.radius, DIST_FACTOR_MIN),
       DIST_FACTOR_MAX,
     )
 
@@ -357,7 +359,7 @@ export class GlobeControls {
     // Current altitude estimate (use last known r)
     const approxAlt = this._opts.getAltitude
       ? this._opts.getAltitude(this._camera.position)
-      : (this._r - PLANET_R)
+      : (this._r - this._opts.radius)
     const clampedAlt = Math.max(approxAlt, 1)
 
     // Approximate local surface radius

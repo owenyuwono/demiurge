@@ -4,8 +4,8 @@ import { Planet } from './planet/Planet.js'
 import { GlobeControls } from './controls/GlobeControls.js'
 import { Hud } from './debug/Hud.js'
 
-const RADIUS = 20_000
-const HEIGHT_SCALE = 400
+const RADIUS = 50_000
+const HEIGHT_SCALE = 1_200
 
 function getSeedFromUrl(): number {
   const params = new URLSearchParams(window.location.search)
@@ -20,7 +20,7 @@ function getSeedFromUrl(): number {
 async function main(): Promise<void> {
   // --- Renderer ---
   // logarithmicDepthBuffer: true ensures good depth precision across the large
-  // near=2 / far=300_000 range on both WebGPU and the WebGL2 fallback backend.
+  // near=2 / far=RADIUS*15 range on both WebGPU and the WebGL2 fallback backend.
   const renderer = new THREE.WebGPURenderer({
     antialias: true,
     logarithmicDepthBuffer: true,
@@ -52,7 +52,7 @@ async function main(): Promise<void> {
 
   // --- Planet ---
   let seed = getSeedFromUrl()
-  const planet = new Planet({ seed, radius: RADIUS, heightScale: HEIGHT_SCALE })
+  const planet = new Planet({ seed, radius: RADIUS, heightScale: HEIGHT_SCALE, maxDepth: 12 })
   scene.add(planet)
 
   // Axial tilt: local Y is the spin axis; tilting Z by 23.4° makes the orbit Earth-like.
@@ -63,7 +63,7 @@ async function main(): Promise<void> {
   const POLAR_AXIS = new THREE.Vector3(0, 1, 0).applyQuaternion(planet.quaternion)
 
   // --- Camera ---
-  const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 2, 300_000)
+  const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.5, RADIUS * 15)
   camera.position.set(0, 0, RADIUS * 3)
   camera.lookAt(0, 0, 0)
 
@@ -71,7 +71,8 @@ async function main(): Promise<void> {
   const controls = new GlobeControls(camera, renderer.domElement, {
     getAltitude: (pos) => pos.length() - planet.getSurfaceRadiusAt(pos),
     getPolarAxis: () => POLAR_AXIS,
-    minAltitude: 500,
+    radius: RADIUS,
+    minAltitude: 30,
     maxAltitude: RADIUS * 8,
   })
 

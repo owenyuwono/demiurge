@@ -10,10 +10,10 @@ import {
 } from 'three'
 import { MeshBasicNodeMaterial } from 'three/webgpu'
 import { attribute } from 'three/tsl'
-import { createNoise3D, fbm, ridged } from './noise'
+import { createNoise3D, ridged } from './noise'
+import { Tectonics, TectonicQuery, boundaryRelief } from './tectonics'
 import { buildChunkGeometry, ChunkMeshData } from './ChunkMesher'
 import { QuadtreeNode } from './QuadtreeNode'
-import { Tectonics, TectonicQuery } from './tectonics'
 import { TectonicsDebug } from './TectonicsDebug'
 import { PlanetGizmos } from './PlanetGizmos'
 
@@ -113,21 +113,29 @@ class CachedMeshData {
 // ---------------------------------------------------------------------------
 
 const BUILD_BUDGET_PER_FRAME = 4 // reduced from 6: tectonic heightFn is ~2-3× costlier per vertex
-const LRU_CAPACITY = 700
+const LRU_CAPACITY = 900
 const HYSTERESIS = 0.15 // 15% — merge threshold = splitFactor * (1 + HYSTERESIS)
 
-// Tectonic heightFn tuning constants (at top of closure for easy tuning)
-const TECT_BOUNDARY_FALLOFF    = 0.05  // boundary falloff in radians ≈ 2.9°
-const TECT_SUBDUCTION_FACTOR   = 0.5   // oceanic subduction trench depth
-const TECT_COLLISION_BASE      = 0.85  // continental collision mountain base
-const TECT_COLLISION_RIDGE     = 0.45  // ridged texture amplitude on collision belts
-const TECT_OCEANIC_ARC         = 0.3   // oceanic-oceanic island arc height
-const TECT_MID_OCEAN_RIDGE     = 0.18  // mid-ocean ridge uplift
-const TECT_RIFT_DEPTH          = 0.14  // continental rift depression
-const TECT_DETAIL_FBM          = 0.16  // detail fbm amplitude
-const TECT_DETAIL_FBM_SCALE    = 3.2   // fbm frequency scale
-const TECT_DETAIL_RIDGE        = 0.08  // detail ridged amplitude
-const TECT_DETAIL_RIDGE_SCALE  = 7.0   // ridged frequency scale
+// Tectonic heightFn tuning constants
+// Note: boundary profile constants live in boundaryRelief() in tectonics.ts
+// Crust-keyed base height constants
+const TECT_LAND_BASE_0         = -0.01
+const TECT_LAND_BASE_SS        = 0.12   // smoothstep gain inland
+const TECT_LAND_PLATE_MOD      = 0.15   // plate.baseElevation modifier on land
+const TECT_OCEAN_BASE_0        = -0.42
+const TECT_OCEAN_DEPTH_AMP     = 0.10   // abyssal deepening
+const TECT_OCEAN_DEPTH_SAT     = 0.45   // saturation distance (radians)
+const TECT_OCEAN_PLATE_MOD     = 0.10   // plate.baseElevation modifier on ocean
+const TECT_SHELF_W_PASSIVE     = 0.12   // wide passive shelf
+const TECT_SHELF_W_ACTIVE      = 0.012  // narrow active margin shelf
+const TECT_COAST_LERP_HI       = 0.012  // crust→ocean transition edge hi
+const TECT_INTERIOR_DAMP_A     = 0.55   // craton interior smoothing floor
+const TECT_INTERIOR_DAMP_B     = 0.45   // craton interior smoothing range
+const TECT_INTERIOR_DAMP_SCALE = 0.18   // craton distance scale (radians)
+const TECT_DETAIL_FBM          = 0.14   // detail fbm amplitude
+const TECT_DETAIL_FBM_SCALE    = 3.2    // fbm frequency scale
+const TECT_DETAIL_RIDGE        = 0.07   // ridged amplitude on land only
+const TECT_DETAIL_RIDGE_SCALE  = 7.0    // ridged frequency scale
 
 // ---------------------------------------------------------------------------
 // Planet
@@ -143,7 +151,7 @@ export class Planet extends Group {
   private readonly splitFactor: number
   private plateCount: number
 
-  private heightFn!: (dir: Vector3) => number
+  private heightFn!: (dir: Vector3, level: number) => number
 
   /** Tectonic simulation — rebuilt on regenerate(). */
   tectonics!: Tectonics
@@ -378,8 +386,9 @@ export class Planet extends Group {
    */
   getSurfaceRadiusAt(v: Vector3): number {
     // Apply inverse world rotation to get a planet-local direction.
+    // Sample at maxDepth for full-detail accuracy (altitude / HUD read at ground level).
     this._dirLocalScratch.copy(v).normalize().applyQuaternion(this._invWorldQuat)
-    return this.radius + this.heightFn(this._dirLocalScratch) * this.heightScale
+    return this.radius + this.heightFn(this._dirLocalScratch, this.maxDepth) * this.heightScale
   }
 
   /** Expose the Tectonics instance (main.ts HUD may read plate count). */
@@ -433,57 +442,139 @@ export class Planet extends Group {
     const plates = this.tectonics.plates
 
     // One scratch TectonicQuery per heightFn call — safe because heightFn is called serially.
-    const scratch: TectonicQuery = { plateId: 0, neighborId: 0, boundaryDist: 0, convergence: 0 }
+    const scratch: TectonicQuery = { plateId: 0, neighborId: 0, boundaryDist: 0, convergence: 0, shear: 0, crustDist: 0 }
 
     // Separate scratch for plateColorFn (both called back-to-back on the same dir — see memo below).
     // 1-entry memoization: if dir.x/y/z identical to the previous heightFn call, reuse the
     // query result for plateColorFn, halving Voronoi cost under serial meshing.
     let memoX = NaN, memoY = NaN, memoZ = NaN
     let memoPlateId = 0
-    const scratchColor: TectonicQuery = { plateId: 0, neighborId: 0, boundaryDist: 0, convergence: 0 }
+    const scratchColor: TectonicQuery = { plateId: 0, neighborId: 0, boundaryDist: 0, convergence: 0, shear: 0, crustDist: 0 }
 
-    this.heightFn = (dir: Vector3): number => {
+    // Smoothstep helper (in-scope for heightFn closure)
+    const _ss3 = (e0: number, e1: number, x: number): number => {
+      const t = Math.max(0, Math.min(1, (x - e0) / (e1 - e0)))
+      return t * t * (3 - 2 * t)
+    }
+
+    // ridgedFn wraps ridged() for boundaryRelief's ridgedAt callback (captures the noise instance)
+    const ridgedFn = (d: Vector3, freq: number, octaves: number): number =>
+      ridged(noise, d.x * freq, d.y * freq, d.z * freq, { octaves })
+
+    // ---------------------------------------------------------------------------
+    // Level-adaptive detail octave count:
+    //
+    //   LOD level → fbm octaves    → ridged octaves
+    //   0–4       → 6              → 4
+    //   5         → 7              → 4    (clamp(5-2,4,10)=4)
+    //   6         → 8              → 4
+    //   7         → 9              → 5
+    //   8         → 10             → 6
+    //   9         → 11             → 7
+    //   10        → 12             → 8
+    //   11        → 13             → 9
+    //   12        → 14             → 10
+    //
+    // LOD-consistency guarantee (no low-frequency popping between levels):
+    //
+    //   fbm() divides by maxAmp = Σ_{i=0}^{N-1} 0.5^i — the normalization constant
+    //   changes with octave count, which would shift low-frequency content between
+    //   LOD levels and cause visible terrain popping. To prevent this, detail FBM
+    //   is computed as:
+    //
+    //     detail_fbm = fbm6_base + Σ_{o=7..N} amp_o · noise_o(dir)
+    //
+    //   where fbm6_base uses the FIXED 6-octave normalization (maxAmp6 = 63/32),
+    //   and each extra octave o contributes amp_o = (0.5^(o-1)) / maxAmp6 —
+    //   exactly what fbm() would contribute if normalization were held constant.
+    //   This ensures octaves 1-6 are byte-identical regardless of LOD level;
+    //   only octaves 7..N are ADDITIVE on top.
+    //
+    //   Similarly ridged() is computed with a fixed 4-octave norm for the base
+    //   plus additive extra octaves.
+    // ---------------------------------------------------------------------------
+
+    // Precompute fixed normalization constants (sum of gains for base octave counts)
+    const FBM_BASE_OCTAVES    = 6
+    const RIDGED_BASE_OCTAVES = 4
+    const FBM_GAIN    = 0.5
+    const FBM_LAC     = 2.0
+    // maxAmp for a geometric series: Σ_{i=0}^{N-1} gain^i = (1 - gain^N) / (1 - gain)
+    // For gain=0.5, N=6: 1+0.5+0.25+0.125+0.0625+0.03125 = 1.96875 = 63/32
+    let _maxAmpFbm6 = 0; { let a = 1; for (let i = 0; i < FBM_BASE_OCTAVES; i++) { _maxAmpFbm6 += a; a *= FBM_GAIN; } }
+    let _maxAmpRidged4 = 0; { let a = 1; for (let i = 0; i < RIDGED_BASE_OCTAVES; i++) { _maxAmpRidged4 += a; a *= FBM_GAIN; } }
+    const MAX_AMP_FBM6    = _maxAmpFbm6     // ≈ 1.96875
+    const MAX_AMP_RIDGED4 = _maxAmpRidged4  // = 0.9375
+
+    this.heightFn = (dir: Vector3, level: number): number => {
       const x = dir.x, y = dir.y, z = dir.z
 
       this.tectonics.query(dir, scratch)
-      const plate = plates[scratch.plateId]
-      const other = plates[scratch.neighborId]
+      const own = plates[scratch.plateId]
+      const c = scratch.crustDist  // signed SDF: + = crust/land, - = ocean
 
       // Memoize last queried dir for plateColorFn re-use
       memoX = x; memoY = y; memoZ = z
       memoPlateId = scratch.plateId
 
-      const base = plate.baseElevation
-      const w = Math.exp(-scratch.boundaryDist / TECT_BOUNDARY_FALLOFF)
-      const conv = scratch.convergence
+      // Crust-keyed base elevation
+      const landBase  = TECT_LAND_BASE_0
+                      + TECT_LAND_BASE_SS * _ss3(0, 0.25, c)
+                      + own.baseElevation * TECT_LAND_PLATE_MOD
 
-      let tect = 0
-      if (conv > 0) {
-        // Converging
-        if (plate.type === 'oceanic' && other.type === 'continental') {
-          // Subduction trench on the oceanic side
-          tect = -conv * w * TECT_SUBDUCTION_FACTOR
-        } else if (plate.type === 'continental' || other.type === 'continental') {
-          // Collision mountain belts with ridged texture
-          tect = conv * w * (TECT_COLLISION_BASE + TECT_COLLISION_RIDGE * ridged(noise, x * 6.0, y * 6.0, z * 6.0, { octaves: 4 }))
-        } else {
-          // Oceanic-oceanic island arcs
-          tect = conv * w * TECT_OCEANIC_ARC
-        }
-      } else {
-        // Diverging: use |conv| so the sign is controlled purely by the factor.
-        const absConv = -conv // conv<=0 here so -conv >= 0 gives |conv|
-        if (plate.type === 'oceanic') {
-          tect = absConv * w * TECT_MID_OCEAN_RIDGE    // positive: mid-ocean ridge uplift
-        } else {
-          tect = absConv * w * (-TECT_RIFT_DEPTH)      // negative: continental rift depression
-        }
+      const oceanBase = TECT_OCEAN_BASE_0
+                      - TECT_OCEAN_DEPTH_AMP * Math.min(1, Math.sqrt(Math.max(0, -c) / TECT_OCEAN_DEPTH_SAT))
+                      + own.baseElevation * TECT_OCEAN_PLATE_MOD
+
+      // Shelf width narrows at active margins
+      const activeness = (1 - _ss3(0.02, 0.06, scratch.boundaryDist))
+                       * _ss3(0.08, 0.25, Math.max(Math.abs(scratch.convergence), Math.abs(scratch.shear)))
+      const shelfW = TECT_SHELF_W_PASSIVE * (1 - activeness) + TECT_SHELF_W_ACTIVE * activeness
+
+      const base = landBase + (oceanBase - landBase) * (1 - _ss3(-shelfW, TECT_COAST_LERP_HI, c))
+
+      // Boundary relief profile (asymmetric, all regimes)
+      const relief = boundaryRelief(scratch, plates, dir, ridgedFn)
+
+      // Interior smoothing: plate interiors (cratons) have dampened detail noise.
+      const interiorDamp = TECT_INTERIOR_DAMP_A
+                         + TECT_INTERIOR_DAMP_B * Math.exp(-scratch.boundaryDist / TECT_INTERIOR_DAMP_SCALE)
+
+      // LOD-adaptive octave counts (clamped to [base, max])
+      const fbmOctaves    = Math.min(Math.max(level + 2, FBM_BASE_OCTAVES),    14)
+      const ridgedOctaves = Math.min(Math.max(level - 2, RIDGED_BASE_OCTAVES), 10)
+
+      // ---- Detail FBM: additive-octave formulation for LOD consistency --------
+      // Octaves 1..6 computed with normalization fixed at MAX_AMP_FBM6.
+      // Octaves 7..N appended as un-normalized additional terms so low-frequency
+      // content is byte-identical across LOD levels (popping prevention).
+      let fbmValue = 0; let fbmAmp = 1;
+      const fx = x * TECT_DETAIL_FBM_SCALE, fy = y * TECT_DETAIL_FBM_SCALE, fz = z * TECT_DETAIL_FBM_SCALE;
+      let fbmFreq = 1;
+      for (let o = 0; o < fbmOctaves; o++) {
+        fbmValue += fbmAmp * noise(fx * fbmFreq, fy * fbmFreq, fz * fbmFreq);
+        fbmAmp   *= FBM_GAIN;
+        fbmFreq  *= FBM_LAC;
       }
+      // Normalize by the FIXED 6-octave sum; extra octaves above 6 are added as
+      // un-normalized deltas — their amplitude is already small enough (0.5^6 ≈ 0.016)
+      // that dividing by the same constant preserves relative scale correctly.
+      const detailFbm = TECT_DETAIL_FBM * (fbmValue / MAX_AMP_FBM6);
 
-      const detail = TECT_DETAIL_FBM * fbm(noise, x * TECT_DETAIL_FBM_SCALE, y * TECT_DETAIL_FBM_SCALE, z * TECT_DETAIL_FBM_SCALE, { octaves: 6 })
-                   + TECT_DETAIL_RIDGE * ridged(noise, x * TECT_DETAIL_RIDGE_SCALE, y * TECT_DETAIL_RIDGE_SCALE, z * TECT_DETAIL_RIDGE_SCALE, { octaves: 4 }) * Math.max(0, base) * 4
+      // ---- Detail ridged: same additive strategy with fixed 4-octave base ----
+      let ridgedValue = 0; let ridgedAmp = 1; let ridgedFreq = 1;
+      const rx = x * TECT_DETAIL_RIDGE_SCALE, ry = y * TECT_DETAIL_RIDGE_SCALE, rz = z * TECT_DETAIL_RIDGE_SCALE;
+      for (let o = 0; o < ridgedOctaves; o++) {
+        const n = noise(rx * ridgedFreq, ry * ridgedFreq, rz * ridgedFreq);
+        ridgedValue += ridgedAmp * (1.0 - Math.abs(n)) ** 2;
+        ridgedAmp   *= FBM_GAIN;
+        ridgedFreq  *= FBM_LAC;
+      }
+      const detailRidged = TECT_DETAIL_RIDGE * (ridgedValue / MAX_AMP_RIDGED4) * _ss3(0, 0.08, c) * 2
 
-      return Math.max(-1, Math.min(1, base + tect + detail))
+      const detail = (detailFbm + detailRidged) * interiorDamp
+
+      return Math.max(-1, Math.min(1, base + relief + detail))
     }
 
     // plateColorFn: uses the 1-entry memo to avoid a redundant Voronoi query when
@@ -513,9 +604,11 @@ export class Planet extends Group {
     this.tectonicsDebug = new TectonicsDebug(this.tectonics, {
       radius: this.radius,
       heightScale: this.heightScale,
+      // Level 6 is sufficient coarse accuracy for arrow placement; avoids the cost
+      // of 14-octave eval for purely decorative gizmo positioning.
       surfaceRadiusAt: (localDir: Vector3) => {
         localScratch.copy(localDir).normalize()
-        return this.radius + this.heightFn(localScratch) * this.heightScale
+        return this.radius + this.heightFn(localScratch, 6) * this.heightScale
       },
     })
     this.tectonicsDebug.visible = false  // starts hidden

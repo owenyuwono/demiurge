@@ -13,8 +13,13 @@ export interface ChunkParams {
   resolution: number;   // quads per side; vertex grid is (res+1)²
   radius:     number;
   heightScale: number;
-  /** height in [-1,1] given a UNIT sphere direction; multiplied by heightScale for world displacement */
-  heightFn:   (dir: Vector3) => number;
+  /**
+   * height in [-1,1] given a UNIT sphere direction and LOD level.
+   * The level drives the detail-octave count so fine noise is only computed
+   * for chunks where it contributes visible geometry (≥ ~1 m quads at level 12).
+   * multiplied by heightScale for world displacement.
+   */
+  heightFn:   (dir: Vector3, level: number) => number;
   /** optional plate color: returns [r,g,b] in [0,1] for a given unit sphere direction */
   plateColorFn?: (dir: Vector3) => readonly [number, number, number];
 }
@@ -75,7 +80,7 @@ function evalVertex(
   res: number,
   radius: number,
   heightScale: number,
-  heightFn: (dir: Vector3) => number,
+  heightFn: (dir: Vector3) => number,  // pre-bound to the chunk's LOD level
   outDir: Vector3,   // receives unit sphere direction
   outWorld: Vector3, // receives world position
 ): number {
@@ -90,38 +95,129 @@ function evalVertex(
 
 // ---------------------------------------------------------------------------
 // Vertex color from elevation and slope
+//
+// Band table (e = normalized elevation, 0 = sea level):
+//
+//  OCEAN (e < 0):
+//   e < −0.55          abyssal       #16202e  very dark navy
+//  −0.55..−0.18        deep ocean    →#1d3a52  mid blue
+//  −0.18..−0.045       cont. slope   →#2e5a74  steel blue
+//  −0.045..0           shelf         →#4d8a96  cyan-teal (waterline ≤0.004 window)
+//
+//  LAND (e ≥ 0):
+//   0..0.012           sand          #b8a36e
+//   0.012..0.18        lowland       →#5a7a4a  desaturated green
+//   0.18..0.42         highland      →#8a7a55  brown-tan
+//   0.42..0.62         bare rock     →#7a7060  grey-brown
+//   e > 0.55 (blend)   snow          →#e6e8eb  near-white (full by 0.62)
+//
+//  SLOPE override (land only, slope > 0.22): blend toward rock #6e6a64
 // ---------------------------------------------------------------------------
+
+function clamp01(x: number): number {
+  return x < 0 ? 0 : x > 1 ? 1 : x;
+}
+
+function lerp(a: number, b: number, t: number): number {
+  return a + (b - a) * t;
+}
 
 function elevationColor(e: number, slope: number, out: Float32Array, base: number): void {
   let r: number, g: number, b: number;
 
-  if (e < -0.08) {
-    // Ocean floor: desaturated blue-grey — reads as ocean basin in normal view
-    r = 0.22; g = 0.28; b = 0.38;
-  } else if (e < -0.05) {
-    // Shallow transition from ocean floor toward muted basin
-    const t = (e + 0.08) / 0.03; // [0, 1]
-    r = 0.22 + (0.38 - 0.22) * t;
-    g = 0.28 + (0.33 - 0.28) * t;
-    b = 0.38 + (0.28 - 0.38) * t;
-  } else if (e > 0.55) {
-    // Snow-capped peaks: near white
-    r = 0.90; g = 0.91; b = 0.93;
-  } else {
-    // Midlands: desaturated green-brown ramp, e ∈ [-0.05, 0.55]
-    const t = (e + 0.05) / 0.60; // [0, 1]
-    // Low: olive-tan, high: dusty sage-green
-    r = 0.46 - t * 0.06;
-    g = 0.44 + t * 0.05;
-    b = 0.30 - t * 0.06;
-  }
+  if (e < 0) {
+    // ---- OCEAN -------------------------------------------------------
+    // Abyssal #16202e
+    const rAby = 0x16 / 255, gAby = 0x20 / 255, bAby = 0x2e / 255;
+    // Deep   #1d3a52
+    const rDep = 0x1d / 255, gDep = 0x3a / 255, bDep = 0x52 / 255;
+    // Slope  #2e5a74
+    const rSlp = 0x2e / 255, gSlp = 0x5a / 255, bSlp = 0x74 / 255;
+    // Shelf  #4d8a96
+    const rShf = 0x4d / 255, gShf = 0x8a / 255, bShf = 0x96 / 255;
 
-  // Blend toward rock-grey on steep slopes
-  if (slope > 0.25) {
-    const rockBlend = Math.min((slope - 0.25) / 0.35, 1.0);
-    r = r + (0.42 - r) * rockBlend;
-    g = g + (0.38 - g) * rockBlend;
-    b = b + (0.34 - b) * rockBlend;
+    if (e < -0.55) {
+      // pure abyssal
+      r = rAby; g = gAby; b = bAby;
+    } else if (e < -0.18) {
+      // abyssal → deep  (window ~0.015 around −0.55)
+      const t = clamp01((e + 0.55) / 0.015);
+      r = lerp(rAby, rDep, t);
+      g = lerp(gAby, gDep, t);
+      b = lerp(bAby, bDep, t);
+    } else if (e < -0.045) {
+      // deep → cont. slope  (window 0.015 around −0.18)
+      const t = clamp01((e + 0.18) / 0.015);
+      r = lerp(rDep, rSlp, t);
+      g = lerp(gDep, gSlp, t);
+      b = lerp(bDep, bSlp, t);
+    } else {
+      // cont. slope → shelf  (window 0.015 around −0.045)
+      // but shelf→waterline kept crisp: transition window ≤ 0.004 handled at e≥0
+      const t = clamp01((e + 0.045) / 0.015);
+      r = lerp(rSlp, rShf, t);
+      g = lerp(gSlp, gShf, t);
+      b = lerp(bSlp, bShf, t);
+    }
+
+  } else {
+    // ---- LAND --------------------------------------------------------
+    // Sand      #b8a36e
+    const rSnd = 0xb8 / 255, gSnd = 0xa3 / 255, bSnd = 0x6e / 255;
+    // Lowland   #5a7a4a
+    const rLow = 0x5a / 255, gLow = 0x7a / 255, bLow = 0x4a / 255;
+    // Highland  #8a7a55
+    const rHig = 0x8a / 255, gHig = 0x7a / 255, bHig = 0x55 / 255;
+    // Bare rock #7a7060
+    const rRck = 0x7a / 255, gRck = 0x70 / 255, bRck = 0x60 / 255;
+    // Snow      #e6e8eb
+    const rSnw = 0xe6 / 255, gSnw = 0xe8 / 255, bSnw = 0xeb / 255;
+
+    if (e < 0.012) {
+      // shelf→sand: crisp waterline transition window = 0.004
+      const t = clamp01(e / 0.004);
+      // shelf color at e=0
+      const rShf = 0x4d / 255, gShf = 0x8a / 255, bShf = 0x96 / 255;
+      r = lerp(rShf, rSnd, t);
+      g = lerp(gShf, gSnd, t);
+      b = lerp(bShf, bSnd, t);
+    } else if (e < 0.18) {
+      // sand → lowland (window 0.015 around 0.012)
+      const t = clamp01((e - 0.012) / 0.015);
+      r = lerp(rSnd, rLow, t);
+      g = lerp(gSnd, gLow, t);
+      b = lerp(bSnd, bLow, t);
+    } else if (e < 0.42) {
+      // lowland → highland (window 0.015 around 0.18)
+      const t = clamp01((e - 0.18) / 0.015);
+      r = lerp(rLow, rHig, t);
+      g = lerp(gLow, gHig, t);
+      b = lerp(bLow, bHig, t);
+    } else if (e < 0.62) {
+      // highland → bare rock (window 0.015 around 0.42)
+      const t = clamp01((e - 0.42) / 0.015);
+      r = lerp(rHig, rRck, t);
+      g = lerp(gHig, gRck, t);
+      b = lerp(bHig, bRck, t);
+    } else {
+      r = rRck; g = gRck; b = bRck;
+    }
+
+    // Snow blend: start at 0.55, fully white by 0.62
+    if (e > 0.55) {
+      const snowT = clamp01((e - 0.55) / (0.62 - 0.55));
+      r = lerp(r, rSnw, snowT);
+      g = lerp(g, gSnw, snowT);
+      b = lerp(b, bSnw, snowT);
+    }
+
+    // Slope override (land only): blend toward rock grey #6e6a64 on cliffs
+    if (slope > 0.22) {
+      const rockBlend = clamp01((slope - 0.22) / 0.20);
+      r = lerp(r, 0x6e / 255, rockBlend);
+      g = lerp(g, 0x6a / 255, rockBlend);
+      b = lerp(b, 0x64 / 255, rockBlend);
+    }
   }
 
   out[base    ] = r;
@@ -135,6 +231,9 @@ function elevationColor(e: number, slope: number, out: Float32Array, base: numbe
 
 export function buildChunkGeometry(p: ChunkParams): ChunkMeshData {
   const { faceIndex, level, ix, iy, resolution: res, radius, heightScale, heightFn, plateColorFn } = p;
+  // Convenience: heightFn with level pre-bound — avoids repeating `level` at every call site
+  // inside this function (all vertices in a chunk share the same LOD level).
+  const hFn = (dir: Vector3): number => heightFn(dir, level);
   const basis = FACE_BASES[faceIndex];
   const hasPlateColor = plateColorFn !== undefined;
 
@@ -201,7 +300,7 @@ export function buildChunkGeometry(p: ChunkParams): ChunkMeshData {
   const czC = basis.nz + cuC * basis.uz + cvC * basis.vz;
   cubeToSphere(cxC, cyC, czC, _sphereDir);
   _sphereDir.normalize();
-  const hCenter = heightFn(_sphereDir);
+  const hCenter = hFn(_sphereDir);
   const rCenter = radius + hCenter * heightScale;
   const origin = new Vector3(
     _sphereDir.x * rCenter,
@@ -238,7 +337,7 @@ export function buildChunkGeometry(p: ChunkParams): ChunkMeshData {
     const cz = basis.nz + cu * basis.uz + cv * basis.vz;
     cubeToSphere(cx, cy, cz, outDir);
     outDir.normalize();
-    const h = heightFn(outDir);
+    const h = hFn(outDir);
     const r = radius + h * heightScale;
     outWorld.copy(outDir).multiplyScalar(r);
   }
@@ -248,7 +347,7 @@ export function buildChunkGeometry(p: ChunkParams): ChunkMeshData {
 
   for (let gj = 0; gj < gridSize; gj++) {
     for (let gi = 0; gi < gridSize; gi++) {
-      evalVertex(basis, level, ix, iy, gi, gj, res, radius, heightScale, heightFn, dir, world);
+      evalVertex(basis, level, ix, iy, gi, gj, res, radius, heightScale, hFn, dir, world);
 
       // Position relative to chunk origin
       const px = world.x - origin.x;
@@ -277,8 +376,9 @@ export function buildChunkGeometry(p: ChunkParams): ChunkMeshData {
       normals[vi * 3 + 1] = nrm.y;
       normals[vi * 3 + 2] = nrm.z;
 
-      // Vertex color
-      const h = heightFn(dir); // dir is set by evalVertex
+      // Vertex color — re-use the direction already set by evalVertex;
+      // hFn is pre-bound to this chunk's level so the same octave count applies.
+      const h = hFn(dir); // dir is set by evalVertex
       const slope = 1 - nrm.dot(dir);
       elevationColor(h, slope, colors, vi * 3);
 

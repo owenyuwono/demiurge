@@ -87,6 +87,8 @@ export interface TectonicQuery {
   neighborId: number
   boundaryDist: number  // radians
   convergence: number   // ≈[-1,1]
+  shear: number         // tangential (along-boundary) relative velocity component, ≈[-1,1]
+  crustDist: number     // signed distance: +inside crust, -outside crust (radians)
 }
 
 // ---------------------------------------------------------------------------
@@ -1153,6 +1155,7 @@ export class Tectonics {
   private readonly _compId:     Uint16Array   // per-texel plate id (0-based)
   private readonly _distField:  Float32Array  // per-texel distance to boundary (radians)
   private readonly _neighborId: Uint16Array   // per-texel neighbour plate id
+  private readonly _crustDist:  Float32Array  // per-texel signed crust SDF (radians)
 
   // Domain-warp noise
   private readonly _warpNoise: (x: number, y: number, z: number) => number
@@ -1162,6 +1165,8 @@ export class Tectonics {
   private readonly _vA         = new Vector3()
   private readonly _vB         = new Vector3()
   private readonly _smoothScratch = new Vector3()
+  private readonly _crustScratch  = new Vector3()
+  private readonly _bHat       = new Vector3()  // along-boundary tangent for shear computation
 
   // Texel lookup scratch (reused in query)
   private readonly _tex = { face: 0, x: 0, y: 0 }
@@ -1363,6 +1368,243 @@ export class Tectonics {
     this._neighborId = neighborId
 
     // -------------------------------------------------------------------------
+    // Step 6b — Crust mask bake + crust SDF
+    // -------------------------------------------------------------------------
+
+    const CRUST_A    = 0.60  // angular falloff weight
+    const CRUST_B    = 0.20  // boundary dist weight
+    const CRUST_C    = 0.45  // noise weight
+    const CRUST_T    = 0.44  // threshold
+    const CRUST_LEAN = 0.25  // leading-edge lean factor
+    const CRUST_RP_LO = 0.55 // R_P lower bound factor
+    const CRUST_RP_HI = 0.95 // R_P upper bound factor
+
+    const crustMask  = new Uint8Array(TOTAL_TEXELS)
+    const crustNoise = createNoise3D(deriveSeed(seed, 9))
+    const rpRng      = makeRng(deriveSeed(seed, 10))
+    const microRng   = makeRng(deriveSeed(seed, 11))
+
+    // --- Per-plate area share ---
+    const plateAreaShare = new Float64Array(finalCount)
+    for (let t = 0; t < TOTAL_TEXELS; t++) plateAreaShare[compId[t]]++
+    for (let i = 0; i < finalCount; i++) plateAreaShare[i] /= TOTAL_TEXELS
+
+    // --- Continental plates: compute R_P and anchorDir, then mask ---
+    // We need type info: re-derive using the same typeRng stream order.
+    // Instead, compute this after types[] is known (Step 5 runs after us now).
+    // To avoid ordering chicken-and-egg, we replicate the type determination inline.
+    // (typeRng is consumed before this code so we must NOT call typeRng here.)
+    // We store the crust bake for-now in a local array, applied per-type below.
+    // Plan: bake mask in two passes — first pass sets up per-plate data, second writes mask.
+    // We derive types identically to Step 5 (same stream 1) using a parallel rng.
+    const typeRng2 = makeRng(deriveSeed(seed, 1))
+    const typesPre: Array<'oceanic' | 'continental'> = []
+    for (let i = 0; i < finalCount; i++) {
+      if (i === 0) { typesPre.push('oceanic') }
+      else if (i === 1) { typesPre.push('continental') }
+      else { typesPre.push(typeRng2() < 0.60 ? 'oceanic' : 'continental') }
+    }
+
+    // --- Per-plate R_P and anchorDir ---
+    const plateRp = new Float64Array(finalCount)
+    const plateAnchorX = new Float64Array(finalCount)
+    const plateAnchorY = new Float64Array(finalCount)
+    const plateAnchorZ = new Float64Array(finalCount)
+    // Also collect microcontinent data per oceanic plate
+    const plateMicroR = new Float64Array(finalCount)   // 0 = no micro
+    const plateMicroX = new Float64Array(finalCount)
+    const plateMicroY = new Float64Array(finalCount)
+    const plateMicroZ = new Float64Array(finalCount)
+
+    // Precompute seedDir (pole of inaccessibility) per plate using already-built distField
+    const plateSeedX = new Float64Array(finalCount)
+    const plateSeedY = new Float64Array(finalCount)
+    const plateSeedZ = new Float64Array(finalCount)
+    {
+      const tmpDir = new Vector3()
+      for (let i = 0; i < finalCount; i++) {
+        poleOfInaccessibility(i, compId, distField, tmpDir)
+        plateSeedX[i] = tmpDir.x
+        plateSeedY[i] = tmpDir.y
+        plateSeedZ[i] = tmpDir.z
+      }
+    }
+
+    // Also need omega — but we haven't computed plates yet.
+    // Re-derive omega from the same streams (axis = stream 3, speed = stream 4).
+    const axisRng2  = makeRng(deriveSeed(seed, 3))
+    const speedRng2 = makeRng(deriveSeed(seed, 4))
+    const plateOmX = new Float64Array(finalCount)
+    const plateOmY = new Float64Array(finalCount)
+    const plateOmZ = new Float64Array(finalCount)
+    for (let i = 0; i < finalCount; i++) {
+      const ax = axisRng2() * 2 - 1
+      const ay = axisRng2() * 2 - 1
+      const az = axisRng2() * 2 - 1
+      const axisLen = Math.sqrt(ax * ax + ay * ay + az * az) || 1
+      const speed = 0.4 + speedRng2() * 0.6
+      plateOmX[i] = ax / axisLen * speed
+      plateOmY[i] = ay / axisLen * speed
+      plateOmZ[i] = az / axisLen * speed
+    }
+
+    for (let i = 0; i < finalCount; i++) {
+      if (typesPre[i] === 'continental') {
+        const area = plateAreaShare[i]
+        const rp = Math.min(CRUST_RP_HI, Math.max(CRUST_RP_LO, CRUST_RP_LO * Math.sqrt(area / 0.0625))) * (CRUST_RP_LO + (CRUST_RP_HI - CRUST_RP_LO) * rpRng())
+        plateRp[i] = rp
+        // anchorDir = normalize(seedDir + LEAN * velDir) where velDir = omega × seedDir
+        const sx = plateSeedX[i], sy = plateSeedY[i], sz = plateSeedZ[i]
+        const ox = plateOmX[i], oy = plateOmY[i], oz = plateOmZ[i]
+        let vx = oy * sz - oz * sy
+        let vy = oz * sx - ox * sz
+        let vz = ox * sy - oy * sx
+        const vLen = Math.sqrt(vx * vx + vy * vy + vz * vz)
+        if (vLen < 1e-6) {
+          plateAnchorX[i] = sx; plateAnchorY[i] = sy; plateAnchorZ[i] = sz
+        } else {
+          vx /= vLen; vy /= vLen; vz /= vLen
+          const ax2 = sx + CRUST_LEAN * vx
+          const ay2 = sy + CRUST_LEAN * vy
+          const az2 = sz + CRUST_LEAN * vz
+          const aLen = Math.sqrt(ax2 * ax2 + ay2 * ay2 + az2 * az2) || 1
+          plateAnchorX[i] = ax2 / aLen; plateAnchorY[i] = ay2 / aLen; plateAnchorZ[i] = az2 / aLen
+        }
+      } else {
+        // Oceanic: no continental crust, but maybe a microcontinent
+        // Consume rpRng consistently (even for oceanic)
+        rpRng()
+        if (microRng() < 0.22) {
+          // Find interior seed point: scan all texels of this plate with distField[t] > 0.05
+          const candidates: number[] = []
+          for (let t = 0; t < TOTAL_TEXELS; t++) {
+            if (compId[t] === i && distField[t] > 0.05) candidates.push(t)
+          }
+          if (candidates.length > 0) {
+            const pick = candidates[Math.floor(microRng() * candidates.length)]
+            const mFace = (pick / (RES * RES)) | 0
+            const mRem  = pick % (RES * RES)
+            const mY    = (mRem / RES) | 0
+            const mX    = mRem % RES
+            const mDir  = new Vector3()
+            texelToDir(mFace, mX, mY, RES, mDir)
+            plateMicroX[i] = mDir.x; plateMicroY[i] = mDir.y; plateMicroZ[i] = mDir.z
+            plateMicroR[i] = 0.04 + microRng() * 0.06
+          }
+        }
+      }
+    }
+
+    // --- Apply crust mask ---
+    {
+      const tmpDir = new Vector3()
+      for (let t = 0; t < TOTAL_TEXELS; t++) {
+        const face = (t / (RES * RES)) | 0
+        const rem  = t % (RES * RES)
+        const ty2  = (rem / RES) | 0
+        const tx2  = rem % RES
+        texelToDir(face, tx2, ty2, RES, tmpDir)
+        const tx = tmpDir.x, ty3 = tmpDir.y, tz = tmpDir.z
+        const pid = compId[t]
+
+        if (typesPre[pid] === 'continental') {
+          const rp = plateRp[pid]
+          const ax2 = plateAnchorX[pid], ay2 = plateAnchorY[pid], az2 = plateAnchorZ[pid]
+          const dotA = Math.max(-1, Math.min(1, tx * ax2 + ty3 * ay2 + tz * az2))
+          const angle = Math.acos(dotA)
+          const falloff = 1 - _ss(0, rp, angle)
+          const bdist = distField[t]
+          const bdistSS = _ss(0, 0.10, bdist)
+          const fbmVal = fbm(crustNoise, tx * 1.3, ty3 * 1.3, tz * 1.3, { octaves: 5 }) * 0.5 + 0.5
+          const score = CRUST_A * falloff + CRUST_B * bdistSS + CRUST_C * fbmVal
+          if (score > CRUST_T) crustMask[t] = 1
+        } else {
+          // Oceanic: microcontinent only
+          const mr = plateMicroR[pid]
+          if (mr > 0) {
+            const mx = plateMicroX[pid], my = plateMicroY[pid], mz = plateMicroZ[pid]
+            const dotM = Math.max(-1, Math.min(1, tx * mx + ty3 * my + tz * mz))
+            const mAngle = Math.acos(dotM)
+            const fbmVal3 = fbm(crustNoise, tx * 3, ty3 * 3, tz * 3, { octaves: 3 }) * 0.5 + 0.5
+            const threshold = mr * (0.7 + 0.5 * fbmVal3)
+            if (mAngle < threshold) crustMask[t] = 1
+          }
+        }
+      }
+    }
+
+    // --- Crust SDF via Dijkstra ---
+    let totalCrust = 0
+    for (let t = 0; t < TOTAL_TEXELS; t++) if (crustMask[t]) totalCrust++
+
+    const crustDist = new Float32Array(TOTAL_TEXELS)
+    if (totalCrust === 0) {
+      crustDist.fill(-1.5)
+    } else if (totalCrust === TOTAL_TEXELS) {
+      crustDist.fill(1.5)
+    } else {
+      const INF2 = 1e30
+      const cDist = new Float32Array(TOTAL_TEXELS).fill(INF2)
+      const cSettled = new Uint8Array(TOTAL_TEXELS)
+      const cHeap = new BinaryHeap(TOTAL_TEXELS * 2)
+      const cNbr: { face: number; x: number; y: number } = { face: 0, x: 0, y: 0 }
+
+      // Seed: crust edge texels (crustMask differs from any 4-neighbour)
+      for (let idx = 0; idx < TOTAL_TEXELS; idx++) {
+        const face = (idx / (RES * RES)) | 0
+        const rem  = idx % (RES * RES)
+        const cy   = (rem / RES) | 0
+        const cx   = rem % RES
+        const mine = crustMask[idx]
+        const dx4 = [1, -1, 0, 0] as const
+        const dy4 = [0, 0, 1, -1] as const
+        for (let d = 0; d < 4; d++) {
+          neighborTexel(face, cx, cy, dx4[d] as -1|0|1, dy4[d] as -1|0|1, RES, cNbr)
+          const ni = texelIndex(cNbr.face, cNbr.x, cNbr.y, RES)
+          if (crustMask[ni] !== mine) {
+            if (cDist[idx] > 0) {
+              cDist[idx] = 0
+              cHeap.push(0, idx)
+            }
+            break
+          }
+        }
+      }
+
+      const CDIAG = TEX_ANG * Math.SQRT2
+      const CORTH = TEX_ANG
+      const dx8c = [ 1, -1,  0,  0,  1, -1,  1, -1] as const
+      const dy8c = [ 0,  0,  1, -1,  1,  1, -1, -1] as const
+
+      while (!cHeap.isEmpty()) {
+        const { key: cdistVal, val: cidx } = cHeap.popMin()
+        if (cSettled[cidx]) continue
+        cSettled[cidx] = 1
+        const face = (cidx / (RES * RES)) | 0
+        const rem  = cidx % (RES * RES)
+        const cy   = (rem / RES) | 0
+        const cx   = rem % RES
+        for (let d = 0; d < 8; d++) {
+          neighborTexel(face, cx, cy, dx8c[d] as -1|0|1, dy8c[d] as -1|0|1, RES, cNbr)
+          const ni = texelIndex(cNbr.face, cNbr.x, cNbr.y, RES)
+          if (cSettled[ni]) continue
+          const cost = (dx8c[d] !== 0 && dy8c[d] !== 0) ? CDIAG : CORTH
+          const newDist2 = cdistVal + cost
+          if (newDist2 < cDist[ni]) {
+            cDist[ni] = newDist2
+            cHeap.push(newDist2, ni)
+          }
+        }
+      }
+
+      for (let t = 0; t < TOTAL_TEXELS; t++) {
+        crustDist[t] = crustMask[t] === 1 ? cDist[t] : -cDist[t]
+      }
+    }
+
+    this._crustDist = crustDist
+
+    // -------------------------------------------------------------------------
     // Step 5 — Plate properties
     // -------------------------------------------------------------------------
 
@@ -1388,10 +1630,8 @@ export class Tectonics {
     for (let i = 0; i < n; i++) {
       const type = types[i]
 
-      // baseElevation: oceanic [-0.55, -0.3], continental [0.06, 0.28]
-      const baseElevation = type === 'oceanic'
-        ? -0.55 + elevRng() * 0.25
-        :  0.06 + elevRng() * 0.22
+      // baseElevation: compressed to ±0.12 modifier range (crust SDF drives land/ocean split)
+      const baseElevation = -0.12 + elevRng() * 0.24   // → [-0.12, +0.12]
 
       // omega: random unit axis × speed in [0.4, 1.0]
       const ax = axisRng() * 2 - 1
@@ -1539,6 +1779,7 @@ export class Tectonics {
     const gLen = Math.sqrt(ptx * ptx + pty * pty + ptz * ptz)
 
     let convergence = 0
+    let shear = 0
     if (gLen > 1e-7) {
       // tHat = −∇dist / |∇dist|, i.e. toward boundary (steepest descent)
       this._tHat.set(-ptx / gLen, -pty / gLen, -ptz / gLen)
@@ -1565,17 +1806,32 @@ export class Tectonics {
 
       const raw = (diffX * this._tHat.x + diffY * this._tHat.y + diffZ * this._tHat.z) / 2
       convergence = Math.max(-1, Math.min(1, raw))
+
+      // bHat = normalize(tHat × unwarped_dir) — the along-boundary tangent
+      // (tHat points toward boundary, cross with dir gives the tangential direction)
+      const bx = this._tHat.y * dir.z - this._tHat.z * dir.y
+      const by = this._tHat.z * dir.x - this._tHat.x * dir.z
+      const bz = this._tHat.x * dir.y - this._tHat.y * dir.x
+      const bLen = Math.sqrt(bx * bx + by * by + bz * bz)
+      if (bLen > 1e-7) {
+        this._bHat.set(bx / bLen, by / bLen, bz / bLen)
+        const rawShear = (diffX * this._bHat.x + diffY * this._bHat.y + diffZ * this._bHat.z) / 2
+        shear = Math.max(-1, Math.min(1, rawShear))
+      }
     }
 
     out.plateId      = plateId
     out.neighborId   = neighborId
     out.boundaryDist = boundaryDist
     out.convergence  = convergence
+    out.shear        = shear
+    out.crustDist    = sampleSmooth(this._crustDist, w, RES, this._crustScratch)
     return out
   }
 
   // ---------------------------------------------------------------------------
   // velocityAt — zero-alloc, UNWARPED dir
+  // IMPORTANT: velocityAt is defined below; boundaryRelief is a module-level export
   // ---------------------------------------------------------------------------
 
   /**
@@ -1613,4 +1869,182 @@ export class Tectonics {
     )
     return out
   }
+}
+
+// ---------------------------------------------------------------------------
+// Asymmetric boundary relief profiles — pure function, headless-testable
+//
+// Geology references per block:
+//   Andes / Cascades   — continental overriding-side volcanic cordillera
+//   Mariana Trench     — oceanic subducting-side deep-sea trench
+//   Japan arc          — oceanic-oceanic island arc (discrete islands)
+//   Himalaya / Alps    — continent-continent collision belt + plateau
+//   Mid-Atlantic Ridge — mid-ocean spreading ridge with axial rift notch
+//   East African Rift  — continental rift graben + shoulders
+//   San Andreas Fault  — transform fault scarp + parallel ridging
+// ---------------------------------------------------------------------------
+
+// Gaussian helper: exp(−((x−center)/width)²)
+function _g(x: number, center: number, width: number): number {
+  const t = (x - center) / width
+  return Math.exp(-(t * t))
+}
+
+// GLSL-style smoothstep
+function _ss(edge0: number, edge1: number, x: number): number {
+  const t = Math.max(0, Math.min(1, (x - edge0) / (edge1 - edge0)))
+  return t * t * (3 - 2 * t)
+}
+
+// Profile shape constants (named for easy tuning)
+// Convergent
+const BR_TRENCH_DEPTH         = 0.60   // OC trench depth
+const BR_FLEX_BULGE           = 0.05   // outer flexural bulge amplitude
+const BR_FLEX_POS             = 0.030  // bulge center (rad)
+const BR_FLEX_WIDTH           = 0.012  // bulge width (rad)
+const BR_TRENCH_WIDTH         = 0.012  // trench width (rad)
+const BR_CORD_HEIGHT          = 0.55   // cordillera peak amplitude (Andes)
+const BR_CORD_POS             = 0.030  // cordillera center (rad)
+const BR_CORD_WIDTH           = 0.018  // cordillera width (rad)
+const BR_CORD_RIDGE           = 0.60   // ridged texture amplitude on cordillera
+const BR_CORD_RIDGE_BASE      = 0.55   // ridged texture floor
+const BR_SHELF_DIP            = 0.06   // coastal shelf dip amplitude
+const BR_SHELF_WIDTH          = 0.006  // shelf dip width (rad)
+const BR_OO_TRENCH_DEPTH      = 0.50   // OO trench depth
+const BR_OO_TRENCH_WIDTH      = 0.011  // OO trench width
+const BR_ARC_HEIGHT           = 0.55   // island arc peak amplitude (Japan)
+const BR_ARC_POS              = 0.026  // arc center (rad)
+const BR_ARC_WIDTH            = 0.014  // arc width (rad)
+const BR_ARC_RIDGE_THRESH     = 0.45   // ridged threshold for discrete islands
+const BR_ARC_RIDGE_SCALE      = 1 / 0.55 // normaliser for arc ridged
+const BR_BELT_HEIGHT          = 0.85   // collision belt amplitude (Himalaya)
+const BR_BELT_WIDTH           = 0.055  // belt width (rad)
+const BR_BELT_RIDGE           = 0.55   // ridged texture amplitude on belt
+const BR_BELT_RIDGE_BASE      = 0.60   // ridged texture floor
+const BR_PLATEAU_HEIGHT       = 0.30   // plateau amplitude (Tibetan Plateau)
+const BR_PLATEAU_INNER        = 0.05   // plateau inner ramp start
+const BR_PLATEAU_OUTER        = 0.13   // plateau outer fade
+const BR_PLATEAU_NEAR         = 0.015  // plateau near ramp start
+const BR_PLATEAU_FAR          = 0.05   // plateau near ramp end
+// Divergent
+const BR_RIDGE_HEIGHT         = 0.22   // mid-ocean ridge amplitude
+const BR_RIDGE_WIDTH          = 0.05   // ridge flank width (rad)
+const BR_NOTCH_DEPTH          = 0.14   // axial rift notch depth
+const BR_NOTCH_WIDTH          = 0.006  // notch half-width (rad)
+const BR_RIFT_SHOULDER        = 0.18   // rift shoulder amplitude
+const BR_RIFT_SHOULDER_POS    = 0.022  // shoulder center (rad)
+const BR_RIFT_SHOULDER_WIDTH  = 0.012  // shoulder width (rad)
+const BR_GRABEN_DEPTH         = 0.24   // graben valley depth
+const BR_GRABEN_WIDTH         = 0.010  // graben half-width (rad)
+// Transform
+const BR_SCARP_DEPTH          = 0.10   // fault scarp/valley depth
+const BR_SCARP_WIDTH          = 0.005  // scarp half-width (rad)
+const BR_RIDGE2_HEIGHT        = 0.05   // parallel ridging amplitude
+const BR_RIDGE2_POS           = 0.012  // parallel ridge center (rad)
+const BR_RIDGE2_WIDTH         = 0.008  // parallel ridge width (rad)
+// Crust-aware regime thresholds
+const CRUST_MINE_THRESH  = -0.020  // crustDist > this → we're on continental crust
+const CRUST_CORD_SS_LO   = -0.02   // cordillera/belt smoothstep lo
+const CRUST_CORD_SS_HI   =  0.01   // cordillera/belt smoothstep hi
+
+/**
+ * Asymmetric tectonic boundary relief profiles.
+ *
+ * Returns a height contribution in normalized units ≈[-1,1].
+ * All terms are continuous in conv/shear (no hard regime branches on sign;
+ * only smooth magnitude-scaled envelopes). The only permitted discontinuity
+ * is at the exact plate boundary where plateId flips.
+ *
+ * @param q        TectonicQuery for the current sample point
+ * @param plates   full Plate array from the Tectonics instance
+ * @param dir      unit planet-local direction (used for noise sampling only)
+ * @param ridgedAt wraps a ridged noise call returning ≈[0,1]
+ */
+export function boundaryRelief(
+  q: TectonicQuery,
+  plates: Plate[],
+  dir: Vector3,
+  ridgedAt: (dir: Vector3, freq: number, octaves: number) => number,
+): number {
+  const d    = q.boundaryDist   // radians
+  const own  = plates[q.plateId]
+  const other = plates[q.neighborId]
+  const conv  = q.convergence
+  const sh    = q.shear
+
+  // --- Convergent envelope ---
+  const cp  = Math.max(0, conv)
+  const cp2 = cp * _ss(0.05, 0.18, cp)
+
+  // --- Divergent envelope ---
+  const absConv = Math.abs(conv)
+  const dp  = Math.max(0, -conv) * _ss(0.05, 0.18, absConv)
+
+  // --- Transform envelope (engages when sliding dominates) ---
+  const abssh = Math.abs(sh)
+  const tw  = abssh * _ss(0.10, 0.30, abssh) * (1 - _ss(0.05, 0.15, Math.abs(conv)))
+
+  // --- Local crust classification ---
+  const mineContinental = q.crustDist > CRUST_MINE_THRESH
+  // Far-side approximation: use nominal plate type
+  const otherContinental = other.type === 'continental'
+  // Scale factor for cordillera + collision-belt: mountains only on land
+  const cordScaleFactor = _ss(CRUST_CORD_SS_LO, CRUST_CORD_SS_HI, q.crustDist)
+
+  let relief = 0
+
+  if (cp2 > 0) {
+    if (!mineContinental && otherContinental) {
+      // Mariana Trench — oceanic subducting under continent
+      relief += -BR_TRENCH_DEPTH * cp2 * _g(d, 0, BR_TRENCH_WIDTH)
+             + BR_FLEX_BULGE  * cp2 * _g(d, BR_FLEX_POS, BR_FLEX_WIDTH)
+
+    } else if (mineContinental && !otherContinental) {
+      // Andes / Cascades — continental overriding side
+      const ridgeFactor = BR_CORD_RIDGE_BASE + BR_CORD_RIDGE * ridgedAt(dir, 6.0, 4)
+      relief += BR_CORD_HEIGHT  * cp2 * _g(d, BR_CORD_POS, BR_CORD_WIDTH) * ridgeFactor * cordScaleFactor
+             - BR_SHELF_DIP  * cp2 * _g(d, 0.004, BR_SHELF_WIDTH)
+
+    } else if (!mineContinental && !otherContinental) {
+      // Japan arc — oceanic-oceanic, polarity by plate id
+      const subducting = own.id < other.id
+      if (subducting) {
+        relief += -BR_OO_TRENCH_DEPTH * cp2 * _g(d, 0, BR_OO_TRENCH_WIDTH)
+      } else {
+        const arcRidged = Math.max(0, ridgedAt(dir, 9.0, 4) - BR_ARC_RIDGE_THRESH) * BR_ARC_RIDGE_SCALE
+        relief += BR_ARC_HEIGHT * cp2 * _g(d, BR_ARC_POS, BR_ARC_WIDTH) * arcRidged
+      }
+
+    } else {
+      // CC collision — both continental
+      const beltRidged = BR_BELT_RIDGE_BASE + BR_BELT_RIDGE * ridgedAt(dir, 6.0, 5)
+      relief += BR_BELT_HEIGHT * cp2 * _g(d, 0, BR_BELT_WIDTH) * beltRidged * cordScaleFactor
+      if (own.id > other.id) {
+        const plateauMask = (1 - _ss(BR_PLATEAU_INNER, BR_PLATEAU_OUTER, d))
+                          * _ss(BR_PLATEAU_NEAR, BR_PLATEAU_FAR, d)
+        relief += BR_PLATEAU_HEIGHT * cp2 * plateauMask * cordScaleFactor
+      }
+    }
+  }
+
+  if (dp > 0) {
+    if (!mineContinental) {
+      // Mid-ocean ridge
+      relief += BR_RIDGE_HEIGHT * dp * _g(d, 0, BR_RIDGE_WIDTH)
+             - BR_NOTCH_DEPTH  * dp * _g(d, 0, BR_NOTCH_WIDTH)
+    } else {
+      // East African Rift
+      relief += BR_RIFT_SHOULDER * dp * _g(d, BR_RIFT_SHOULDER_POS, BR_RIFT_SHOULDER_WIDTH)
+             - BR_GRABEN_DEPTH   * dp * _g(d, 0, BR_GRABEN_WIDTH)
+    }
+  }
+
+  if (tw > 0) {
+    // San Andreas Fault — narrow fault scarp/valley + subtle parallel ridging
+    relief += -BR_SCARP_DEPTH  * tw * _g(d, 0, BR_SCARP_WIDTH)
+           + BR_RIDGE2_HEIGHT * tw * _g(d, BR_RIDGE2_POS, BR_RIDGE2_WIDTH)
+                              * ridgedAt(dir, 11.0, 3)
+  }
+
+  return relief
 }
