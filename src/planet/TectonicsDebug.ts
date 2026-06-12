@@ -1,0 +1,288 @@
+import {
+  BufferAttribute,
+  BufferGeometry,
+  Color,
+  ConeGeometry,
+  CylinderGeometry,
+  Float32BufferAttribute,
+  Group,
+  InstancedMesh,
+  Matrix4,
+  Mesh,
+  MeshBasicMaterial,
+  Quaternion,
+  Uint32BufferAttribute,
+  Vector3,
+} from 'three'
+import { Tectonics, TectonicQuery } from './tectonics'
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Fibonacci-sphere lattice — deterministic, uniform-ish distribution. */
+function fibonacciSphere(count: number): Vector3[] {
+  const dirs: Vector3[] = []
+  const phi = Math.PI * (Math.sqrt(5) - 1) // golden angle
+  for (let i = 0; i < count; i++) {
+    const y = 1 - (i / (count - 1)) * 2
+    const r = Math.sqrt(Math.max(0, 1 - y * y))
+    const theta = phi * i
+    dirs.push(new Vector3(r * Math.cos(theta), y, r * Math.sin(theta)))
+  }
+  return dirs
+}
+
+/**
+ * Build a unit arrow geometry along +Z.
+ *
+ * Accepts proportional shaft/head parameters so callers can tune for size.
+ *
+ *   shaftRadiusFrac  — shaft radius as fraction of total arrow length (1.0)
+ *   headRadiusFrac   — cone base radius as fraction of total length
+ *   headLenFrac      — cone length as fraction of total length
+ *
+ * Shaft runs from z=0 to z=(1-headLenFrac). Cone tip is at z=1.
+ * Returns one merged BufferGeometry with position/normal/uv + Uint32 index.
+ */
+function buildArrowGeometry(
+  shaftRadiusFrac = 0.025,
+  headRadiusFrac  = 0.07,
+  headLenFrac     = 0.28,
+): BufferGeometry {
+  const SHAFT_LENGTH = 1.0 - headLenFrac
+  const HEAD_LENGTH  = headLenFrac
+  const SHAFT_RADIUS = shaftRadiusFrac
+  const HEAD_RADIUS  = headRadiusFrac
+  const RADIAL_SEGS  = 6
+
+  // Shaft: CylinderGeometry along +Y, translated so base at y=0
+  const shaftGeo = new CylinderGeometry(SHAFT_RADIUS, SHAFT_RADIUS, SHAFT_LENGTH, RADIAL_SEGS, 1, true)
+  shaftGeo.translate(0, SHAFT_LENGTH / 2, 0)
+
+  // Head: ConeGeometry along +Y, base at y=SHAFT_LENGTH, tip at y=1
+  const headGeo = new ConeGeometry(HEAD_RADIUS, HEAD_LENGTH, RADIAL_SEGS)
+  headGeo.translate(0, SHAFT_LENGTH + HEAD_LENGTH / 2, 0)
+
+  // Merge by concatenating attribute arrays and offsetting head indices
+  const shaftPos = shaftGeo.attributes.position.array as Float32Array
+  const shaftNor = shaftGeo.attributes.normal.array as Float32Array
+  const shaftUv  = shaftGeo.attributes.uv.array as Float32Array
+  const shaftIdx = shaftGeo.index!.array as Uint16Array | Uint32Array
+
+  const headPos  = headGeo.attributes.position.array as Float32Array
+  const headNor  = headGeo.attributes.normal.array as Float32Array
+  const headUv   = headGeo.attributes.uv.array as Float32Array
+  const headIdx  = headGeo.index!.array as Uint16Array | Uint32Array
+
+  const shaftVertCount = shaftPos.length / 3
+
+  const positions = new Float32Array(shaftPos.length + headPos.length)
+  const normals   = new Float32Array(shaftNor.length + headNor.length)
+  const uvs       = new Float32Array(shaftUv.length  + headUv.length)
+  positions.set(shaftPos, 0);        positions.set(headPos, shaftPos.length)
+  normals.set(shaftNor, 0);          normals.set(headNor,  shaftNor.length)
+  uvs.set(shaftUv, 0);               uvs.set(headUv,  shaftUv.length)
+
+  const indices = new Uint32Array(shaftIdx.length + headIdx.length)
+  for (let i = 0; i < shaftIdx.length; i++) indices[i] = shaftIdx[i]
+  for (let i = 0; i < headIdx.length;  i++) indices[shaftIdx.length + i] = headIdx[i] + shaftVertCount
+
+  const geo = new BufferGeometry()
+  geo.setAttribute('position', new Float32BufferAttribute(positions, 3))
+  geo.setAttribute('normal',   new Float32BufferAttribute(normals, 3))
+  geo.setAttribute('uv',       new Float32BufferAttribute(uvs, 2))
+  // Fix: use BufferAttribute directly instead of Array.from (Uint32BufferAttribute pattern)
+  geo.setIndex(new BufferAttribute(indices, 1))
+
+  // Bake +Y → +Z so instances only need to orient along +Z
+  geo.rotateX(-Math.PI / 2)
+
+  shaftGeo.dispose()
+  headGeo.dispose()
+
+  return geo
+}
+
+// ---------------------------------------------------------------------------
+// TectonicsDebug
+// ---------------------------------------------------------------------------
+
+export class TectonicsDebug extends Group {
+  private readonly _geometries: BufferGeometry[] = []
+  private readonly _materials:  MeshBasicMaterial[] = []
+  private readonly _meshes: (Mesh | InstancedMesh)[] = []
+
+  constructor(
+    tectonics: Tectonics,
+    opts: {
+      radius:          number
+      heightScale:     number
+      surfaceRadiusAt: (dir: Vector3) => number
+    }
+  ) {
+    super()
+    this.visible = false
+
+    const { radius, heightScale, surfaceRadiusAt } = opts
+
+    // -----------------------------------------------------------------------
+    // 1. VELOCITY FIELD — instanced arrows, ~240 samples
+    //
+    // Arrow size: max length = radius * 0.05 ≈ 1,000 units at radius=20,000.
+    // At a 20,000-unit viewing distance: angular size = 2·arctan(500/20000) ≈ 2.86°.
+    // Shaft radius ≈ 2.5% of length, head radius ≈ 7%, head length ≈ 28%.
+    // -----------------------------------------------------------------------
+    const SAMPLE_COUNT  = 240
+    const FIELD_MAX_LEN = radius * 0.05   // ~1,000 units at r=20,000
+
+    const sampleDirs = fibonacciSphere(SAMPLE_COUNT)
+
+    // First pass: compute velocities and find maxSpeed — fix nit (a): call
+    // velocityAt(dir, new Vector3()) directly rather than cloning _vel.
+    const velocities: Vector3[] = []
+    let maxSpeed = 1e-6 // avoid div-by-zero
+    for (const dir of sampleDirs) {
+      const v = tectonics.velocityAt(dir, new Vector3())
+      velocities.push(v)
+      const spd = v.length()
+      if (spd > maxSpeed) maxSpeed = spd
+    }
+
+    // Field arrow geometry: shaft 2.5% of length, head 7% base, 28% length
+    const fieldArrowGeo = buildArrowGeometry(0.025, 0.07, 0.28)
+    this._geometries.push(fieldArrowGeo)
+
+    const fieldArrowMat = new MeshBasicMaterial({ color: 0xffffff, vertexColors: false })
+    this._materials.push(fieldArrowMat)
+
+    const instancedArrows = new InstancedMesh(fieldArrowGeo, fieldArrowMat, SAMPLE_COUNT)
+    instancedArrows.count = 0
+
+    const _q       = new Quaternion()
+    const _zHat    = new Vector3(0, 0, 1)
+    const _mat4    = new Matrix4()
+    const _pos     = new Vector3()
+    const _col     = new Color()
+    // Reused scratch for query() — avoids a fresh allocation per arrow.
+    // Using the real warped+weighted ownership keeps field-arrow colors
+    // consistent with the terrain's painted plate regions near boundaries.
+    const _scratch: TectonicQuery = { plateId: 0, neighborId: 0, boundaryDist: 0, convergence: 0 }
+
+    let instanceIdx = 0
+    for (let i = 0; i < sampleDirs.length; i++) {
+      const dir = sampleDirs[i]
+      const vel = velocities[i]
+      const spd = vel.length()
+      if (spd < 1e-4) continue // skip near-zero velocity
+
+      // Position: hover heightScale * 2.0 above terrain
+      const surfR = surfaceRadiusAt(dir)
+      _pos.copy(dir).multiplyScalar(surfR + heightScale * 2.0)
+
+      // Orientation: rotate +Z onto normalized velocity direction
+      const velDir = vel.clone().normalize()
+      _q.setFromUnitVectors(_zHat, velDir)
+
+      // Scale: length ≈ FIELD_MAX_LEN * (0.45 + 0.55 * speed/maxSpeed)
+      const scale = FIELD_MAX_LEN * (0.45 + 0.55 * spd / maxSpeed)
+
+      _mat4.makeRotationFromQuaternion(_q)
+      _mat4.scale(new Vector3(scale, scale, scale))
+      _mat4.setPosition(_pos)
+      instancedArrows.setMatrixAt(instanceIdx, _mat4)
+
+      // Color: owning plate color via real warped+weighted query, brightened 1.35×.
+      // This matches the terrain's painted ownership exactly — raw dot-product
+      // ownership near boundaries would mis-color arrows inside a big neighbor's cell.
+      const plateIdx = tectonics.query(dir, _scratch).plateId
+      const [r, g, b] = tectonics.plates[plateIdx].color
+      _col.setRGB(
+        Math.min(1, r * 1.35),
+        Math.min(1, g * 1.35),
+        Math.min(1, b * 1.35),
+      )
+      instancedArrows.setColorAt(instanceIdx, _col)
+
+      instanceIdx++
+    }
+
+    instancedArrows.count = instanceIdx
+    instancedArrows.instanceMatrix.needsUpdate = true
+    if (instancedArrows.instanceColor) instancedArrows.instanceColor.needsUpdate = true
+
+    this.add(instancedArrows)
+    this._meshes.push(instancedArrows)
+
+    // -----------------------------------------------------------------------
+    // 2. PER-PLATE ARROWS — two meshes per plate for contrast
+    //
+    // Arrow length = radius * 0.09 ≈ 1,800 units at radius=20,000.
+    // At a 20,000-unit viewing distance: angular size = 2·arctan(900/20000) ≈ 5.15°.
+    //
+    // Two-mesh approach: a slightly thicker white arrow underneath + the
+    // plate-colored arrow on top at 92% scale. ~32 extra draw calls in a
+    // debug view — negligible. Gives clear contrast against same-hue ground.
+    // Shaft 3% of length, head 8% base, 28% length (proportionally thicker).
+    // -----------------------------------------------------------------------
+    const PLATE_ARROW_LEN = radius * 0.09  // ~1,800 units at r=20,000
+
+    // White backing arrow: slightly wider (shaft 3.8%, head 9.5%)
+    const plateArrowWhiteGeo = buildArrowGeometry(0.038, 0.095, 0.28)
+    this._geometries.push(plateArrowWhiteGeo)
+
+    // Colored foreground arrow: same proportions as above but will be scaled to 92%
+    const plateArrowColorGeo = buildArrowGeometry(0.030, 0.080, 0.28)
+    this._geometries.push(plateArrowColorGeo)
+
+    for (const plate of tectonics.plates) {
+      const seedDir = plate.seedDir.clone().normalize()
+      const vel = tectonics.velocityAt(seedDir, new Vector3())
+      const spd = vel.length()
+      if (spd < 1e-4) continue
+
+      const velDir = vel.clone().normalize()
+
+      const surfR = surfaceRadiusAt(seedDir)
+      // Hover heightScale * 3.0 above terrain
+      _pos.copy(seedDir).multiplyScalar(surfR + heightScale * 3.0)
+
+      // White backing mesh — drawn at full PLATE_ARROW_LEN scale
+      const whiteMat = new MeshBasicMaterial({ color: 0xffffff })
+      this._materials.push(whiteMat)
+
+      const whiteMesh = new Mesh(plateArrowWhiteGeo, whiteMat)
+      whiteMesh.position.copy(_pos)
+      whiteMesh.quaternion.setFromUnitVectors(_zHat, velDir)
+      whiteMesh.scale.setScalar(PLATE_ARROW_LEN)
+
+      // Plate-colored foreground mesh — drawn at 92% scale so white shows around edges
+      const [r, g, b] = plate.color
+      const colorMat = new MeshBasicMaterial({ color: new Color(r, g, b) })
+      this._materials.push(colorMat)
+
+      const colorMesh = new Mesh(plateArrowColorGeo, colorMat)
+      colorMesh.position.copy(_pos)
+      colorMesh.quaternion.setFromUnitVectors(_zHat, velDir)
+      colorMesh.scale.setScalar(PLATE_ARROW_LEN * 0.92)
+
+      this.add(whiteMesh, colorMesh)
+      this._meshes.push(whiteMesh, colorMesh)
+    }
+
+    // NOTE: Pole axis has been removed from TectonicsDebug.
+    // It now lives in PlanetGizmos (always-visible, independent of tectonics view).
+  }
+
+  dispose(): void {
+    // Geometries — deduplicated by reference (plate arrow geos are shared across meshes)
+    const seenGeos = new Set<BufferGeometry>()
+    for (const geo of this._geometries) {
+      if (!seenGeos.has(geo)) { seenGeos.add(geo); geo.dispose() }
+    }
+    for (const mat of this._materials) mat.dispose()
+    this._geometries.length = 0
+    this._materials.length  = 0
+    this._meshes.length     = 0
+  }
+}
