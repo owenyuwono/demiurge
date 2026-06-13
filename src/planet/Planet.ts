@@ -14,6 +14,7 @@ import { MeshBasicNodeMaterial } from 'three/webgpu'
 import { attribute } from 'three/tsl'
 import { createNoise3D, ridged, fbm, erosionFbm } from './noise'
 import { Tectonics, TectonicQuery, boundaryRelief } from './tectonics'
+import { Climate, ClimateSample } from './climate'
 import { buildChunkGeometry, ChunkMeshData } from './ChunkMesher'
 import { QuadtreeNode } from './QuadtreeNode'
 import { TectonicsDebug } from './TectonicsDebug'
@@ -33,6 +34,14 @@ interface PlanetOptions {
   plateCount?: number
   /** Target triangle pixel size for the SSE LOD metric (default 2.5). */
   targetTriPx?: number
+  /** Mean surface temperature, °C-ish, for the climate model (default 15 = Earth). */
+  baseTemp?: number
+  /** Atmospheric thickness 0..1 — thick shrinks gradients, thin makes extremes (default 0.6). */
+  atmosphere?: number
+  /** Rotation period in seconds — drives the circulation band count (default 600 = Earth-like → 3 cells). */
+  rotationPeriodS?: number
+  /** Axial tilt in degrees — climate uses it for the > 54° insolation inversion (default 23.4). */
+  axialTiltDeg?: number
 }
 
 interface Stats {
@@ -44,6 +53,7 @@ interface Stats {
   lastBuildMs: number
   plates: number
   volcanoes: number
+  bandCount: number
 }
 
 // ---------------------------------------------------------------------------
@@ -118,8 +128,8 @@ class CachedMeshData {
 // Constants
 // ---------------------------------------------------------------------------
 
-const BUILD_BUDGET_PER_FRAME = 96 // aggressive — brute-force surface refinement (accepts frame hitches)
-const BUILD_BUDGET_MS = 30        // up to 30 ms/frame on meshing — will drop fps while catching up
+const BUILD_BUDGET_PER_FRAME = 40 // chunks per frame — balanced between responsiveness and frame budget
+const BUILD_BUDGET_MS = 16        // ms/frame ceiling on meshing
 const LRU_CAPACITY = 4096         // hold a larger fine working set without evicting visible chunks
 const HYSTERESIS = 0.15 // 15% — SSE merge fires at threshold * (1 + HYSTERESIS)
 const EPS_DIST = 0.1    // minimum camera-to-node distance (prevents div-by-zero at contact)
@@ -220,10 +230,23 @@ export class Planet extends Group {
   private plateCount: number
   private arcDensity = 1.0
 
+  // Climate knobs — stored, applied on the next regenerate() (which rebuilds the Climate).
+  private baseTemp: number
+  private atmosphere: number
+  private rotationPeriodS: number
+  private readonly axialTiltDeg: number
+
   private heightFn!: (dir: Vector3, level: number) => number
 
   /** Tectonic simulation — rebuilt on regenerate(). */
   tectonics!: Tectonics
+
+  /** Climate fields (temperature + moisture) — rebuilt on regenerate() after heightFn + tectonics. */
+  private climateSim!: Climate
+  /** Reused ClimateSample scratch for climateFn — safe because meshing is serial. */
+  private readonly _climateScratch: ClimateSample = { temperature: 0, moisture: 0 }
+  /** Bound climate sampler passed to the mesher — set by buildHeightFn. */
+  private climateFn!: (dir: Vector3, height: number) => ClimateSample
 
   /** Debug overlay — rebuilt on regenerate(), always a child of this Group. */
   private tectonicsDebug!: TectonicsDebug
@@ -315,6 +338,10 @@ export class Planet extends Group {
     this.splitFactor = opts.splitFactor ?? 3.0
     this.plateCount = opts.plateCount ?? 16
     this.targetTriPx = opts.targetTriPx ?? 2.5
+    this.baseTemp = opts.baseTemp ?? 15
+    this.atmosphere = opts.atmosphere ?? 0.6
+    this.rotationPeriodS = opts.rotationPeriodS ?? 600
+    this.axialTiltDeg = opts.axialTiltDeg ?? 23.4
     // Safe fallbacks — caller updates these on the first update() call.
     this._vFovRadians = Math.PI / 3  // 60°
     this._screenHeightPx = 1080
@@ -482,6 +509,41 @@ export class Planet extends Group {
   }
 
   /**
+   * Set the mean surface temperature (°C-ish) for the climate model.
+   * Stored; applied on the next regenerate(seed) (which rebuilds the Climate).
+   */
+  setBaseTemp(t: number): void {
+    this.baseTemp = t
+  }
+
+  /**
+   * Set atmospheric thickness in [0,1] (thick → uniform/small gradients, thin → extremes).
+   * Stored; applied on the next regenerate(seed).
+   */
+  setAtmosphere(a: number): void {
+    this.atmosphere = Math.max(0, Math.min(1, a))
+  }
+
+  /**
+   * Set rotation period in seconds. Drives the circulation band count via
+   * deriveBandCount(). Stored; applied on the next regenerate(seed).
+   */
+  setRotationPeriod(s: number): void {
+    this.rotationPeriodS = Math.max(1, s)
+  }
+
+  /**
+   * Circulation cells per hemisphere derived from rotation period.
+   * Faster rotation (shorter period) → stronger Coriolis → more, narrower cells.
+   * bandCount = clamp(round(3 · sqrt(600 / period)), 1, 7). period=600 → 3 (Earth-like),
+   * 150 → 6, 3000 → 1. Generic: any rotation maps to a band count, no hardcoded "3 cells".
+   */
+  private deriveBandCount(): number {
+    const n = Math.round(3 * Math.sqrt(600 / this.rotationPeriodS))
+    return Math.max(1, Math.min(7, n))
+  }
+
+  /**
    * Live-set the maximum quadtree depth.
    * Clamped to [4, 20]. Takes effect on the next update() call (no rebuild needed).
    */
@@ -554,6 +616,11 @@ export class Planet extends Group {
     return this.tectonics
   }
 
+  /** Expose the Climate instance (rebuilt on regenerate). */
+  get climate(): Climate {
+    return this.climateSim
+  }
+
   getStats(): Stats {
     let minLevel = Infinity
     let maxLevel = 0
@@ -572,6 +639,7 @@ export class Planet extends Group {
       lastBuildMs: this.lastBuildMs,
       plates: this.tectonics.plates.length,
       volcanoes: this.tectonics.volcanoes.length,
+      bandCount: this.deriveBandCount(),
     }
   }
 
@@ -597,6 +665,7 @@ export class Planet extends Group {
     this.pointsMaterial.dispose()
     this.tectonicsDebug.dispose()
     this.gizmos.dispose()
+    this.climateSim.dispose()
   }
 
   // ---------------------------------------------------------------------------
@@ -848,6 +917,25 @@ export class Planet extends Group {
       _colorScratch[0] = base[0]; _colorScratch[1] = base[1]; _colorScratch[2] = base[2]
       return _colorScratch
     }
+
+    // ---- Climate ----------------------------------------------------------
+    // Built AFTER heightFn + tectonics exist (it depends on both). Color-only:
+    // climate never feeds back into heightFn, so terrain geometry is unchanged.
+    // bandCount comes from rotation; axial tilt feeds the > 54° inversion.
+    // crustDistAt reuses a dedicated scratch query so it never clobbers the
+    // heightFn / plateColorFn scratch above.
+    const climateQueryScratch: TectonicQuery = { plateId: 0, neighborId: 0, boundaryDist: 0, convergence: 0, shear: 0, crustDist: 0, paleoDist: 0, otherCrustDist: 0 }
+    this.climateSim = new Climate({
+      seed,
+      baseTemp: this.baseTemp,
+      atmosphere: this.atmosphere,
+      bandCount: this.deriveBandCount(),
+      axialTiltRad: (this.axialTiltDeg * Math.PI) / 180,
+      heightFn: this.heightFn,
+      crustDistAt: (dir: Vector3): number => this.tectonics.query(dir, climateQueryScratch).crustDist,
+    })
+    this.climateFn = (dir: Vector3, height: number): ClimateSample =>
+      this.climateSim.sample(dir, height, this._climateScratch)
   }
 
   /** plateColorFn for passing to buildChunkGeometry — set by buildHeightFn. */
@@ -1201,6 +1289,7 @@ export class Planet extends Group {
         heightScale: this.heightScale,
         heightFn: this.heightFn,
         plateColorFn: this._plateColorFn,
+        climateFn: this.climateFn,
       })
 
       this.geoCache.set(item.key, new CachedMeshData(data))
@@ -1313,17 +1402,32 @@ export class Planet extends Group {
   /**
    * Compute the screen-space-error projected-pixel size for a node.
    *
-   * Uses the node's bounding sphere (center = worldCenter, radius = nodeSize * √2 / 2)
-   * and measures distance from the camera to the nearest point on that sphere,
-   * so near-horizon chunks with far-away centers still split correctly.
+   * Uses a terrain-height-adjusted bounding sphere so that elevated chunks
+   * (hills) are measured at their ACTUAL surface radius rather than sea-level.
+   * surfaceCenter is computed once per node and cached — no per-frame heightFn calls.
+   *
+   * surfaceCenter = centerDir * (radius + heightFn(centerDir, level) * heightScale)
+   * This is in planet-local space, the same frame as the local camera.
+   *
+   * boundRadius is the geometric half-diagonal of the patch (no elevation padding —
+   * the surfaceCenter already measures distance to the real displaced surface).
    *
    * projPx = nodeSize * screenHeightPx / (2 * nearDist * tan(vFov/2))
    *
    * Zero-alloc: uses this._sseScratch.
    */
-  private computeProjPx(cam: Vector3, node: { worldCenter: Vector3; nodeSize: number }): number {
-    const camToCenter = this._sseScratch.copy(cam).distanceTo(node.worldCenter)
-    // Bounding sphere radius: half-diagonal of the square patch
+  private computeProjPx(cam: Vector3, node: QuadtreeNode): number {
+    // Lazy-init: compute surfaceCenter once and cache it on the node.
+    // h is recovered from the cached vector afterwards to avoid a second heightFn call.
+    if (node.surfaceCenter === null) {
+      const h = this.heightFn(node.centerDir, node.level)
+      node.surfaceCenter = node.centerDir.clone().multiplyScalar(this.radius + h * this.heightScale)
+    }
+
+    const camToCenter = this._sseScratch.copy(cam).distanceTo(node.surfaceCenter)
+    // Bounding sphere radius: half-diagonal of the square patch. No absolute-elevation
+    // padding — that over-refined high terrain within a ~heightScale radius and starved
+    // everything else. The surfaceCenter fix already measures to the real surface.
     const boundRadius = node.nodeSize * 0.7071067811865476 // Math.SQRT2 / 2
     const nearDist = Math.max(EPS_DIST, camToCenter - boundRadius)
     // Guard: tan(vFov/2) could be 0 if vFov is degenerate

@@ -27,6 +27,13 @@ export class QuadtreeNode {
 
   children: [QuadtreeNode, QuadtreeNode, QuadtreeNode, QuadtreeNode] | null = null
 
+  /**
+   * Terrain-height-adjusted centre, in planet-local space.
+   * Null until first LOD metric use; computed and cached at that point by Planet.
+   * Equals centerDir * (radius + heightFn(centerDir) * heightScale).
+   */
+  surfaceCenter: Vector3 | null = null
+
   constructor(faceIndex: number, level: number, ix: number, iy: number, radius: number) {
     this.faceIndex = faceIndex
     this.level = level

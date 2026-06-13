@@ -22,6 +22,13 @@ export interface ChunkParams {
   heightFn:   (dir: Vector3, level: number) => number;
   /** optional plate color: returns [r,g,b] in [0,1] for a given unit sphere direction */
   plateColorFn?: (dir: Vector3) => readonly [number, number, number];
+  /**
+   * optional climate sampler: temperature (°C-ish) + moisture (0..1) for a unit
+   * sphere direction and normalized terrain height. When provided, land is colored
+   * by biome; when absent, the mesher falls back to the elevation palette so it
+   * stays usable standalone.
+   */
+  climateFn?: (dir: Vector3, height: number) => { temperature: number; moisture: number };
 }
 
 export interface ChunkMeshData {
@@ -232,16 +239,167 @@ function elevationColor(e: number, slope: number, out: Float32Array, base: numbe
 }
 
 // ---------------------------------------------------------------------------
+// Biome coloring (climate-driven). Used when ChunkParams.climateFn is provided.
+//   - Seabed (e < 0): identical geology palette to elevationColor (verbatim) —
+//     the water shell draws the ocean, climate does not recolor the seabed.
+//   - Land (e ≥ 0): biome chosen from temperature (°C) + moisture (0..1), blended
+//     smoothly (no hard biome edges). Ice/snow where it's cold (caps poles AND
+//     peaks via a temperature-driven snow line), desert where dry, forests/
+//     grassland/tundra otherwise. High elevation trends rocky; cliffs → rock grey.
+// ---------------------------------------------------------------------------
+
+const SNOW_TEMP = -2;     // °C — below this, land trends to snow/ice (blended over a few °C)
+const SNOW_BLEND = 5;     // °C window over which snow fades in below SNOW_TEMP
+
+function smoothstepM(e0: number, e1: number, x: number): number {
+  const t = clamp01((x - e0) / (e1 - e0));
+  return t * t * (3 - 2 * t);
+}
+
+export function biomeColor(
+  e: number,
+  slope: number,
+  temperature: number,
+  moisture: number,
+  out: Float32Array,
+  base: number,
+): void {
+  let r: number, g: number, b: number;
+
+  if (e < 0) {
+    // ---- SEABED (verbatim copy of elevationColor's seabed branch) -----------
+    const rAby = 0x23 / 255, gAby = 0x22 / 255, bAby = 0x20 / 255;
+    const rDep = 0x3a / 255, gDep = 0x35 / 255, bDep = 0x2c / 255;
+    const rSlp = 0x60 / 255, gSlp = 0x54 / 255, bSlp = 0x42 / 255;
+    const rShf = 0x9c / 255, gShf = 0x8a / 255, bShf = 0x66 / 255;
+
+    if (e < -0.55) {
+      r = rAby; g = gAby; b = bAby;
+    } else if (e < -0.18) {
+      const t = clamp01((e + 0.55) / 0.015);
+      r = lerp(rAby, rDep, t);
+      g = lerp(gAby, gDep, t);
+      b = lerp(bAby, bDep, t);
+    } else if (e < -0.045) {
+      const t = clamp01((e + 0.18) / 0.015);
+      r = lerp(rDep, rSlp, t);
+      g = lerp(gDep, gSlp, t);
+      b = lerp(bDep, bSlp, t);
+    } else {
+      const t = clamp01((e + 0.045) / 0.015);
+      r = lerp(rSlp, rShf, t);
+      g = lerp(gSlp, gShf, t);
+      b = lerp(bSlp, bShf, t);
+    }
+
+  } else {
+    // ---- LAND: biome by (temperature, moisture) -----------------------------
+    // Palette (all generic — Earth's look emerges from Earth-like params):
+    const sandHot = [0xc2 / 255, 0xa8 / 255, 0x78 / 255];   // hot dry desert
+    const sandCold = [0x9a / 255, 0x8c / 255, 0x70 / 255];  // cold dry / rocky steppe
+    const grass = [0x8f / 255, 0x95 / 255, 0x55 / 255];     // grassland / steppe
+    const tropical = [0x2f / 255, 0x6b / 255, 0x34 / 255];  // hot wet jungle
+    const temperate = [0x4f / 255, 0x7a / 255, 0x45 / 255]; // temperate forest
+    const tundra = [0x6b / 255, 0x6f / 255, 0x57 / 255];    // cold sparse (brown-grey)
+    const rock = [0x7a / 255, 0x70 / 255, 0x60 / 255];      // bare rock (matches elevationColor)
+    const snow = [0xe6 / 255, 0xe8 / 255, 0xeb / 255];      // ice / snow
+
+    // --- 1. Beach sand at the waterline, seamless with the seabed shelf. -----
+    // (kept so coastlines read as sand regardless of biome, like elevationColor)
+    const rShf = 0x9c / 255, gShf = 0x8a / 255, bShf = 0x66 / 255;
+
+    // --- 2. Dry vs vegetated axis -------------------------------------------
+    // dryness: 1 when very dry (M→0), 0 when moist (M ≥ ~0.3).
+    const dry = 1 - smoothstepM(0.25, 0.32, moisture);
+    // Within dry: hot deserts vs cold steppe (by temperature).
+    const hotDry = smoothstepM(2, 14, temperature);
+    const desertR = lerp(sandCold[0], sandHot[0], hotDry);
+    const desertG = lerp(sandCold[1], sandHot[1], hotDry);
+    const desertB = lerp(sandCold[2], sandHot[2], hotDry);
+
+    // --- 3. Vegetated biome by temperature ----------------------------------
+    // Build along the temperature axis: tundra (cold) → temperate forest (mild)
+    // → tropical (hot). Tropical additionally requires moisture, else it stays
+    // temperate. Smoothstep windows keep the transitions soft (no hard edges).
+    const tWarm = smoothstepM(2, 8, temperature);        // 0 cold (tundra), 1 by 8°C (forest)
+    const tHot = smoothstepM(18, 24, temperature);       // 0 mild, 1 by 24°C
+    const tropWet = smoothstepM(0.45, 0.62, moisture);   // tropical needs moisture too
+    const tropMix = tHot * tropWet;
+    // mild-end color: temperate forest, pushed toward tropical when hot AND wet.
+    const mildR = lerp(temperate[0], tropical[0], tropMix);
+    const mildG = lerp(temperate[1], tropical[1], tropMix);
+    const mildB = lerp(temperate[2], tropical[2], tropMix);
+    // blend from tundra (cold) up to the mild/hot color as it warms.
+    let vegR = lerp(tundra[0], mildR, tWarm);
+    let vegG = lerp(tundra[1], mildG, tWarm);
+    let vegB = lerp(tundra[2], mildB, tWarm);
+
+    // --- 4. Grassland/steppe for middling moisture (between desert and forest) -
+    // Peaks around M ≈ 0.25..0.5; suppressed in true tropical (hot+wet) regions.
+    const grassW = smoothstepM(0.25, 0.4, moisture) * (1 - smoothstepM(0.5, 0.62, moisture)) * (1 - tropMix);
+    vegR = lerp(vegR, grass[0], grassW);
+    vegG = lerp(vegG, grass[1], grassW);
+    vegB = lerp(vegB, grass[2], grassW);
+
+    // --- 5. Combine dry (desert) with vegetated along the dryness axis -------
+    r = lerp(vegR, desertR, dry);
+    g = lerp(vegG, desertG, dry);
+    b = lerp(vegB, desertB, dry);
+
+    // --- 6. Beach sand at the immediate waterline ---------------------------
+    if (e < 0.012) {
+      const t = clamp01(e / 0.012);
+      // From shelf sand up to the chosen biome color (so beaches read sandy).
+      r = lerp(rShf, r, t);
+      g = lerp(gShf, g, t);
+      b = lerp(bShf, b, t);
+    }
+
+    // --- 7. High elevation trends rocky -------------------------------------
+    // Above e ≈ 0.5 blend toward bare rock (the T-driven snow below caps peaks).
+    if (e > 0.5) {
+      const rockT = smoothstepM(0.5, 0.72, e);
+      r = lerp(r, rock[0], rockT);
+      g = lerp(g, rock[1], rockT);
+      b = lerp(b, rock[2], rockT);
+    }
+
+    // --- 8. Snow / ice by TEMPERATURE (latitude- AND altitude-dependent) -----
+    // T already falls with both latitude and altitude, so this gives polar ice
+    // caps at sea level AND a natural snow line on cold peaks. Blended over a few °C.
+    if (temperature < SNOW_TEMP + SNOW_BLEND) {
+      const snowT = 1 - smoothstepM(SNOW_TEMP, SNOW_TEMP + SNOW_BLEND, temperature);
+      r = lerp(r, snow[0], snowT);
+      g = lerp(g, snow[1], snowT);
+      b = lerp(b, snow[2], snowT);
+    }
+
+    // --- 9. Slope override (land only): cliffs → rock grey #6e6a64 ----------
+    if (slope > 0.22) {
+      const rockBlend = clamp01((slope - 0.22) / 0.20);
+      r = lerp(r, 0x6e / 255, rockBlend);
+      g = lerp(g, 0x6a / 255, rockBlend);
+      b = lerp(b, 0x64 / 255, rockBlend);
+    }
+  }
+
+  out[base    ] = r;
+  out[base + 1] = g;
+  out[base + 2] = b;
+}
+
+// ---------------------------------------------------------------------------
 // Main builder
 // ---------------------------------------------------------------------------
 
 export function buildChunkGeometry(p: ChunkParams): ChunkMeshData {
-  const { faceIndex, level, ix, iy, resolution: res, radius, heightScale, heightFn, plateColorFn } = p;
+  const { faceIndex, level, ix, iy, resolution: res, radius, heightScale, heightFn, plateColorFn, climateFn } = p;
   // Convenience: heightFn with level pre-bound — avoids repeating `level` at every call site
   // inside this function (all vertices in a chunk share the same LOD level).
   const hFn = (dir: Vector3): number => heightFn(dir, level);
   const basis = FACE_BASES[faceIndex];
   const hasPlateColor = plateColorFn !== undefined;
+  const hasClimate = climateFn !== undefined;
 
   // Vertex counts
   const gridSize    = res + 1;              // vertices per side of interior grid
@@ -408,7 +566,12 @@ export function buildChunkGeometry(p: ChunkParams): ChunkMeshData {
       // hFn is pre-bound to this chunk's level so the same octave count applies.
       const h = hFn(dir); // dir is set by evalVertex
       const slope = 1 - nrm.dot(dir);
-      elevationColor(h, slope, colors, vi * 3);
+      if (hasClimate) {
+        const cs = climateFn!(dir, h);
+        biomeColor(h, slope, cs.temperature, cs.moisture, colors, vi * 3);
+      } else {
+        elevationColor(h, slope, colors, vi * 3);
+      }
 
       // Plate color (if provided)
       if (hasPlateColor && plateColors !== null) {

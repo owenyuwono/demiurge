@@ -229,6 +229,8 @@ async function main(): Promise<void> {
     maxDepth: 18,
     water: true,
     waterLevel: 0.5,
+    baseTemp: 15,
+    atmosphere: 0.6,
     seed: String(seed),
     randomizeSeed: () => {
       const newSeed = (Math.random() * 2 ** 31) | 0
@@ -302,7 +304,22 @@ async function main(): Promise<void> {
 
   const motionFolder = gui.addFolder('Motion')
   motionFolder.add(ui, 'spin').name('spin')
-  motionFolder.add(ui, 'spinPeriodS', 60, 3600).name('period (s)')
+  // Rotation period drives both the visual spin (live) and the climate band count
+  // (faster spin → more circulation cells); the band-count change applies on regenerate.
+  motionFolder.add(ui, 'spinPeriodS', 60, 3600).name('period (s)').onChange((v: number) => {
+    planet.setRotationPeriod(v)
+  })
+
+  // Climate: base temp = planet class (frozen↔temperate↔desert), atmosphere = how
+  // uniform vs extreme the gradients are. Both apply on regenerate (they rebuild the
+  // temperature/moisture fields and rebake biome colors).
+  const climateFolder = gui.addFolder('Climate')
+  climateFolder.add(ui, 'baseTemp', -40, 60, 1).name('base temp °C').onChange((v: number) => {
+    planet.setBaseTemp(v)
+  })
+  climateFolder.add(ui, 'atmosphere', 0, 1, 0.01).name('atmosphere').onChange((v: number) => {
+    planet.setAtmosphere(v)
+  })
 
   // LOD tuning: targetTriPx and maxDepth are live — no rebuild needed.
   const lodFolder = gui.addFolder('LOD')
