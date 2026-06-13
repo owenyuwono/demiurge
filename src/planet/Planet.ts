@@ -4,13 +4,15 @@ import {
   Mesh,
   MeshBasicMaterial,
   MeshStandardMaterial,
+  Points,
+  PointsMaterial,
   Vector3,
   Matrix4,
   Quaternion,
 } from 'three'
 import { MeshBasicNodeMaterial } from 'three/webgpu'
 import { attribute } from 'three/tsl'
-import { createNoise3D, ridged } from './noise'
+import { createNoise3D, ridged, fbm, erosionFbm } from './noise'
 import { Tectonics, TectonicQuery, boundaryRelief } from './tectonics'
 import { buildChunkGeometry, ChunkMeshData } from './ChunkMesher'
 import { QuadtreeNode } from './QuadtreeNode'
@@ -29,15 +31,19 @@ interface PlanetOptions {
   maxDepth?: number
   splitFactor?: number
   plateCount?: number
+  /** Target triangle pixel size for the SSE LOD metric (default 2.5). */
+  targetTriPx?: number
 }
 
 interface Stats {
   leaves: number
   cached: number
+  minLevel: number
   maxLevel: number
   pendingBuilds: number
   lastBuildMs: number
   plates: number
+  volcanoes: number
 }
 
 // ---------------------------------------------------------------------------
@@ -112,30 +118,68 @@ class CachedMeshData {
 // Constants
 // ---------------------------------------------------------------------------
 
-const BUILD_BUDGET_PER_FRAME = 4 // reduced from 6: tectonic heightFn is ~2-3× costlier per vertex
-const LRU_CAPACITY = 900
-const HYSTERESIS = 0.15 // 15% — merge threshold = splitFactor * (1 + HYSTERESIS)
+const BUILD_BUDGET_PER_FRAME = 96 // aggressive — brute-force surface refinement (accepts frame hitches)
+const BUILD_BUDGET_MS = 30        // up to 30 ms/frame on meshing — will drop fps while catching up
+const LRU_CAPACITY = 4096         // hold a larger fine working set without evicting visible chunks
+const HYSTERESIS = 0.15 // 15% — SSE merge fires at threshold * (1 + HYSTERESIS)
+const EPS_DIST = 0.1    // minimum camera-to-node distance (prevents div-by-zero at contact)
 
 // Tectonic heightFn tuning constants
 // Note: boundary profile constants live in boundaryRelief() in tectonics.ts
 // Crust-keyed base height constants
-const TECT_LAND_BASE_0         = -0.01
-const TECT_LAND_BASE_SS        = 0.12   // smoothstep gain inland
+const TECT_LAND_BASE_0         = 0.06   // coastline base
+const TECT_LAND_BASE_SS        = 0.17   // smoothstep gain inland (interiors climb to ~0.23+)
 const TECT_LAND_PLATE_MOD      = 0.15   // plate.baseElevation modifier on land
 const TECT_OCEAN_BASE_0        = -0.42
 const TECT_OCEAN_DEPTH_AMP     = 0.10   // abyssal deepening
 const TECT_OCEAN_DEPTH_SAT     = 0.45   // saturation distance (radians)
 const TECT_OCEAN_PLATE_MOD     = 0.10   // plate.baseElevation modifier on ocean
 const TECT_SHELF_W_PASSIVE     = 0.12   // wide passive shelf
-const TECT_SHELF_W_ACTIVE      = 0.012  // narrow active margin shelf
-const TECT_COAST_LERP_HI       = 0.012  // crust→ocean transition edge hi
-const TECT_INTERIOR_DAMP_A     = 0.55   // craton interior smoothing floor
-const TECT_INTERIOR_DAMP_B     = 0.45   // craton interior smoothing range
-const TECT_INTERIOR_DAMP_SCALE = 0.18   // craton distance scale (radians)
-const TECT_DETAIL_FBM          = 0.14   // detail fbm amplitude
-const TECT_DETAIL_FBM_SCALE    = 3.2    // fbm frequency scale
-const TECT_DETAIL_RIDGE        = 0.07   // ridged amplitude on land only
-const TECT_DETAIL_RIDGE_SCALE  = 7.0    // ridged frequency scale
+const TECT_SHELF_W_ACTIVE      = 0.045  // active margin shelf — narrower than passive (2.7× contrast)
+const TECT_SHELF_W_STAGNANT    = 0.045  // stagnant-lid shelf — narrow (no wide passive margin tectonics)
+const TECT_COAST_LERP_HI       = 0.018  // crust→ocean transition edge hi [was 0.012 — gentler coast ramp trims the 120m base step where a breaching cone coincides]
+// Highlands (signed fbm: plateaus AND basins)
+const TECT_HIGHLANDS_AMP       = 0.12   // [was 0.42] de-saturation pass — flatter interiors raise mountain prominence
+const TECT_HIGHLANDS_FREQ      = 1.9
+const TECT_HIGHLANDS_OCT       = 5
+const TECT_HIGHLANDS_SS_LO     = 0.012
+const TECT_HIGHLANDS_SS_HI     = 0.10
+// Paleo-orogens (fossil ranges)
+const TECT_PALEO_AMP           = 0.16   // tectonic regime (16-plate path) — original value
+const TECT_PALEO_AMP_STAGNANT  = 1.10   // stagnant-lid regime only (plateCount 0 or 1) — higher because boundaryRelief=0
+const TECT_PALEO_SIGMA         = 0.10   // gaussian half-width in radians
+const TECT_PALEO_FREQ          = 2.6
+const TECT_PALEO_OCT           = 5
+const TECT_PALEO_SS_LO         = 0.012
+const TECT_PALEO_SS_HI         = 0.08
+// Elevation-coupled interior detail
+const TECT_HILL_AMP_BASE       = 0.10
+const TECT_HILL_AMP_RANGE      = 0.10
+const TECT_HILL_SS_LO          = 0.05
+const TECT_HILL_SS_HI          = 0.30
+const TECT_DETAIL_FBM_SCALE    = 3.2    // fbm frequency scale (unchanged)
+const TECT_DETAIL_RIDGE        = 0.05   // ridged amplitude on land only [was 0.07 — trims coast-adjacent step for GATE X 120m]
+const TECT_DETAIL_RIDGE_SCALE  = 7.0    // ridged frequency scale (unchanged)
+// Offshore island / skerry band
+const TECT_ISLAND_AMP          = 0.12
+const TECT_ISLAND_FREQ         = 14.0
+const TECT_ISLAND_OCT          = 4
+const TECT_ISLAND_THRESH       = 0.55
+const TECT_ISLAND_COAST_LO     = -0.05  // crustDist band lo
+const TECT_ISLAND_COAST_HI     = -0.005 // crustDist band hi
+
+// Arc-volcano headroom blend: volcano cone is attenuated by (1 - smoothstep(LO,HI,terrainH))
+// so summits on already-high terrain stay well below the clamp (visible crater, no crease),
+// while cones over low terrain (ocean → islands) keep full strength and still breach.
+// HI lowered to ~0.50 (terrain never approaches 1.0 after de-saturation, so the old
+// HI=1.0 barely engaged) — a cone on a 0.25-high platform is now ~70% strength, on a
+// 0.40+ cordillera nearly gone, while abyssal/ocean cones (terrainH < LO) are untouched.
+const TECT_VOLC_HEADROOM_LO    = 0.15
+const TECT_VOLC_HEADROOM_HI    = 0.50
+// Cap on the summed volcano-cone contribution. A single breaching cone (≤ ~0.64) is
+// well under this; the cap only bites where multiple cones overlap, preventing stacked
+// summits from blowing past the [-1,1] clamp (the H' max-saturation outlier).
+const TECT_VOLC_SUM_MAX        = 0.64
 
 // ---------------------------------------------------------------------------
 // Planet
@@ -147,9 +191,34 @@ export class Planet extends Group {
   private readonly radius: number
   private readonly heightScale: number
   private readonly resolution: number
-  private readonly maxDepth: number
+
+  /** Maximum quadtree depth. Live-tuneable via setMaxDepth(). */
+  maxDepth: number
+
+  /** Legacy split-distance factor (kept for merge threshold computation only). */
   private readonly splitFactor: number
+
+  /**
+   * Target triangle pixel size for the SSE split metric.
+   * Split when a chunk's projected edge spans more than (resolution * targetTriPx) pixels.
+   * Live-tuneable. Default 2.5 → splitThresholdPx ≈ 80 px for resolution=32.
+   */
+  targetTriPx: number
+
+  /**
+   * Camera vertical FOV in radians — updated every update() call.
+   * Initialised to 60° (typical default) so getSurfaceRadiusAt is usable before first update().
+   */
+  private _vFovRadians: number
+
+  /**
+   * Drawing-buffer height in pixels — updated every update() call.
+   * Initialised to 1080 as a safe fallback.
+   */
+  private _screenHeightPx: number
+
   private plateCount: number
+  private arcDensity = 1.0
 
   private heightFn!: (dir: Vector3, level: number) => number
 
@@ -168,6 +237,9 @@ export class Planet extends Group {
   /** Currently visible leaf meshes keyed by node key. */
   private readonly visibleMeshes = new Map<string, Mesh>()
 
+  /** Points overlays for visible chunks keyed by node key (only populated when _showVertices is on). */
+  private readonly visiblePoints = new Map<string, Points>()
+
   /** Geometry cache (returns geometry on mesh removal, evicts on overflow). */
   private readonly geoCache = new LruCache<CachedMeshData>(LRU_CAPACITY)
 
@@ -175,10 +247,11 @@ export class Planet extends Group {
    * Build queue for pending geometries. Each entry records:
    *  - key: node key
    *  - node: the QuadtreeNode to build
+   *  - priority: projected-pixel size at enqueue time — higher = closer to camera, builds first
    *  - waitingFor: "split-ready" — parent key this belongs to (or null if it's
    *    a standalone leaf or a parent being built for merge)
    */
-  private readonly buildQueue: Array<{ key: string; node: QuadtreeNode }> = []
+  private readonly buildQueue: Array<{ key: string; node: QuadtreeNode; priority: number }> = []
   private readonly buildQueueSet = new Set<string>()
 
   /**
@@ -200,13 +273,19 @@ export class Planet extends Group {
   >()
 
   // Materials
+  /** Shared lit material for normal view — one instance, never disposed per-mesh. */
   private readonly normalMaterial: MeshStandardMaterial
   private readonly debugMaterials: MeshBasicMaterial[]
   /** Plate-color node material (flat, unlit, reads 'plateColor' attribute). Created once. */
   private readonly plateColorMaterial: MeshBasicNodeMaterial
+  /** Pure unlit wireframe — white edges only, no fill, no lighting. */
+  private readonly wireMaterial: MeshBasicMaterial
+  /** Shared points material for vertex overlay — yellow constant-size screen-space dots. */
+  private readonly pointsMaterial: PointsMaterial
   private debugColorsActive = false
   private tectonicsViewActive = false
   private wireframeActive = false
+  private _showVertices = false
 
   // Cached inverse world matrix + quaternion for rotation-safe transforms
   // Re-computed each update() call.
@@ -215,6 +294,8 @@ export class Planet extends Group {
   // Scratch vectors — preallocated, zero allocations in hot paths
   private readonly _camLocalScratch = new Vector3()
   private readonly _dirLocalScratch = new Vector3()
+  // SSE scratch: holds (camPos - nodeCenter) for nearest-point distance computation.
+  private readonly _sseScratch = new Vector3()
 
   // Stats
   private lastBuildMs = 0
@@ -233,12 +314,13 @@ export class Planet extends Group {
     this.maxDepth = opts.maxDepth ?? 10
     this.splitFactor = opts.splitFactor ?? 3.0
     this.plateCount = opts.plateCount ?? 16
+    this.targetTriPx = opts.targetTriPx ?? 2.5
+    // Safe fallbacks — caller updates these on the first update() call.
+    this._vFovRadians = Math.PI / 3  // 60°
+    this._screenHeightPx = 1080
 
-    this.normalMaterial = new MeshStandardMaterial({
-      vertexColors: true,
-      roughness: 1,
-      metalness: 0,
-    })
+    // Shared normal-view material — one instance for all terrain chunks.
+    this.normalMaterial = new MeshStandardMaterial({ vertexColors: true, roughness: 1, metalness: 0 })
 
     // Pre-build per-level debug materials with a distinct hue per level
     this.debugMaterials = Array.from({ length: this.maxDepth + 1 }, (_, i) => {
@@ -253,6 +335,14 @@ export class Planet extends Group {
     this.plateColorMaterial = new MeshBasicNodeMaterial()
     this.plateColorMaterial.colorNode = attribute('plateColor', 'vec3')
     this.plateColorMaterial.vertexColors = false
+
+    // Pure unlit wireframe: white edges only, no fill, no lighting.
+    // When wireframe mode is on, every chunk renders with this material regardless of view mode.
+    this.wireMaterial = new MeshBasicMaterial({ color: 0xffffff, wireframe: true })
+
+    // Vertex dot overlay: yellow constant screen-space dots (sizeAttenuation false keeps
+    // them at a fixed pixel size at any zoom level).
+    this.pointsMaterial = new PointsMaterial({ color: 0xffff00, size: 2.5, sizeAttenuation: false })
 
     this.buildHeightFn(opts.seed)
     this.buildTectonicsDebug(opts.seed)
@@ -273,9 +363,17 @@ export class Planet extends Group {
    * update() is rotation-safe: converts cameraWorldPos to planet-local space
    * before any LOD math. Call it with the camera's world-space position even
    * when the planet group is tilted + spinning.
+   *
+   * @param cameraWorldPos  World-space camera position (Three.js world coordinates).
+   * @param vFovRadians     Camera vertical FOV in radians (camera.fov is degrees — convert before passing).
+   * @param screenHeightPx  Drawing-buffer height in pixels (renderer.getDrawingBufferSize().y).
    */
-  update(cameraWorldPos: Vector3): void {
+  update(cameraWorldPos: Vector3, vFovRadians: number, screenHeightPx: number): void {
     if (this.frozen) return
+
+    // Store for use in SSE metric throughout this frame.
+    this._vFovRadians = vFovRadians
+    this._screenHeightPx = screenHeightPx
 
     // Cache inverse world transform once per frame (rigid body: translate + rotate only).
     this.updateMatrixWorld()
@@ -294,9 +392,33 @@ export class Planet extends Group {
 
   setWireframe(on: boolean): void {
     this.wireframeActive = on
-    this.normalMaterial.wireframe = on
-    for (const m of this.debugMaterials) m.wireframe = on
-    this.plateColorMaterial.wireframe = on
+    // When on: every visible chunk swaps to wireMaterial (pure unlit white edges, no fill).
+    // When off: each chunk reverts to its normal materialFor(level) material.
+    for (const [, mesh] of this.visibleMeshes) {
+      mesh.material = on
+        ? this.wireMaterial
+        : this.materialFor(this.levelFromKey(mesh.userData.key as string))
+    }
+  }
+
+  setShowVertices(on: boolean): void {
+    this._showVertices = on
+    if (on) {
+      // Create Points overlays for all currently-visible chunks.
+      for (const [key, mesh] of this.visibleMeshes) {
+        if (!this.visiblePoints.has(key)) {
+          this._addPoints(key, mesh)
+        }
+      }
+    } else {
+      // Remove all Points overlays.
+      for (const [, pts] of this.visiblePoints) {
+        this.remove(pts)
+        // Do NOT dispose pts.geometry — it is the shared chunk geometry owned by the LRU cache.
+        // Only dispose the Points object itself (no GPU resources beyond the shared geometry reference).
+      }
+      this.visiblePoints.clear()
+    }
   }
 
   setDebugColors(on: boolean): void {
@@ -306,8 +428,11 @@ export class Planet extends Group {
       this.tectonicsViewActive = false
       this.tectonicsDebug.visible = false
     }
-    for (const [, mesh] of this.visibleMeshes) {
-      mesh.material = this.materialFor(this.levelFromKey(mesh.userData.key as string))
+    // Wireframe overrides view-mode material; only swap when wireframe is off.
+    if (!this.wireframeActive) {
+      for (const [, mesh] of this.visibleMeshes) {
+        mesh.material = this.materialFor(this.levelFromKey(mesh.userData.key as string))
+      }
     }
   }
 
@@ -318,9 +443,11 @@ export class Planet extends Group {
     if (on && this.debugColorsActive) {
       this.debugColorsActive = false
     }
-    // Swap chunk materials to/from plate-color node material.
-    for (const [, mesh] of this.visibleMeshes) {
-      mesh.material = this.materialFor(this.levelFromKey(mesh.userData.key as string))
+    // Wireframe overrides view-mode material; only swap when wireframe is off.
+    if (!this.wireframeActive) {
+      for (const [, mesh] of this.visibleMeshes) {
+        mesh.material = this.materialFor(this.levelFromKey(mesh.userData.key as string))
+      }
     }
   }
 
@@ -338,19 +465,50 @@ export class Planet extends Group {
 
   /**
    * Set the desired plate count for the next regenerate() call.
-   * Clamped to [4, 48]. Has no effect on the current terrain — takes effect
-   * on the next regenerate(seed) invocation.
+   * Clamped to [0, 48]. Values 0 or 1 trigger the non-tectonic (stagnant-lid) regime.
+   * Has no effect on the current terrain — takes effect on the next regenerate(seed) invocation.
    */
   setPlateCount(n: number): void {
-    this.plateCount = Math.max(4, Math.min(48, n))
+    this.plateCount = Math.max(0, Math.min(48, n))
+  }
+
+  /**
+   * Set the desired arc density for the next regenerate() call.
+   * Clamped to [0.2, 3]. Has no effect on the current terrain — takes effect
+   * on the next regenerate(seed) invocation.
+   */
+  setArcDensity(d: number): void {
+    this.arcDensity = Math.max(0.2, Math.min(3, d))
+  }
+
+  /**
+   * Live-set the maximum quadtree depth.
+   * Clamped to [4, 20]. Takes effect on the next update() call (no rebuild needed).
+   */
+  setMaxDepth(n: number): void {
+    this.maxDepth = Math.max(4, Math.min(20, n))
+  }
+
+  /**
+   * Live-set the SSE target triangle pixel size.
+   * Clamped to [0.5, 32]. Takes effect on the next update() call.
+   */
+  setTargetTriPx(n: number): void {
+    this.targetTriPx = Math.max(0.5, Math.min(32, n))
   }
 
   regenerate(seed: number): void {
+    // Remove all Points overlays first (geometry is owned by the mesh, disposed below).
+    for (const pts of this.visiblePoints.values()) {
+      this.remove(pts)
+    }
+    this.visiblePoints.clear()
     // Remove all visible meshes from scene and dispose their geometries explicitly
     // (visible geometries are NOT in the cache — invariant: cache holds only non-displayed geometries)
     for (const mesh of this.visibleMeshes.values()) {
       this.remove(mesh)
       ;(mesh.geometry as BufferGeometry).dispose()
+      // Shared materials (normalMaterial, debugMaterials, plateColorMaterial, wireMaterial) are NOT disposed per-mesh.
     }
     this.visibleMeshes.clear()
 
@@ -397,31 +555,46 @@ export class Planet extends Group {
   }
 
   getStats(): Stats {
+    let minLevel = Infinity
     let maxLevel = 0
     for (const [key] of this.visibleMeshes) {
-      maxLevel = Math.max(maxLevel, this.levelFromKey(key))
+      const lv = this.levelFromKey(key)
+      if (lv < minLevel) minLevel = lv
+      if (lv > maxLevel) maxLevel = lv
     }
+    if (this.visibleMeshes.size === 0) minLevel = 0
     return {
       leaves: this.visibleMeshes.size,
       cached: this.geoCache.size,
+      minLevel,
       maxLevel,
       pendingBuilds: this.buildQueue.length,
       lastBuildMs: this.lastBuildMs,
       plates: this.tectonics.plates.length,
+      volcanoes: this.tectonics.volcanoes.length,
     }
   }
 
   dispose(): void {
-    // Dispose visible mesh geometries explicitly (not in cache — invariant)
+    // Remove all Points overlays (geometry shared with meshes — do NOT dispose it here).
+    for (const pts of this.visiblePoints.values()) {
+      this.remove(pts)
+    }
+    this.visiblePoints.clear()
+    // Dispose visible mesh geometries explicitly
+    // (not in cache — invariant: cache holds only non-displayed geometries)
     for (const mesh of this.visibleMeshes.values()) {
       this.remove(mesh)
       ;(mesh.geometry as BufferGeometry).dispose()
+      // Shared materials are disposed once below — not per-mesh.
     }
     this.visibleMeshes.clear()
     this.geoCache.disposeAll()
     this.normalMaterial.dispose()
     for (const m of this.debugMaterials) m.dispose()
     this.plateColorMaterial.dispose()
+    this.wireMaterial.dispose()
+    this.pointsMaterial.dispose()
     this.tectonicsDebug.dispose()
     this.gizmos.dispose()
   }
@@ -438,18 +611,27 @@ export class Planet extends Group {
   private buildHeightFn(seed: number): void {
     const noise = createNoise3D(seed)
 
-    this.tectonics = new Tectonics({ seed, plateCount: this.plateCount })
+    this.tectonics = new Tectonics({ seed, plateCount: this.plateCount, arcDensity: this.arcDensity })
     const plates = this.tectonics.plates
 
+    // Regime selection — hoisted out of the per-vertex closure (branch-free in hot path).
+    // plateCount===0 and ===1 both produce plates.length===1 (the non-tectonic stagnant-lid case).
+    const isStagnantLid = plates.length === 1
+    const paleoAmp    = isStagnantLid ? TECT_PALEO_AMP_STAGNANT  : TECT_PALEO_AMP
+    const shelfWBase  = isStagnantLid ? TECT_SHELF_W_STAGNANT    : TECT_SHELF_W_PASSIVE
+
     // One scratch TectonicQuery per heightFn call — safe because heightFn is called serially.
-    const scratch: TectonicQuery = { plateId: 0, neighborId: 0, boundaryDist: 0, convergence: 0, shear: 0, crustDist: 0 }
+    const scratch: TectonicQuery = { plateId: 0, neighborId: 0, boundaryDist: 0, convergence: 0, shear: 0, crustDist: 0, paleoDist: 0, otherCrustDist: 0 }
 
     // Separate scratch for plateColorFn (both called back-to-back on the same dir — see memo below).
     // 1-entry memoization: if dir.x/y/z identical to the previous heightFn call, reuse the
     // query result for plateColorFn, halving Voronoi cost under serial meshing.
+    // The memo now stores the full query so plateColorFn can read boundaryDist/convergence/shear.
     let memoX = NaN, memoY = NaN, memoZ = NaN
-    let memoPlateId = 0
-    const scratchColor: TectonicQuery = { plateId: 0, neighborId: 0, boundaryDist: 0, convergence: 0, shear: 0, crustDist: 0 }
+    let memoBoundaryDist = 0, memoConvergence = 0, memoShear = 0, memoPlateId = 0
+    const scratchColor: TectonicQuery = { plateId: 0, neighborId: 0, boundaryDist: 0, convergence: 0, shear: 0, crustDist: 0, paleoDist: 0, otherCrustDist: 0 }
+    // Preallocated scratch tuple for plateColorFn — zero allocations in the hot path.
+    const _colorScratch: [number, number, number] = [0, 0, 0]
 
     // Smoothstep helper (in-scope for heightFn closure)
     const _ss3 = (e0: number, e1: number, x: number): number => {
@@ -460,6 +642,13 @@ export class Planet extends Group {
     // ridgedFn wraps ridged() for boundaryRelief's ridgedAt callback (captures the noise instance)
     const ridgedFn = (d: Vector3, freq: number, octaves: number): number =>
       ridged(noise, d.x * freq, d.y * freq, d.z * freq, { octaves })
+
+    // erosionFbmFn wraps erosionFbm for belt/cordillera texture terms in boundaryRelief
+    // erosionFbm outputs ≈[-1,1]; map to [0,1] like ridged does
+    const erosionFbmFn = (d: Vector3, freq: number, octaves: number): number => {
+      const ev = erosionFbm(noise, d.x * freq, d.y * freq, d.z * freq, { octaves, erosion: 8 })
+      return ev * 0.5 + 0.5
+    }
 
     // ---------------------------------------------------------------------------
     // Level-adaptive detail octave count:
@@ -513,41 +702,57 @@ export class Planet extends Group {
       const own = plates[scratch.plateId]
       const c = scratch.crustDist  // signed SDF: + = crust/land, - = ocean
 
-      // Memoize last queried dir for plateColorFn re-use
+      // Memoize last queried dir for plateColorFn re-use (full query state)
       memoX = x; memoY = y; memoZ = z
       memoPlateId = scratch.plateId
+      memoBoundaryDist = scratch.boundaryDist
+      memoConvergence = scratch.convergence
+      memoShear = scratch.shear
 
-      // Crust-keyed base elevation
-      const landBase  = TECT_LAND_BASE_0
-                      + TECT_LAND_BASE_SS * _ss3(0, 0.25, c)
-                      + own.baseElevation * TECT_LAND_PLATE_MOD
-
+      // --- Ocean base (unchanged) ---
       const oceanBase = TECT_OCEAN_BASE_0
                       - TECT_OCEAN_DEPTH_AMP * Math.min(1, Math.sqrt(Math.max(0, -c) / TECT_OCEAN_DEPTH_SAT))
                       + own.baseElevation * TECT_OCEAN_PLATE_MOD
 
-      // Shelf width narrows at active margins
+      // --- Land base: interiors climb to ~0.19+ ---
+      const landBase = TECT_LAND_BASE_0
+                     + TECT_LAND_BASE_SS * _ss3(0, 0.30, c)
+                     + own.baseElevation * TECT_LAND_PLATE_MOD
+
+      // --- Highlands: signed fbm gives plateaus AND basins; inland only ---
+      const highlands = TECT_HIGHLANDS_AMP
+                      * fbm(noise, x * TECT_HIGHLANDS_FREQ, y * TECT_HIGHLANDS_FREQ, z * TECT_HIGHLANDS_FREQ,
+                            { octaves: TECT_HIGHLANDS_OCT })
+                      * _ss3(TECT_HIGHLANDS_SS_LO, TECT_HIGHLANDS_SS_HI, c)
+
+      // --- Paleo-orogens: worn belts along fossil boundaries ---
+      const paleoEnv  = paleoAmp
+                      * Math.exp(-((scratch.paleoDist / TECT_PALEO_SIGMA) ** 2))
+                      * (0.45 + 0.55 * erosionFbm(noise,
+                            x * TECT_PALEO_FREQ, y * TECT_PALEO_FREQ, z * TECT_PALEO_FREQ,
+                            { octaves: TECT_PALEO_OCT, erosion: 8 }))
+                      * _ss3(TECT_PALEO_SS_LO, TECT_PALEO_SS_HI, c)
+
+      // --- Shelf width narrows at active margins ---
       const activeness = (1 - _ss3(0.02, 0.06, scratch.boundaryDist))
                        * _ss3(0.08, 0.25, Math.max(Math.abs(scratch.convergence), Math.abs(scratch.shear)))
-      const shelfW = TECT_SHELF_W_PASSIVE * (1 - activeness) + TECT_SHELF_W_ACTIVE * activeness
+      const shelfW = shelfWBase * (1 - activeness) + TECT_SHELF_W_ACTIVE * activeness
 
-      const base = landBase + (oceanBase - landBase) * (1 - _ss3(-shelfW, TECT_COAST_LERP_HI, c))
+      // --- Base elevation: blend ocean/land across the shelf ---
+      const combinedLand = landBase + highlands + paleoEnv
+      const base = combinedLand + (oceanBase - combinedLand) * (1 - _ss3(-shelfW, TECT_COAST_LERP_HI, c))
 
-      // Boundary relief profile (asymmetric, all regimes)
-      const relief = boundaryRelief(scratch, plates, dir, ridgedFn)
+      // --- Boundary relief profile (asymmetric, all regimes) ---
+      const relief = boundaryRelief(scratch, plates, dir, ridgedFn, erosionFbmFn)
 
-      // Interior smoothing: plate interiors (cratons) have dampened detail noise.
-      const interiorDamp = TECT_INTERIOR_DAMP_A
-                         + TECT_INTERIOR_DAMP_B * Math.exp(-scratch.boundaryDist / TECT_INTERIOR_DAMP_SCALE)
+      // --- Interior detail: elevation-coupled hills (replaces flat interiorDamp suppression) ---
+      const hillAmp = TECT_HILL_AMP_BASE + TECT_HILL_AMP_RANGE * _ss3(TECT_HILL_SS_LO, TECT_HILL_SS_HI, combinedLand)
 
       // LOD-adaptive octave counts (clamped to [base, max])
       const fbmOctaves    = Math.min(Math.max(level + 2, FBM_BASE_OCTAVES),    14)
       const ridgedOctaves = Math.min(Math.max(level - 2, RIDGED_BASE_OCTAVES), 10)
 
       // ---- Detail FBM: additive-octave formulation for LOD consistency --------
-      // Octaves 1..6 computed with normalization fixed at MAX_AMP_FBM6.
-      // Octaves 7..N appended as un-normalized additional terms so low-frequency
-      // content is byte-identical across LOD levels (popping prevention).
       let fbmValue = 0; let fbmAmp = 1;
       const fx = x * TECT_DETAIL_FBM_SCALE, fy = y * TECT_DETAIL_FBM_SCALE, fz = z * TECT_DETAIL_FBM_SCALE;
       let fbmFreq = 1;
@@ -556,12 +761,9 @@ export class Planet extends Group {
         fbmAmp   *= FBM_GAIN;
         fbmFreq  *= FBM_LAC;
       }
-      // Normalize by the FIXED 6-octave sum; extra octaves above 6 are added as
-      // un-normalized deltas — their amplitude is already small enough (0.5^6 ≈ 0.016)
-      // that dividing by the same constant preserves relative scale correctly.
-      const detailFbm = TECT_DETAIL_FBM * (fbmValue / MAX_AMP_FBM6);
+      const detailFbm = hillAmp * (fbmValue / MAX_AMP_FBM6)
 
-      // ---- Detail ridged: same additive strategy with fixed 4-octave base ----
+      // ---- Detail ridged: near coasts only ----
       let ridgedValue = 0; let ridgedAmp = 1; let ridgedFreq = 1;
       const rx = x * TECT_DETAIL_RIDGE_SCALE, ry = y * TECT_DETAIL_RIDGE_SCALE, rz = z * TECT_DETAIL_RIDGE_SCALE;
       for (let o = 0; o < ridgedOctaves; o++) {
@@ -571,25 +773,80 @@ export class Planet extends Group {
         ridgedFreq  *= FBM_LAC;
       }
       const detailRidged = TECT_DETAIL_RIDGE * (ridgedValue / MAX_AMP_RIDGED4) * _ss3(0, 0.08, c) * 2
+                         * (0.7 + 0.3 * Math.exp(-scratch.boundaryDist / 0.18))
 
-      const detail = (detailFbm + detailRidged) * interiorDamp
+      const detail = detailFbm + detailRidged
 
-      return Math.max(-1, Math.min(1, base + relief + detail))
+      // --- Offshore skerries / archipelagos ---
+      const islandBand = _ss3(TECT_ISLAND_COAST_LO, TECT_ISLAND_COAST_LO * 0.5 + TECT_ISLAND_COAST_HI * 0.5, c)
+                       * (1 - _ss3(TECT_ISLAND_COAST_HI * 0.5 + TECT_ISLAND_COAST_LO * 0.5, TECT_ISLAND_COAST_HI, c))
+      let islandH = 0
+      if (islandBand > 0.01) {
+        const iRaw = fbm(noise, x * TECT_ISLAND_FREQ, y * TECT_ISLAND_FREQ, z * TECT_ISLAND_FREQ,
+                         { octaves: TECT_ISLAND_OCT })
+        const iExcess = Math.max(0, iRaw - TECT_ISLAND_THRESH) / (1 - TECT_ISLAND_THRESH)
+        islandH = Math.min(TECT_ISLAND_AMP, TECT_ISLAND_AMP * iExcess) * islandBand
+      }
+
+      // --- Arc volcanoes: headroom-aware additive blend ---
+      // The cone+crater term is ADDED on top of terrain that, on a continental
+      // cordillera (BR_CORD_HEIGHT = 1.30), is already near or above the clamp.
+      // A raw add-then-clamp flat-tops the summit (peak pinned at 1.0), erases the
+      // crater rim/dip, and leaves a clamp-edge crease where the flat top meets the
+      // cone flank (the source of the GATE X 120 m discontinuity on seed 1).
+      //
+      // Fix: attenuate the volcano by the terrain's remaining headroom. Over low
+      // terrain (ocean → islands) the cone is full strength (islands still breach);
+      // where terrain is already high it is faded out, keeping summits below the
+      // clamp (~0.88–0.97) so the crater stays visible and no crease forms.
+      const terrainH = base + relief + detail + islandH      // pre-clamp terrain
+      const volcano  = Math.min(TECT_VOLC_SUM_MAX, this.tectonics.volcanoElevation(dir))
+      const headroom = 1 - _ss3(TECT_VOLC_HEADROOM_LO, TECT_VOLC_HEADROOM_HI, terrainH)
+      return Math.max(-1, Math.min(1, terrainH + volcano * headroom))
     }
 
     // plateColorFn: uses the 1-entry memo to avoid a redundant Voronoi query when
     // the mesher calls heightFn then plateColorFn for the same dir back-to-back.
+    // Near tectonic boundaries, blends a regime tint (red=collision, blue=rift, yellow=shear).
     this._plateColorFn = (dir: Vector3): readonly [number, number, number] => {
       let pid: number
+      let bd: number, conv: number, sh: number
       if (dir.x === memoX && dir.y === memoY && dir.z === memoZ) {
-        // Same dir as last heightFn call — reuse memoized plate id.
         pid = memoPlateId
+        bd = memoBoundaryDist
+        conv = memoConvergence
+        sh = memoShear
       } else {
-        // Different dir (e.g. the origin vertex queried separately) — do a fresh query.
         this.tectonics.query(dir, scratchColor)
         pid = scratchColor.plateId
+        bd = scratchColor.boundaryDist
+        conv = scratchColor.convergence
+        sh = scratchColor.shear
       }
-      return plates[pid].color
+      const base = plates[pid].color
+      // Regime tint near boundaries
+      if (bd < 0.035) {
+        const t = 1 - _ss3(0, 0.035, bd)
+        let tr: number, tg: number, tb: number
+        if (conv > 0.12) {
+          tr = 0.95; tg = 0.18; tb = 0.12
+        } else if (conv < -0.12) {
+          tr = 0.15; tg = 0.35; tb = 0.95
+        } else if (Math.abs(sh) > 0.18) {
+          tr = 0.95; tg = 0.85; tb = 0.15
+        } else {
+          // Quiet boundary — no tint
+          _colorScratch[0] = base[0]; _colorScratch[1] = base[1]; _colorScratch[2] = base[2]
+          return _colorScratch
+        }
+        const blend = 0.65 * t
+        _colorScratch[0] = base[0] * (1 - blend) + tr * blend
+        _colorScratch[1] = base[1] * (1 - blend) + tg * blend
+        _colorScratch[2] = base[2] * (1 - blend) + tb * blend
+        return _colorScratch
+      }
+      _colorScratch[0] = base[0]; _colorScratch[1] = base[1]; _colorScratch[2] = base[2]
+      return _colorScratch
     }
   }
 
@@ -625,19 +882,27 @@ export class Planet extends Group {
 
   /**
    * Walk all 6 quadtrees and collect the desired leaf set.
-   * Split/merge decisions use split threshold and merge threshold (with hysteresis).
-   * Results drive addMesh / removeMesh / schedule builds.
+   *
+   * Split/merge decisions use the screen-space-error (SSE) metric:
+   *   projPx = nodeSize * screenHeightPx / (2 * nearDist * tan(vFov/2))
+   *
+   * where nearDist is the camera distance to the nearest point on the node's
+   * bounding sphere (not just its center). This ensures near-horizon chunks
+   * with far-away centers still subdivide correctly when the player is at eye level.
+   *
+   * Split threshold: projPx > resolution * targetTriPx
+   * Merge threshold: projPx < resolution * targetTriPx / (1 + HYSTERESIS)
    */
   private selectLeaves(cam: Vector3): void {
-    const splitDist = this.splitFactor
-    const mergeDist = this.splitFactor * (1 + HYSTERESIS)
+    // Pixel thresholds derived from targetTriPx and chunk resolution.
+    const { splitThreshPx, mergeThreshPx } = this.lodThresholds()
 
     const desired = new Set<string>()
 
     // Collect desired leaves via recursive descent
     const collect = (node: QuadtreeNode): void => {
-      const dist = cam.distanceTo(node.worldCenter)
-      const wantSplit = node.level < this.maxDepth && dist < splitDist * node.nodeSize
+      const projPx = this.computeProjPx(cam, node)
+      const wantSplit = node.level < this.maxDepth && projPx > splitThreshPx
 
       if (!wantSplit) {
         // This node is a desired leaf
@@ -663,15 +928,18 @@ export class Planet extends Group {
         if (!allChildrenCached) {
           // Still pending — keep parent as leaf for now
           desired.add(node.key)
-          // Ensure missing children are queued
+          // Ensure missing children are queued; enqueue with their SSE as priority.
+          // Also pre-enqueue the full descent path so we don't wait one level per frame.
           for (const child of node.children!) {
             if (
               !this.geoCache.get(child.key) &&
               !this.visibleMeshes.has(child.key) &&
               !this.buildQueueSet.has(child.key)
             ) {
-              this.enqueueBuild(child)
+              this.enqueueBuild(child, this.computeProjPx(cam, child))
             }
+            // Pre-enqueue grandchildren and deeper levels along the hot path
+            this.enqueueDeepPath(child, cam, splitThreshPx)
           }
           this.splitPending.set(node.key, node)
           return
@@ -680,11 +948,14 @@ export class Planet extends Group {
         this.splitPending.delete(node.key)
         for (const child of node.children!) collect(child)
       } else {
-        // Children just created — enqueue all 4 and keep parent visible
+        // Children just created — enqueue all 4 and keep parent visible.
+        // Also pre-enqueue the full descent path so deeper levels build concurrently.
         for (const child of node.children!) {
           if (!this.buildQueueSet.has(child.key)) {
-            this.enqueueBuild(child)
+            this.enqueueBuild(child, this.computeProjPx(cam, child))
           }
+          // Pre-enqueue grandchildren and deeper levels along the hot path
+          this.enqueueDeepPath(child, cam, splitThreshPx)
         }
         this.splitPending.set(node.key, node)
         desired.add(node.key) // parent stays visible
@@ -694,19 +965,18 @@ export class Planet extends Group {
     for (const root of this.roots) collect(root)
 
     // --- Merge: nodes in desired whose children exist and are all leaves visible
-    //     but dist > mergeDist (caller no longer wants split).
-    //     If we just want to check for unwanted children, we also walk once more.
+    //     but projPx < mergeThreshPx (caller no longer wants split).
     const desiredWithChildren = (node: QuadtreeNode): void => {
       if (node.children === null) return
 
-      const dist = cam.distanceTo(node.worldCenter)
-      if (dist > mergeDist * node.nodeSize) {
-        // Node is in desired as a leaf (no longer splits) but children still exist
-        // → merge: we keep children visible until parent geometry ready.
+      const projPx = this.computeProjPx(cam, node)
+      if (projPx < mergeThreshPx) {
+        // Node is in desired as a leaf (no longer splits) but children still exist.
         const childKeys = node.children.map((c) => c.key)
         const allChildrenVisible = childKeys.every((k) => this.visibleMeshes.has(k))
 
         if (allChildrenVisible && !this.mergePending.has(node.key)) {
+          // All children are rendered — do the normal visible-children merge path.
           const parentReady =
             this.geoCache.get(node.key) !== undefined || this.visibleMeshes.has(node.key)
           if (parentReady) {
@@ -714,14 +984,36 @@ export class Planet extends Group {
             this.addMesh(node)
             for (const c of node.children!) this.removeMesh(c.key)
             node.merge()
+            return // subtree gone — nothing left to recurse into
           } else {
             // Enqueue parent build; keep children visible
             this.mergePending.set(node.key, { node, childKeys })
-            if (!this.buildQueueSet.has(node.key)) this.enqueueBuild(node)
+            if (!this.buildQueueSet.has(node.key)) this.enqueueBuild(node, projPx)
+          }
+        } else if (!allChildrenVisible) {
+          // Some/all children are not visible.  Two cases:
+          //   A) Phantom subtree: enqueueDeepPath created node objects that were
+          //      never built (camera moved away before builds completed).
+          //      Safe to reclaim immediately — no visible tiles are affected.
+          //   B) Legitimate split-in-progress: projPx was HIGH when collect() ran,
+          //      builds are pending.  We must NOT reclaim those.
+          //
+          // Discriminator: if projPx < mergeThreshPx (we are already in this
+          // branch) AND none of the direct children are in buildQueueSet, then
+          // this subtree is unwanted (phantom).  A wanted split always has
+          // projPx > splitThreshPx (well above mergeThreshPx) and children
+          // in buildQueueSet or splitPending.
+          const noneQueued = childKeys.every((k) => !this.buildQueueSet.has(k))
+          const noneInSplitPending = !this.splitPending.has(node.key)
+          if (noneQueued && noneInSplitPending) {
+            // Phantom subtree — reclaim it so we stop walking it every frame.
+            node.merge()
+            return // subtree gone — nothing left to recurse into
           }
         }
       }
 
+      // Only recurse when children still exist (merge() may have cleared them above).
       if (node.children) {
         for (const c of node.children) desiredWithChildren(c)
       }
@@ -769,6 +1061,18 @@ export class Planet extends Group {
         (c) => this.geoCache.get(c.key) !== undefined || this.visibleMeshes.has(c.key),
       )
       if (allReady) {
+        // Re-check that the split is still wanted at the current camera distance.
+        // If the camera pulled back while children were building, promoting would
+        // flash over-refined tiles for one frame.  Deleting the entry lets
+        // selectLeaves re-decide this frame; it will re-enqueue the split next
+        // frame if it is still wanted (projPx > splitThreshPx), so this cannot
+        // cause a permanently stuck-coarse state.
+        const { splitThreshPx } = this.lodThresholds()
+        const currentProjPx = this.computeProjPx(this._camLocalScratch, parentNode)
+        if (currentProjPx <= splitThreshPx) {
+          this.splitPending.delete(parentKey)
+          continue // don't promote; selectLeaves will re-decide this frame
+        }
         // Swap: add children, remove parent
         for (const child of parentNode.children) this.addMesh(child)
         this.removeMesh(parentKey)
@@ -784,7 +1088,7 @@ export class Planet extends Group {
    * selection loop re-decides naturally next frame.
    */
   private promoteReadyMerges(cam: Vector3): void {
-    const mergeDist = this.splitFactor * (1 + HYSTERESIS)
+    const { mergeThreshPx } = this.lodThresholds()
 
     for (const [parentKey, { node, childKeys }] of this.mergePending) {
       const parentCached = this.geoCache.get(parentKey)
@@ -795,9 +1099,9 @@ export class Planet extends Group {
         node.children !== null &&
         node.children.every((c) => c.children === null && this.visibleMeshes.has(c.key))
 
-      // Re-validate: merge-distance condition must still hold
-      const dist = cam.distanceTo(node.worldCenter)
-      const mergeConditionHolds = dist > mergeDist * node.nodeSize
+      // Re-validate: merge SSE condition must still hold (projPx still below merge threshold)
+      const projPx = this.computeProjPx(cam, node)
+      const mergeConditionHolds = projPx < mergeThreshPx
 
       if (!childrenStillLeaves || !mergeConditionHolds) {
         // Stale merge — discard; selection will re-decide next frame
@@ -817,18 +1121,70 @@ export class Planet extends Group {
   // Internal: build queue
   // ---------------------------------------------------------------------------
 
-  private enqueueBuild(node: QuadtreeNode): void {
-    this.buildQueue.push({ key: node.key, node })
+  private enqueueBuild(node: QuadtreeNode, priority = 0): void {
+    this.buildQueue.push({ key: node.key, node, priority })
     this.buildQueueSet.add(node.key)
+  }
+
+  /**
+   * Recursively pre-enqueue all build targets along the descent path from `node`
+   * down to the desired target depth, WITHOUT waiting for each level to be built
+   * first. This breaks the one-level-per-frame gating that caused slow surface
+   * refinement.
+   *
+   * Only enqueues nodes that:
+   *   - are not already cached or visible
+   *   - are not already in the build queue
+   *   - are at a level where projPx still exceeds splitThreshPx (would split)
+   *   - are within maxDepth
+   *
+   * QuadtreeNode.split() is called eagerly to create the node objects needed to
+   * know their keys/worldCenters for priority computation. This is safe — nodes
+   * that are created but never built simply stay as phantom QuadtreeNode objects
+   * (no GPU cost). If the camera moves away, selectLeaves will call merge() on
+   * ancestors and the unreachable sub-tree is abandoned.
+   *
+   * Zero new per-frame allocations in the hot path: the scratch vectors used by
+   * computeProjPx are already preallocated on `this`.
+   */
+  private enqueueDeepPath(node: QuadtreeNode, cam: Vector3, splitThreshPx: number): void {
+    if (node.level >= this.maxDepth) return
+    const projPx = this.computeProjPx(cam, node)
+    if (projPx <= splitThreshPx) return
+
+    // Ensure children exist as QuadtreeNode objects (no geometry built yet — just node metadata)
+    if (node.children === null) {
+      node.split(this.radius)
+    }
+
+    for (const child of node.children!) {
+      // Enqueue build for this child if not already handled
+      if (
+        this.geoCache.get(child.key) === undefined &&
+        !this.visibleMeshes.has(child.key) &&
+        !this.buildQueueSet.has(child.key)
+      ) {
+        this.enqueueBuild(child, this.computeProjPx(cam, child))
+      }
+      // Recurse: if this child would also want to split, pre-enqueue its descendants too
+      this.enqueueDeepPath(child, cam, splitThreshPx)
+    }
   }
 
   private drainBuildQueue(): void {
     if (this.buildQueue.length === 0) return
 
+    // Sort highest-priority (largest projPx / closest to camera) to the front
+    // so the most visually-urgent chunks build first. O(n log n) but queue is small.
+    this.buildQueue.sort((a, b) => b.priority - a.priority)
+
     const t0 = performance.now()
     let built = 0
 
     while (built < BUILD_BUDGET_PER_FRAME && this.buildQueue.length > 0) {
+      // Also enforce a wall-clock cap so a heavy frame (complex heightFn) doesn't stall
+      if (built > 0 && performance.now() - t0 > BUILD_BUDGET_MS) break
+
       const item = this.buildQueue.shift()!
       this.buildQueueSet.delete(item.key)
 
@@ -869,21 +1225,44 @@ export class Planet extends Group {
     if (this.visibleMeshes.has(node.key)) return
     // Remove from cache when promoting to visible — cache holds only non-displayed geometries
     this.geoCache.delete(node.key)
-    const mesh = new Mesh(data.geometry, this.materialFor(node.level))
+    const mesh = new Mesh(data.geometry)
     mesh.position.copy(data.origin)
     mesh.frustumCulled = true
     mesh.userData.key = node.key
+    // Wireframe mode overrides view-mode material: pure unlit white edges.
+    mesh.material = this.wireframeActive ? this.wireMaterial : this.materialFor(node.level)
     this.add(mesh)
     this.visibleMeshes.set(node.key, mesh)
+    // Add vertex dots overlay if showVertices is on.
+    if (this._showVertices) {
+      this._addPoints(node.key, mesh)
+    }
   }
 
   private removeMesh(key: string): void {
     const mesh = this.visibleMeshes.get(key)
     if (!mesh) return
+    // Remove Points overlay first if present.
+    const pts = this.visiblePoints.get(key)
+    if (pts) {
+      this.remove(pts)
+      // Do NOT dispose pts.geometry — it is the shared chunk geometry still referenced by mesh.
+      this.visiblePoints.delete(key)
+    }
     this.remove(mesh)
     this.visibleMeshes.delete(key)
-    // Return geometry to cache (don't dispose)
+    // Shared materials are never disposed per-mesh. Return geometry to cache only.
     this.geoCache.return(key, new CachedMeshData({ geometry: mesh.geometry as BufferGeometry, origin: mesh.position.clone() }))
+  }
+
+  /** Create a Points overlay for a chunk mesh and add it to the scene group. */
+  private _addPoints(key: string, mesh: Mesh): void {
+    const pts = new Points(mesh.geometry, this.pointsMaterial)
+    // Mirror the chunk mesh's position exactly so dots align with wireframe vertices.
+    pts.position.copy(mesh.position)
+    pts.frustumCulled = true
+    this.add(pts)
+    this.visiblePoints.set(key, pts)
   }
 
   // ---------------------------------------------------------------------------
@@ -891,9 +1270,8 @@ export class Planet extends Group {
   // ---------------------------------------------------------------------------
 
   /**
-   * Returns the active material for a chunk at this level.
+   * Returns the shared material for a chunk at this level.
    * View mode priority: tectonics → lodColors → normal.
-   * wireframe is applied on top of whichever material is selected.
    */
   private materialFor(level: number): MeshStandardMaterial | MeshBasicMaterial | MeshBasicNodeMaterial {
     if (this.tectonicsViewActive) {
@@ -932,6 +1310,28 @@ export class Planet extends Group {
     return search(this.roots[faceIndex])
   }
 
+  /**
+   * Compute the screen-space-error projected-pixel size for a node.
+   *
+   * Uses the node's bounding sphere (center = worldCenter, radius = nodeSize * √2 / 2)
+   * and measures distance from the camera to the nearest point on that sphere,
+   * so near-horizon chunks with far-away centers still split correctly.
+   *
+   * projPx = nodeSize * screenHeightPx / (2 * nearDist * tan(vFov/2))
+   *
+   * Zero-alloc: uses this._sseScratch.
+   */
+  private computeProjPx(cam: Vector3, node: { worldCenter: Vector3; nodeSize: number }): number {
+    const camToCenter = this._sseScratch.copy(cam).distanceTo(node.worldCenter)
+    // Bounding sphere radius: half-diagonal of the square patch
+    const boundRadius = node.nodeSize * 0.7071067811865476 // Math.SQRT2 / 2
+    const nearDist = Math.max(EPS_DIST, camToCenter - boundRadius)
+    // Guard: tan(vFov/2) could be 0 if vFov is degenerate
+    const tanHalfFov = Math.tan(this._vFovRadians * 0.5)
+    if (tanHalfFov < 1e-6) return 0
+    return (node.nodeSize * this._screenHeightPx) / (2 * nearDist * tanHalfFov)
+  }
+
   /** Check if a key belongs to a child of a splitPending parent (must stay visible). */
   private isChildOfSplitPending(key: string): boolean {
     for (const [, parent] of this.splitPending) {
@@ -946,5 +1346,20 @@ export class Planet extends Group {
       if (childKeys.includes(key)) return true
     }
     return false
+  }
+
+  // ---------------------------------------------------------------------------
+  // Internal: LOD threshold helpers
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Single source of truth for LOD pixel thresholds.
+   * Both selectLeaves and promoteReadyMerges read from here so they agree on
+   * the exact split/merge band.
+   */
+  private lodThresholds(): { splitThreshPx: number; mergeThreshPx: number } {
+    const splitThreshPx = this.resolution * this.targetTriPx
+    const mergeThreshPx = splitThreshPx / (1 + HYSTERESIS)
+    return { splitThreshPx, mergeThreshPx }
   }
 }

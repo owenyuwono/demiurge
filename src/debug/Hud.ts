@@ -6,12 +6,17 @@ const KEYMAP_HELP = `
 4  spin
 f  freeze LOD
 g  new seed
+view 3: red=collision blue=rift yellow=shear
+view 3: orange pins = arc volcanoes
 
 ─── camera ──────────────────
 drag      rotate globe
 wheel     zoom
 WASD      orbit
-shift     fast`.trimStart()
+shift     fast
+
+─── walk mode ───────────────
+Walk here → click planet · mouse look · WASD/shift · Back to orbit`.trimStart()
 
 export class Hud {
   private readonly el: HTMLElement

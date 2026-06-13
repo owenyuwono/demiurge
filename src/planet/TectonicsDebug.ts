@@ -10,8 +10,8 @@ import {
   Matrix4,
   Mesh,
   MeshBasicMaterial,
+  OctahedronGeometry,
   Quaternion,
-  Uint32BufferAttribute,
   Vector3,
 } from 'three'
 import { Tectonics, TectonicQuery } from './tectonics'
@@ -167,7 +167,7 @@ export class TectonicsDebug extends Group {
     // Reused scratch for query() — avoids a fresh allocation per arrow.
     // Using the real warped+weighted ownership keeps field-arrow colors
     // consistent with the terrain's painted plate regions near boundaries.
-    const _scratch: TectonicQuery = { plateId: 0, neighborId: 0, boundaryDist: 0, convergence: 0, shear: 0, crustDist: 0 }
+    const _scratch: TectonicQuery = { plateId: 0, neighborId: 0, boundaryDist: 0, convergence: 0, shear: 0, crustDist: 0, paleoDist: 0, otherCrustDist: 0 }
 
     let instanceIdx = 0
     for (let i = 0; i < sampleDirs.length; i++) {
@@ -268,6 +268,45 @@ export class TectonicsDebug extends Group {
 
       this.add(whiteMesh, colorMesh)
       this._meshes.push(whiteMesh, colorMesh)
+    }
+
+    // -----------------------------------------------------------------------
+    // 3. VOLCANO MARKERS — instanced octahedra, one per volcano
+    //
+    // OctahedronGeometry is orientation-free so no axis-bake needed.
+    // Scale = radius * 0.012 (uniform) — large enough to read from orbit.
+    // Lift = heightScale * 2.0 above surfaceRadiusAt (which already includes
+    // the baked terrain cone height), matching the velocity-arrow hover idiom.
+    // Color: 0xff5a1e (hot orange), MeshBasicMaterial (unlit / full-bright).
+    // -----------------------------------------------------------------------
+    if (tectonics.volcanoes.length > 0) {
+      const VOLCANO_SCALE = radius * 0.012
+
+      const volcanoGeo = new OctahedronGeometry(1)
+      this._geometries.push(volcanoGeo)
+
+      const volcanoMat = new MeshBasicMaterial({ color: 0xff5a1e, vertexColors: false })
+      this._materials.push(volcanoMat)
+
+      const volcanoMesh = new InstancedMesh(volcanoGeo, volcanoMat, tectonics.volcanoes.length)
+      volcanoMesh.count = 0
+
+      const _scaleVec = new Vector3(VOLCANO_SCALE, VOLCANO_SCALE, VOLCANO_SCALE)
+      const _identityQuat = new Quaternion()
+
+      for (let i = 0; i < tectonics.volcanoes.length; i++) {
+        const v = tectonics.volcanoes[i]
+        const surfR = surfaceRadiusAt(v.pos)
+        _pos.copy(v.pos).multiplyScalar(surfR + heightScale * 2.0)
+        _mat4.compose(_pos, _identityQuat, _scaleVec)
+        volcanoMesh.setMatrixAt(i, _mat4)
+      }
+
+      volcanoMesh.count = tectonics.volcanoes.length
+      volcanoMesh.instanceMatrix.needsUpdate = true
+
+      this.add(volcanoMesh)
+      this._meshes.push(volcanoMesh)
     }
 
     // NOTE: Pole axis has been removed from TectonicsDebug.

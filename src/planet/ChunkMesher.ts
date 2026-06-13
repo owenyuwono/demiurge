@@ -94,18 +94,24 @@ function evalVertex(
 }
 
 // ---------------------------------------------------------------------------
-// Vertex color from elevation and slope
+// Vertex color from elevation and slope.
+//
+// Colors the GROUND at every elevation — geology only, NO water color. The actual
+// sea is a separate translucent shell (see main.ts), so the seabed is sediment/sand
+// (dark in the deeps, sandy on the shelf), not blue. The water mesh tints whatever is
+// below it — deep dark sediment → dark blue, shallow sand → turquoise — naturally, and
+// when the water level is lowered the exposed seabed reads as honest sediment.
 //
 // Band table (e = normalized elevation, 0 = sea level):
 //
-//  OCEAN (e < 0):
-//   e < −0.55          abyssal       #16202e  very dark navy
-//  −0.55..−0.18        deep ocean    →#1d3a52  mid blue
-//  −0.18..−0.045       cont. slope   →#2e5a74  steel blue
-//  −0.045..0           shelf         →#4d8a96  cyan-teal (waterline ≤0.004 window)
+//  SEABED (e < 0):
+//   e < −0.55          abyssal sediment  #232220  near-black warm grey
+//  −0.55..−0.18        deep sediment     →#3a352c  dark brown-grey
+//  −0.18..−0.045       slope sediment    →#605442  medium brown
+//  −0.045..0           sandy shelf       →#9c8a66  light tan
 //
 //  LAND (e ≥ 0):
-//   0..0.012           sand          #b8a36e
+//   0..0.012           sand          →#b8a36e  beach (blends up from shelf tan)
 //   0.012..0.18        lowland       →#5a7a4a  desaturated green
 //   0.18..0.42         highland      →#8a7a55  brown-tan
 //   0.42..0.62         bare rock     →#7a7060  grey-brown
@@ -126,15 +132,15 @@ function elevationColor(e: number, slope: number, out: Float32Array, base: numbe
   let r: number, g: number, b: number;
 
   if (e < 0) {
-    // ---- OCEAN -------------------------------------------------------
-    // Abyssal #16202e
-    const rAby = 0x16 / 255, gAby = 0x20 / 255, bAby = 0x2e / 255;
-    // Deep   #1d3a52
-    const rDep = 0x1d / 255, gDep = 0x3a / 255, bDep = 0x52 / 255;
-    // Slope  #2e5a74
-    const rSlp = 0x2e / 255, gSlp = 0x5a / 255, bSlp = 0x74 / 255;
-    // Shelf  #4d8a96
-    const rShf = 0x4d / 255, gShf = 0x8a / 255, bShf = 0x96 / 255;
+    // ---- SEABED (geology, not water — the blue comes from the water shell) -----
+    // Abyssal sediment #232220
+    const rAby = 0x23 / 255, gAby = 0x22 / 255, bAby = 0x20 / 255;
+    // Deep sediment   #3a352c
+    const rDep = 0x3a / 255, gDep = 0x35 / 255, bDep = 0x2c / 255;
+    // Slope sediment  #605442
+    const rSlp = 0x60 / 255, gSlp = 0x54 / 255, bSlp = 0x42 / 255;
+    // Sandy shelf  #9c8a66
+    const rShf = 0x9c / 255, gShf = 0x8a / 255, bShf = 0x66 / 255;
 
     if (e < -0.55) {
       // pure abyssal
@@ -174,10 +180,10 @@ function elevationColor(e: number, slope: number, out: Float32Array, base: numbe
     const rSnw = 0xe6 / 255, gSnw = 0xe8 / 255, bSnw = 0xeb / 255;
 
     if (e < 0.012) {
-      // shelf→sand: crisp waterline transition window = 0.004
-      const t = clamp01(e / 0.004);
-      // shelf color at e=0
-      const rShf = 0x4d / 255, gShf = 0x8a / 255, bShf = 0x96 / 255;
+      // sandy shelf → beach sand, smooth (no crisp waterline — the water shell draws that now)
+      const t = clamp01(e / 0.012);
+      // sandy shelf color at e=0 (matches the seabed branch so the join is seamless)
+      const rShf = 0x9c / 255, gShf = 0x8a / 255, bShf = 0x66 / 255;
       r = lerp(rShf, rSnd, t);
       g = lerp(gShf, gSnd, t);
       b = lerp(bShf, bSnd, t);
@@ -265,11 +271,11 @@ export function buildChunkGeometry(p: ChunkParams): ChunkMeshData {
   const totalIndices    = gridIndexCount + skirtIndexCount;
 
   // Allocate typed arrays
-  const positions   = new Float32Array(totalVerts * 3);
-  const normals     = new Float32Array(totalVerts * 3);
-  const colors      = new Float32Array(totalVerts * 3);
-  const plateColors = hasPlateColor ? new Float32Array(totalVerts * 3) : null;
-  const indices     = new Uint32Array(totalIndices);
+  const positions    = new Float32Array(totalVerts * 3);
+  const normals      = new Float32Array(totalVerts * 3);
+  const colors       = new Float32Array(totalVerts * 3);
+  const plateColors  = hasPlateColor ? new Float32Array(totalVerts * 3) : null;
+  const indices      = new Uint32Array(totalIndices);
 
   // Scratch objects — reused, no per-vertex allocation
   const dir    = new Vector3();
@@ -285,6 +291,10 @@ export function buildChunkGeometry(p: ChunkParams): ChunkMeshData {
   const tan1   = new Vector3();
   const tan2   = new Vector3();
   const nrm    = new Vector3();
+  // Sphere-tangent normal scratch — tangent frame built from sphere direction
+  const _tanUp = new Vector3();
+  const _tan1  = new Vector3();
+  const _tan2  = new Vector3();
 
   // -- Chunk center (for origin-relative positions) -------------------------
   // Center of tile = (ix+0.5)/2^level, (iy+0.5)/2^level on the face
@@ -309,35 +319,40 @@ export function buildChunkGeometry(p: ChunkParams): ChunkMeshData {
   );
 
   // -- Skirt depth ----------------------------------------------------------
-  // chunkWorldSize ≈ arc length of the patch = (π/2 · radius) / 2^level
-  const chunkWorldSize = (Math.PI / 2 * radius) / (1 << level);
-  const skirtDepth = Math.max(heightScale * 1.5, chunkWorldSize * 0.05);
+  // Proportional to the chunk's arc length so skirts scale naturally as the
+  // quadtree deepens (depth 12→16 shrinks chunks ~16×, skirts shrink with them).
+  // A coarser neighbour's quads are ~2× larger, so the seam displacement is at
+  // most one quad-height step; SKIRT_FACTOR × chunkArcLen ≈ 1.6 quad-widths at
+  // res=32, which is enough to close any T-junction gap without wasted fill.
+  const SKIRT_FACTOR = 0.05; // tune here: 0.05 = skirt ≈ 5 % of chunk arc length
+  const chunkArcLen = (Math.PI / 2 * radius) / (1 << level);
+  const skirtDepth = SKIRT_FACTOR * chunkArcLen;
 
-  // -- Central-difference step size: half a grid step in [0,1] face space ---
+  // -- Central-difference step sizes ------------------------------------------
+  // cdStep: half a grid step in [0,1] face space.
   // grid step in [0,1] face coords = 1 / (res * 2^level)
   const cdStep = 0.5 / (res * (1 << level));
 
-  // Helper: evaluate world position for a face-space offset (du, dv) from
-  // grid point (gi, gj), without touching the shared scratch objects.
-  function evalOffset(
-    gi: number,
-    gj: number,
-    du: number,
-    dv: number,
+  // arcStep: converts the face-UV step to an arc angle on the unit sphere.
+  // A cube face spans [-1,1] (2 units) which corresponds to π/2 radians.
+  // Therefore: cdStep in [0,1] face coords → cdStep*2 in [-1,1] cube coords
+  // → cdStep*2*(π/2)/2 = cdStep*(π/2) radians of arc.
+  // Using this arc step for sphere-tangent CDs keeps interior normals identical
+  // to the old face-local result (same sampling density, basis-independent normal).
+  const arcStep = cdStep * (Math.PI / 2);
+
+  // Helper: sample height at sphere direction `d` and return the world position.
+  // The direction is `normalize(centerDir + tangent * arcStep)` — already on the sphere.
+  function evalSphereOffset(
+    centerDir: Vector3,
+    tangent: Vector3,
+    step: number,
+    heightFnBound: (d: Vector3) => number,
     outDir: Vector3,
     outWorld: Vector3,
   ): void {
-    // Continuous face [0,1] coords of this grid point
-    const u0 = (ix + gi / res) * scale;
-    const v0 = (iy + gj / res) * scale;
-    const cu = (u0 + du) * 2 - 1;
-    const cv = (v0 + dv) * 2 - 1;
-    const cx = basis.nx + cu * basis.ux + cv * basis.vx;
-    const cy = basis.ny + cu * basis.uy + cv * basis.vy;
-    const cz = basis.nz + cu * basis.uz + cv * basis.vz;
-    cubeToSphere(cx, cy, cz, outDir);
-    outDir.normalize();
-    const h = hFn(outDir);
+    outDir.copy(centerDir).addScaledVector(tangent, step).normalize();
+    const h = heightFnBound(outDir);
     const r = radius + h * heightScale;
     outWorld.copy(outDir).multiplyScalar(r);
   }
@@ -357,15 +372,28 @@ export function buildChunkGeometry(p: ChunkParams): ChunkMeshData {
       positions[vi * 3 + 1] = py;
       positions[vi * 3 + 2] = pz;
 
-      // Normal via central differences in face (u,v) space
-      evalOffset(gi, gj, -cdStep,      0, dirL, worldL);
-      evalOffset(gi, gj,  cdStep,      0, dirR, worldR);
-      evalOffset(gi, gj,       0, -cdStep, dirD, worldD);
-      evalOffset(gi, gj,       0,  cdStep, dirU, worldU);
+      // Normal via sphere-tangent central differences.
+      // Build an orthonormal tangent frame from the sphere direction `dir` so
+      // that adjacent faces use the same frame at a shared edge vertex → seamless.
+      // Pole fallback: when dir ≈ (0,±1,0) use world X instead of world Y to
+      // avoid a degenerate cross product.
+      if (Math.abs(dir.y) < 0.9) {
+        _tanUp.set(0, 1, 0);
+      } else {
+        _tanUp.set(1, 0, 0);
+      }
+      _tan1.crossVectors(dir, _tanUp).normalize(); // tangent 1 ⊥ dir
+      _tan2.crossVectors(dir, _tan1);              // tangent 2 ⊥ dir ⊥ _tan1 (already unit)
+
+      // Sample displaced surface at ±arcStep along each tangent direction.
+      evalSphereOffset(dir, _tan1, -arcStep, hFn, dirL, worldL);
+      evalSphereOffset(dir, _tan1,  arcStep, hFn, dirR, worldR);
+      evalSphereOffset(dir, _tan2, -arcStep, hFn, dirD, worldD);
+      evalSphereOffset(dir, _tan2,  arcStep, hFn, dirU, worldU);
 
       // Tangent vectors of the displaced surface
-      tan1.subVectors(worldR, worldL); // ∂pos/∂u  (unnormalized)
-      tan2.subVectors(worldU, worldD); // ∂pos/∂v
+      tan1.subVectors(worldR, worldL); // ∂pos/∂_tan1 (unnormalized)
+      tan2.subVectors(worldU, worldD); // ∂pos/∂_tan2
 
       nrm.crossVectors(tan1, tan2).normalize();
 

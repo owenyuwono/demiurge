@@ -89,6 +89,15 @@ export interface TectonicQuery {
   convergence: number   // ≈[-1,1]
   shear: number         // tangential (along-boundary) relative velocity component, ≈[-1,1]
   crustDist: number     // signed distance: +inside crust, -outside crust (radians)
+  paleoDist: number     // radians — distance to nearest fossil/paleo crack boundary
+  otherCrustDist: number  // crustDist mirrored to neighbor side (coarse, no fine warp)
+}
+
+export interface Volcano {
+  pos: Vector3
+  baseRadius: number        // angular radius in radians
+  height: number            // normalized, added to terrain
+  craterRadiusFrac: number  // fraction of baseRadius for caldera
 }
 
 // ---------------------------------------------------------------------------
@@ -112,6 +121,16 @@ const TOTAL_TEXELS = 6 * RES * RES
 // Pre-compute texel-angle constant at RES
 const TEX_ANG = texAng(RES)
 
+// --- arc volcano constants ---
+// Planet RADIUS = 50 km (world units). Angular radius θ rad → arc length R·θ = 50·θ km.
+// baseRadius range: 0.018 rad → 50 * 0.018 = 0.90 km; 0.045 rad → 50 * 0.045 = 2.25 km. ✓
+const ARC_CONV_THRESH   = 0.14    // convergence threshold; effective = ARC_CONV_THRESH / arcDensity
+const ARC_OFFSET        = 0.020   // rad — volcanic-front offset onto overriding plate
+const ARC_BAND          = 0.006   // rad — half-width of front band
+const ARC_SPACING       = 0.045   // rad — true min spacing (dart-throwing); effective = ARC_SPACING / arcDensity
+const ARC_MAX           = 2000    // safety cap on total volcanoes
+const ARC_SIZE_SPAN     = 0.25    // convergence span above threshold for convStrength ramp
+
 // ---------------------------------------------------------------------------
 // Walker mechanics — Step 1
 // ---------------------------------------------------------------------------
@@ -126,9 +145,21 @@ const MAX_BUDGET = 3.0         // radians (maximum walker budget)
 const MAX_STEPS_HARD = 1200    // hard step cap per walker
 
 // Stream ids for seeded RNG streams (extending old scheme)
-// 0-6 = plate properties (same as before)
-// 7   = crack walker seeds
-// 8   = additional crack round seeds (for the count loop)
+// 0-6  = plate properties (same as before)
+// 7    = crack walker seeds
+// 8    = additional crack round seeds (for the count loop)
+// 9    = crustNoise (already used)
+// 10   = rpRng (already used)
+// 11   = microRng (already used)
+// 12   = paleo crack walker seeds (NEW)
+// 13   = fine warp noise sub-seed (NEW)
+// 15   = non-tectonic continental mask noise (NEW)
+
+// ---------------------------------------------------------------------------
+// Non-tectonic continental mask constants (tuned to hit land-fraction gate)
+// ---------------------------------------------------------------------------
+const CONT_FREQ   = 1.1    // frequency of continental noise fbm
+const CONT_THRESH = 0.10   // signed fbm threshold: c > CONT_THRESH → land
 
 /**
  * Run one round of crack tracing.
@@ -1145,6 +1176,152 @@ function buildDistanceField(
 }
 
 // ---------------------------------------------------------------------------
+// Bake-time field smoothing — box blur (4+4 weights: center×4, neighbor×1 each)
+// ---------------------------------------------------------------------------
+
+/**
+ * One-pass 4-neighbor weighted box blur of a Float32Array cubemap field.
+ * Center weight 4, each cardinal neighbor weight 1 → total weight 8.
+ * Reduces C0 creases at texel edges introduced by raw Dijkstra output.
+ */
+function blurField(src: Float32Array): Float32Array {
+  const dst = new Float32Array(TOTAL_TEXELS)
+  const nbr: { face: number; x: number; y: number } = { face: 0, x: 0, y: 0 }
+  const dx4 = [1, -1, 0, 0] as const
+  const dy4 = [0, 0, 1, -1] as const
+  for (let idx = 0; idx < TOTAL_TEXELS; idx++) {
+    const face = (idx / (RES * RES)) | 0
+    const rem  = idx % (RES * RES)
+    const y    = (rem / RES) | 0
+    const x    = rem % RES
+    let sum = src[idx] * 4  // center weight 4
+    for (let d = 0; d < 4; d++) {
+      neighborTexel(face, x, y, dx4[d] as -1|0|1, dy4[d] as -1|0|1, RES, nbr)
+      sum += src[texelIndex(nbr.face, nbr.x, nbr.y, RES)]  // each neighbor weight 1
+    }
+    dst[idx] = sum / 8  // total weight 4 + 4×1 = 8
+  }
+  return dst
+}
+
+// ---------------------------------------------------------------------------
+// bakeConvShear — pre-bake per-texel convergence and shear
+// ---------------------------------------------------------------------------
+
+/**
+ * Compute per-texel convergence and shear from plate omegas and the distance-
+ * field gradient. Called once at construction time; the resulting arrays are
+ * blurred before being stored to eliminate the gradient-direction sign-flips
+ * that cause cliff-like discontinuities at sub-texel scale.
+ *
+ * The gradient is computed with a ±1-texel central-difference stencil on the
+ * already-blurred `distField`. Blurring the output (3 passes) further smooths
+ * saddle-point reversal artefacts.
+ */
+function bakeConvShear(
+  distField: Float32Array,
+  compId: Uint16Array,
+  neighborId: Uint16Array,
+  plates: Plate[],
+): { convField: Float32Array; shearField: Float32Array } {
+  const convField  = new Float32Array(TOTAL_TEXELS)
+  const shearField = new Float32Array(TOTAL_TEXELS)
+
+  const nt0: { face: number; x: number; y: number } = { face: 0, x: 0, y: 0 }
+  const nt1: { face: number; x: number; y: number } = { face: 0, x: 0, y: 0 }
+  const nt2: { face: number; x: number; y: number } = { face: 0, x: 0, y: 0 }
+  const nt3: { face: number; x: number; y: number } = { face: 0, x: 0, y: 0 }
+  const dir0  = new Vector3()
+  const dir1  = new Vector3()
+  const dir2  = new Vector3()
+  const dir3  = new Vector3()
+  const cDir  = new Vector3()
+
+  for (let idx = 0; idx < TOTAL_TEXELS; idx++) {
+    const face = (idx / (RES * RES)) | 0
+    const rem  = idx % (RES * RES)
+    const ty   = (rem / RES) | 0
+    const tx   = rem % RES
+
+    // Texel-centre direction
+    texelToDir(face, tx, ty, RES, cDir)
+
+    // Central-difference stencil ±1 texel
+    neighborTexel(face, tx, ty,  1,  0, RES, nt0)
+    neighborTexel(face, tx, ty, -1,  0, RES, nt1)
+    neighborTexel(face, tx, ty,  0,  1, RES, nt2)
+    neighborTexel(face, tx, ty,  0, -1, RES, nt3)
+
+    const d0 = distField[texelIndex(nt0.face, nt0.x, nt0.y, RES)]
+    const d1 = distField[texelIndex(nt1.face, nt1.x, nt1.y, RES)]
+    const d2 = distField[texelIndex(nt2.face, nt2.x, nt2.y, RES)]
+    const d3 = distField[texelIndex(nt3.face, nt3.x, nt3.y, RES)]
+
+    texelToDir(nt0.face, nt0.x, nt0.y, RES, dir0)
+    texelToDir(nt1.face, nt1.x, nt1.y, RES, dir1)
+    texelToDir(nt2.face, nt2.x, nt2.y, RES, dir2)
+    texelToDir(nt3.face, nt3.x, nt3.y, RES, dir3)
+
+    const gradU = (d0 - d1) * 0.5
+    const gradV = (d2 - d3) * 0.5
+    const uax = dir0.x - dir1.x, uay = dir0.y - dir1.y, uaz = dir0.z - dir1.z
+    const vax = dir2.x - dir3.x, vay = dir2.y - dir3.y, vaz = dir2.z - dir3.z
+
+    const gwx = gradU * uax + gradV * vax
+    const gwy = gradU * uay + gradV * vay
+    const gwz = gradU * uaz + gradV * vaz
+
+    // Project onto tangent plane at cDir
+    const gdot = gwx * cDir.x + gwy * cDir.y + gwz * cDir.z
+    const ptx = gwx - gdot * cDir.x
+    const pty = gwy - gdot * cDir.y
+    const ptz = gwz - gdot * cDir.z
+    const gLen = Math.sqrt(ptx * ptx + pty * pty + ptz * ptz)
+
+    if (gLen < 1e-7) continue  // boundary texel or isolated island — leave at 0
+
+    const tHatX = -ptx / gLen
+    const tHatY = -pty / gLen
+    const tHatZ = -ptz / gLen
+
+    const pid = compId[idx]
+    const nid = Math.min(neighborId[idx], plates.length - 1)
+    const omA = plates[pid].omega
+    const omB = plates[nid].omega
+    const cx = cDir.x, cy = cDir.y, cz = cDir.z
+
+    const vAx = omA.y * cz - omA.z * cy
+    const vAy = omA.z * cx - omA.x * cz
+    const vAz = omA.x * cy - omA.y * cx
+    const vBx = omB.y * cz - omB.z * cy
+    const vBy = omB.z * cx - omB.x * cz
+    const vBz = omB.x * cy - omB.y * cx
+
+    const diffX = vAx - vBx
+    const diffY = vAy - vBy
+    const diffZ = vAz - vBz
+
+    const rawConv = (diffX * tHatX + diffY * tHatY + diffZ * tHatZ) / 2
+    convField[idx] = Math.max(-1, Math.min(1, rawConv))
+
+    const bx = tHatY * cDir.z - tHatZ * cDir.y
+    const by = tHatZ * cDir.x - tHatX * cDir.z
+    const bz = tHatX * cDir.y - tHatY * cDir.x
+    const bLen = Math.sqrt(bx * bx + by * by + bz * bz)
+    if (bLen > 1e-7) {
+      const rawShear = (diffX * bx / bLen + diffY * by / bLen + diffZ * bz / bLen) / 2
+      shearField[idx] = Math.max(-1, Math.min(1, rawShear))
+    }
+  }
+
+  // 3 blur passes — eliminates sign-flip artefacts at gradient saddle points
+  return {
+    convField:  blurField(blurField(blurField(convField))),
+    shearField: blurField(blurField(blurField(shearField))),
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Tectonics — public class
 // ---------------------------------------------------------------------------
 
@@ -1156,17 +1333,21 @@ export class Tectonics {
   private readonly _distField:  Float32Array  // per-texel distance to boundary (radians)
   private readonly _neighborId: Uint16Array   // per-texel neighbour plate id
   private readonly _crustDist:  Float32Array  // per-texel signed crust SDF (radians)
+  private readonly _paleoDist:  Float32Array  // per-texel distance to paleo crack network (radians)
+  private readonly _convField:  Float32Array  // per-texel baked convergence (stable, blurred)
+  private readonly _shearField: Float32Array  // per-texel baked shear (stable, blurred)
 
   // Domain-warp noise
   private readonly _warpNoise: (x: number, y: number, z: number) => number
+  // Fine-warp noise for coastline complexity (stream 13)
+  private readonly _fineWarpNoise: (x: number, y: number, z: number) => number
 
   // Preallocated scratch — zero allocations in query() / velocityAt()
   private readonly _warpedDir  = new Vector3()
-  private readonly _vA         = new Vector3()
-  private readonly _vB         = new Vector3()
   private readonly _smoothScratch = new Vector3()
   private readonly _crustScratch  = new Vector3()
-  private readonly _bHat       = new Vector3()  // along-boundary tangent for shear computation
+  private readonly _fineWarpScratch = new Vector3()
+  private readonly _fineCrustScratch = new Vector3()
 
   // Texel lookup scratch (reused in query)
   private readonly _tex = { face: 0, x: 0, y: 0 }
@@ -1181,10 +1362,40 @@ export class Tectonics {
   private readonly _gTex2 = { face: 0, x: 0, y: 0 }
   private readonly _gTex3 = { face: 0, x: 0, y: 0 }
   private readonly _tHat  = new Vector3()
+  private readonly _otherCrustDir = new Vector3()  // scratch for mirrored crust probe
 
-  constructor(opts: { seed: number; plateCount?: number }) {
-    const { seed, plateCount = 16 } = opts
-    const target = plateCount  // EXACT target plate count
+  // Volcano bake products — populated last in constructor
+  private _volcanoes: Volcano[] = []
+  // Typed flat arrays for zero-alloc hot path (volcanoElevation)
+  private _volPos:        Float32Array = new Float32Array(0)  // 3*nVol, xyz interleaved
+  private _volBaseRadius: Float32Array = new Float32Array(0)
+  private _volHeight:     Float32Array = new Float32Array(0)
+  private _volCraterFrac: Float32Array = new Float32Array(0)
+  // Cube-map bucket grid for spatial index (CSR)
+  private _volBucketRes: number = 0
+  private _volBucketStart: Int32Array = new Int32Array(0)  // length nCells+1
+  private _volBucketIdx:   Int32Array = new Int32Array(0)  // concatenated volcano indices
+  // Timing exposed for harness diagnostics (set after _bakeVolcanoes completes)
+  _volcanoBakeMs: number = 0
+
+  // Scratch for volcanoElevation hot path (zero-alloc)
+  private readonly _volScratchTexel = { face: 0, x: 0, y: 0 }
+  // Scratch for _bakeVolcanoes (one-time; preallocated to avoid GC churn during bake)
+  private readonly _bakeQueryScratch: TectonicQuery = {
+    plateId: 0, neighborId: 0, boundaryDist: 0, convergence: 0,
+    shear: 0, crustDist: 0, paleoDist: 0, otherCrustDist: 0,
+  }
+  private readonly _bakeDirScratch = new Vector3()
+
+  /** Public accessor: the baked volcanic arc candidates. */
+  get volcanoes(): readonly Volcano[] { return this._volcanoes }
+
+  constructor(opts: { seed: number; plateCount?: number; arcDensity?: number }) {
+    const { seed, plateCount = 16, arcDensity: arcDensityRaw = 1.0 } = opts
+    const arcDensity = Math.max(0.2, Math.min(3, arcDensityRaw))
+    // Clamp plateCount to [0, 48]; values ≤ 1 trigger the non-tectonic branch
+    const plateCountClamped = Math.max(0, Math.min(48, plateCount))
+    const target = plateCountClamped  // EXACT target plate count (for tectonic path)
 
     // Sub-seed assignments (preserving original 0-6 for plate properties):
     //   0 = (old) site jitter — now unused; kept to preserve stream layout
@@ -1196,9 +1407,33 @@ export class Tectonics {
     //   6 = (old) plate size bias — now unused; kept to preserve stream layout
     //   7 = crack walker seeds (main round)
     //   8 = crack walker seeds (additional rounds)
+    //  12 = paleo crack walker seeds
+    //  13 = fine warp noise
+    //  15 = non-tectonic continental mask noise (NEW)
     this._warpNoise = createNoise3D(deriveSeed(seed, 5))
+    this._fineWarpNoise = createNoise3D(deriveSeed(seed, 13))
 
-    const typeRng  = makeRng(deriveSeed(seed, 1))
+    // Non-tectonic branch: single plate, noise-driven crust SDF, no boundaries
+    if (plateCountClamped <= 1) {
+      const nt = Tectonics._computeNonTectonic(seed)
+      this.plates       = nt.plates
+      this._compId      = nt.compId
+      this._neighborId  = nt.neighborId
+      this._distField   = nt.distField
+      this._convField   = nt.convField
+      this._shearField  = nt.shearField
+      this._crustDist   = nt.crustDist
+      this._paleoDist   = nt.paleoDist
+      const _t0 = performance.now()
+      this._bakeVolcanoes(seed, arcDensity)
+      this._volcanoBakeMs = performance.now() - _t0
+      return
+    }
+
+    // typeRng (stream 1): consumed only inside the crust bake via typeRng2 (parallel instance).
+    // elevRng (stream 2): consumed in Step 5.
+    // axisRng (stream 3) and speedRng (stream 4): consumed once in the omega pre-derivation
+    // inside the crust bake section — that is the SINGLE authoritative site for both.
     const elevRng  = makeRng(deriveSeed(seed, 2))
     const axisRng  = makeRng(deriveSeed(seed, 3))
     const speedRng = makeRng(deriveSeed(seed, 4))
@@ -1364,7 +1599,7 @@ export class Tectonics {
     const { distField, neighborId } = buildDistanceField(compId, finalCount)
 
     this._compId     = compId
-    this._distField  = distField
+    this._distField  = blurField(blurField(distField))
     this._neighborId = neighborId
 
     // -------------------------------------------------------------------------
@@ -1430,19 +1665,17 @@ export class Tectonics {
       }
     }
 
-    // Also need omega — but we haven't computed plates yet.
-    // Re-derive omega from the same streams (axis = stream 3, speed = stream 4).
-    const axisRng2  = makeRng(deriveSeed(seed, 3))
-    const speedRng2 = makeRng(deriveSeed(seed, 4))
+    // Omega arrays — derived ONCE here and reused in both the crust bake and Step 5.
+    // This is the single authoritative derivation; axisRng/speedRng are consumed here.
     const plateOmX = new Float64Array(finalCount)
     const plateOmY = new Float64Array(finalCount)
     const plateOmZ = new Float64Array(finalCount)
     for (let i = 0; i < finalCount; i++) {
-      const ax = axisRng2() * 2 - 1
-      const ay = axisRng2() * 2 - 1
-      const az = axisRng2() * 2 - 1
+      const ax = axisRng() * 2 - 1
+      const ay = axisRng() * 2 - 1
+      const az = axisRng() * 2 - 1
       const axisLen = Math.sqrt(ax * ax + ay * ay + az * az) || 1
-      const speed = 0.4 + speedRng2() * 0.6
+      const speed = 0.4 + speedRng() * 0.6
       plateOmX[i] = ax / axisLen * speed
       plateOmY[i] = ay / axisLen * speed
       plateOmZ[i] = az / axisLen * speed
@@ -1602,48 +1835,102 @@ export class Tectonics {
       }
     }
 
-    this._crustDist = crustDist
+    this._crustDist = blurField(blurField(blurField(crustDist)))
+
+    // -------------------------------------------------------------------------
+    // Step 6c — Paleo-orogen network (fossil plate boundaries)
+    // -------------------------------------------------------------------------
+    // Trace a SECOND independent crack network using new seeds (streams 12+).
+    // These represent ancient sutures / paleo-orogens (Urals, Appalachians, etc).
+    // Walkers may roam freely including near poles — no polar kill in spawning,
+    // but the walker loop's existing polar kill (POLAR_COS) still applies so
+    // walkers that wander into polar caps still die. We achieve "allow polar
+    // walkers" by using a spawn filter that skips the SEED_POLAR_COS rejection
+    // (we don't pass spawnFilter — default allows polar seeds).
+    // Actually: traceCracks already rejects polar SEEDS via SEED_POLAR_COS but
+    // allows walkers to move freely. For paleo we want polar seeds too — so we
+    // need a dedicated spawn attempt. Since traceCracks always rejects polar seeds
+    // (hardcoded), we live with that limitation and rely on the broad seed count
+    // (14 seeds × wide budgets) to get good polar coverage from mid-lat seeds.
+    const paleoMask = new Uint8Array(TOTAL_TEXELS)
+    const paleoRng  = makeRng(deriveSeed(seed, 12))
+    const PALEO_SEED_COUNT = 14
+    const PALEO_MAX_WALKERS = 8 * PALEO_SEED_COUNT
+    traceCracks(paleoMask, paleoRng, PALEO_SEED_COUNT, PALEO_MAX_WALKERS, dirScratch, texScratch)
+
+    // Dilate4 the paleo mask, then multi-source Dijkstra → _paleoDist
+    const paleoDilated = dilate4(paleoMask)
+
+    // Multi-source Dijkstra from all dilated paleo crack texels
+    const paleoDist = new Float32Array(TOTAL_TEXELS)
+    {
+      const INF3 = 1e30
+      const pDist    = new Float32Array(TOTAL_TEXELS).fill(INF3)
+      const pSettled = new Uint8Array(TOTAL_TEXELS)
+      const pHeap    = new BinaryHeap(TOTAL_TEXELS * 2)
+      const pNbr: { face: number; x: number; y: number } = { face: 0, x: 0, y: 0 }
+
+      // Seed: all dilated paleo crack texels
+      for (let idx = 0; idx < TOTAL_TEXELS; idx++) {
+        if (paleoDilated[idx] === 1) {
+          pDist[idx] = 0
+          pHeap.push(0, idx)
+        }
+      }
+
+      const PDIAG = TEX_ANG * Math.SQRT2
+      const PORTH = TEX_ANG
+      const pdx8 = [ 1, -1,  0,  0,  1, -1,  1, -1] as const
+      const pdy8 = [ 0,  0,  1, -1,  1,  1, -1, -1] as const
+
+      while (!pHeap.isEmpty()) {
+        const { key: pd, val: pidx } = pHeap.popMin()
+        if (pSettled[pidx]) continue
+        pSettled[pidx] = 1
+        const face = (pidx / (RES * RES)) | 0
+        const rem  = pidx % (RES * RES)
+        const py   = (rem / RES) | 0
+        const px   = rem % RES
+        for (let d = 0; d < 8; d++) {
+          neighborTexel(face, px, py, pdx8[d] as -1|0|1, pdy8[d] as -1|0|1, RES, pNbr)
+          const ni = texelIndex(pNbr.face, pNbr.x, pNbr.y, RES)
+          if (pSettled[ni]) continue
+          const cost = (pdx8[d] !== 0 && pdy8[d] !== 0) ? PDIAG : PORTH
+          const nd = pd + cost
+          if (nd < pDist[ni]) {
+            pDist[ni] = nd
+            pHeap.push(nd, ni)
+          }
+        }
+      }
+
+      // Replace INF with a large but finite cap so consumers can safely clamp
+      for (let t = 0; t < TOTAL_TEXELS; t++) {
+        paleoDist[t] = pDist[t] === INF3 ? Math.PI : pDist[t]
+      }
+    }
+
+    this._paleoDist = blurField(paleoDist)
 
     // -------------------------------------------------------------------------
     // Step 5 — Plate properties
     // -------------------------------------------------------------------------
+    // Types, omegas, and seedDirs are already derived (typesPre, plateOmX/Y/Z, plateSeedX/Y/Z).
+    // We consume elevRng here (stream 2 — interleaved per-plate as before).
 
     const n = finalCount
     const PHI_GOLD = 0.61803398875
 
-    // Type assignment: plate 0 forced oceanic, plate 1 forced continental, rest random
-    const types: Array<'oceanic' | 'continental'> = []
-    for (let i = 0; i < n; i++) {
-      let type: 'oceanic' | 'continental'
-      if (i === 0) {
-        type = 'oceanic'
-      } else if (i === 1) {
-        type = 'continental'
-      } else {
-        type = typeRng() < 0.60 ? 'oceanic' : 'continental'
-      }
-      types.push(type)
-    }
-
     const plates: Plate[] = []
 
     for (let i = 0; i < n; i++) {
-      const type = types[i]
+      const type = typesPre[i]
 
       // baseElevation: compressed to ±0.12 modifier range (crust SDF drives land/ocean split)
       const baseElevation = -0.12 + elevRng() * 0.24   // → [-0.12, +0.12]
 
-      // omega: random unit axis × speed in [0.4, 1.0]
-      const ax = axisRng() * 2 - 1
-      const ay = axisRng() * 2 - 1
-      const az = axisRng() * 2 - 1
-      const axisLen = Math.sqrt(ax * ax + ay * ay + az * az) || 1
-      const speed = 0.4 + speedRng() * 0.6
-      const omega = new Vector3(
-        ax / axisLen * speed,
-        ay / axisLen * speed,
-        az / axisLen * speed,
-      )
+      // omega: reuse the single-source derivation computed before the crust bake
+      const omega = new Vector3(plateOmX[i], plateOmY[i], plateOmZ[i])
 
       // Color: golden-ratio hue spacing
       const hue = ((i * PHI_GOLD) % 1 + 1) % 1
@@ -1651,9 +1938,8 @@ export class Tectonics {
         ? hslToRgb(hue, 0.55, 0.34)
         : hslToRgb(hue, 0.60, 0.55)
 
-      // seedDir = pole of inaccessibility (texel with max dist-to-boundary in this plate)
-      const seedDir = new Vector3()
-      poleOfInaccessibility(i, compId, distField, seedDir)
+      // seedDir: reuse pre-computed pole of inaccessibility
+      const seedDir = new Vector3(plateSeedX[i], plateSeedY[i], plateSeedZ[i])
 
       plates.push({
         id: i,
@@ -1666,6 +1952,610 @@ export class Tectonics {
     }
 
     this.plates = plates
+
+    // -------------------------------------------------------------------------
+    // Step 7 — Bake convergence + shear fields (stable, pre-blurred)
+    // -------------------------------------------------------------------------
+    // Must come AFTER this.plates is assigned (omega is needed).
+    // Uses the already-blurred _distField so the gradient is as smooth as possible.
+    const { convField, shearField } = bakeConvShear(
+      this._distField, this._compId, this._neighborId, this.plates,
+    )
+    this._convField  = convField
+    this._shearField = shearField
+
+    // -------------------------------------------------------------------------
+    // Step 8 — Bake arc volcanoes (LAST — reads _convField/_crustDist/_distField)
+    // -------------------------------------------------------------------------
+    const _t0 = performance.now();
+    this._bakeVolcanoes(seed, arcDensity);
+    this._volcanoBakeMs = performance.now() - _t0;
+  }
+
+  // ---------------------------------------------------------------------------
+  // _buildNonTectonic — stagnant-lid / single-plate regime
+  // Called from constructor when plateCount <= 1. Assigns all required fields.
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Compute all field arrays for the non-tectonic (stagnant-lid) regime.
+   * Returns a plain object; the constructor assigns them to readonly fields.
+   * Static because readonly fields can only be assigned in the constructor.
+   */
+  private static _computeNonTectonic(seed: number): {
+    plates: Plate[]
+    compId: Uint16Array
+    neighborId: Uint16Array
+    distField: Float32Array
+    convField: Float32Array
+    shearField: Float32Array
+    crustDist: Float32Array
+    paleoDist: Float32Array
+  } {
+
+    // ---- 1. Continental mask from noise (stream 15) ----
+    const contNoise = createNoise3D(deriveSeed(seed, 15))
+    const crustMask = new Uint8Array(TOTAL_TEXELS)
+    const dirScratch = new Vector3()
+    const texScratch = { face: 0, x: 0, y: 0 }
+
+    for (let face = 0; face < 6; face++) {
+      for (let ty = 0; ty < RES; ty++) {
+        for (let tx = 0; tx < RES; tx++) {
+          texelToDir(face, tx, ty, RES, dirScratch)
+          const c = fbm(contNoise, dirScratch.x * CONT_FREQ, dirScratch.y * CONT_FREQ, dirScratch.z * CONT_FREQ, { octaves: 5 })
+          const t = texelIndex(face, tx, ty, RES)
+          crustMask[t] = c > CONT_THRESH ? 1 : 0
+        }
+      }
+    }
+
+    // ---- 2. Crust SDF via Dijkstra (same machinery as Step 6b) ----
+    let totalCrust = 0
+    for (let t = 0; t < TOTAL_TEXELS; t++) if (crustMask[t]) totalCrust++
+
+    const crustDistRaw = new Float32Array(TOTAL_TEXELS)
+    if (totalCrust === 0) {
+      crustDistRaw.fill(-1.5)
+    } else if (totalCrust === TOTAL_TEXELS) {
+      crustDistRaw.fill(1.5)
+    } else {
+      const INF2 = 1e30
+      const cDist = new Float32Array(TOTAL_TEXELS).fill(INF2)
+      const cSettled = new Uint8Array(TOTAL_TEXELS)
+      const cHeap = new BinaryHeap(TOTAL_TEXELS * 2)
+      const cNbr: { face: number; x: number; y: number } = { face: 0, x: 0, y: 0 }
+
+      // Seed: crust edge texels (crustMask differs from any 4-neighbour)
+      for (let idx = 0; idx < TOTAL_TEXELS; idx++) {
+        const face = (idx / (RES * RES)) | 0
+        const rem  = idx % (RES * RES)
+        const cy   = (rem / RES) | 0
+        const cx   = rem % RES
+        const mine = crustMask[idx]
+        const dx4 = [1, -1, 0, 0] as const
+        const dy4 = [0, 0, 1, -1] as const
+        for (let d = 0; d < 4; d++) {
+          neighborTexel(face, cx, cy, dx4[d] as -1|0|1, dy4[d] as -1|0|1, RES, cNbr)
+          const ni = texelIndex(cNbr.face, cNbr.x, cNbr.y, RES)
+          if (crustMask[ni] !== mine) {
+            if (cDist[idx] > 0) {
+              cDist[idx] = 0
+              cHeap.push(0, idx)
+            }
+            break
+          }
+        }
+      }
+
+      const CDIAG = TEX_ANG * Math.SQRT2
+      const CORTH = TEX_ANG
+      const dx8c = [ 1, -1,  0,  0,  1, -1,  1, -1] as const
+      const dy8c = [ 0,  0,  1, -1,  1,  1, -1, -1] as const
+
+      while (!cHeap.isEmpty()) {
+        const { key: cdistVal, val: cidx } = cHeap.popMin()
+        if (cSettled[cidx]) continue
+        cSettled[cidx] = 1
+        const face = (cidx / (RES * RES)) | 0
+        const rem  = cidx % (RES * RES)
+        const cy   = (rem / RES) | 0
+        const cx   = rem % RES
+        for (let d = 0; d < 8; d++) {
+          neighborTexel(face, cx, cy, dx8c[d] as -1|0|1, dy8c[d] as -1|0|1, RES, cNbr)
+          const ni = texelIndex(cNbr.face, cNbr.x, cNbr.y, RES)
+          if (cSettled[ni]) continue
+          const cost = (dx8c[d] !== 0 && dy8c[d] !== 0) ? CDIAG : CORTH
+          const newDist2 = cdistVal + cost
+          if (newDist2 < cDist[ni]) {
+            cDist[ni] = newDist2
+            cHeap.push(newDist2, ni)
+          }
+        }
+      }
+
+      for (let t = 0; t < TOTAL_TEXELS; t++) {
+        crustDistRaw[t] = crustMask[t] === 1 ? cDist[t] : -cDist[t]
+      }
+    }
+
+    const crustDist = blurField(blurField(blurField(crustDistRaw)))
+
+    // ---- 3. Single plate ----
+    const plates: Plate[] = [{
+      id: 0,
+      seedDir: new Vector3(0, 1, 0),
+      type: 'continental',
+      baseElevation: 0,
+      omega: new Vector3(0, 0, 0),
+      color: hslToRgb(0.0, 0.0, 0.55),
+    }]
+
+    // ---- 4. No-boundary fields ----
+    const compId     = new Uint16Array(TOTAL_TEXELS)           // all 0 → plateId 0 everywhere
+    const neighborId = new Uint16Array(TOTAL_TEXELS)           // all 0 → neighborId 0
+    const distField  = new Float32Array(TOTAL_TEXELS).fill(Math.PI)  // sentinel "far from any boundary"
+    const convField  = new Float32Array(TOTAL_TEXELS)          // all 0 — no convergence
+    const shearField = new Float32Array(TOTAL_TEXELS)          // all 0 — no shear
+
+    // ---- 5. Paleo orogens (identical to Step 6c in tectonic path) ----
+    const paleoMask = new Uint8Array(TOTAL_TEXELS)
+    const paleoRng  = makeRng(deriveSeed(seed, 12))
+    const PALEO_SEED_COUNT  = 14
+    const PALEO_MAX_WALKERS = 8 * PALEO_SEED_COUNT
+    traceCracks(paleoMask, paleoRng, PALEO_SEED_COUNT, PALEO_MAX_WALKERS, dirScratch, texScratch)
+
+    const paleoDilated = dilate4(paleoMask)
+
+    const paleoDistRaw = new Float32Array(TOTAL_TEXELS)
+    {
+      const INF3 = 1e30
+      const pDist    = new Float32Array(TOTAL_TEXELS).fill(INF3)
+      const pSettled = new Uint8Array(TOTAL_TEXELS)
+      const pHeap    = new BinaryHeap(TOTAL_TEXELS * 2)
+      const pNbr: { face: number; x: number; y: number } = { face: 0, x: 0, y: 0 }
+
+      for (let idx = 0; idx < TOTAL_TEXELS; idx++) {
+        if (paleoDilated[idx] === 1) {
+          pDist[idx] = 0
+          pHeap.push(0, idx)
+        }
+      }
+
+      const PDIAG = TEX_ANG * Math.SQRT2
+      const PORTH = TEX_ANG
+      const pdx8 = [ 1, -1,  0,  0,  1, -1,  1, -1] as const
+      const pdy8 = [ 0,  0,  1, -1,  1,  1, -1, -1] as const
+
+      while (!pHeap.isEmpty()) {
+        const { key: pd, val: pidx } = pHeap.popMin()
+        if (pSettled[pidx]) continue
+        pSettled[pidx] = 1
+        const face = (pidx / (RES * RES)) | 0
+        const rem  = pidx % (RES * RES)
+        const py   = (rem / RES) | 0
+        const px   = rem % RES
+        for (let d = 0; d < 8; d++) {
+          neighborTexel(face, px, py, pdx8[d] as -1|0|1, pdy8[d] as -1|0|1, RES, pNbr)
+          const ni = texelIndex(pNbr.face, pNbr.x, pNbr.y, RES)
+          if (pSettled[ni]) continue
+          const cost = (pdx8[d] !== 0 && pdy8[d] !== 0) ? PDIAG : PORTH
+          const nd = pd + cost
+          if (nd < pDist[ni]) {
+            pDist[ni] = nd
+            pHeap.push(nd, ni)
+          }
+        }
+      }
+
+      for (let t = 0; t < TOTAL_TEXELS; t++) {
+        paleoDistRaw[t] = pDist[t] === INF3 ? Math.PI : pDist[t]
+      }
+    }
+
+    const paleoDist = blurField(paleoDistRaw)
+
+    return { plates, compId, neighborId, distField, convField, shearField, crustDist, paleoDist }
+  }
+
+  // ---------------------------------------------------------------------------
+  // _bakeVolcanoes — one-time bake of subduction-arc volcano positions
+  // ---------------------------------------------------------------------------
+
+  private _bakeVolcanoes(seed: number, arcDensity: number): void {
+    const ARC_CONV_THRESH_EFF = ARC_CONV_THRESH / arcDensity
+    const ARC_SPACING_EFF     = ARC_SPACING / arcDensity
+
+    const q       = this._bakeQueryScratch
+    const dir     = this._bakeDirScratch
+    // Separate scratch vector for sampleSmooth — must not be dir itself
+    const ssScratch = new Vector3()
+    const plates  = this.plates
+
+    // ---- a. FRONT CANDIDATES ----
+    // For each texel, quick-reject via _convField, then full query() for exact gates.
+    interface Candidate {
+      px: number; py: number; pz: number  // unit direction at texel center
+      conv: number
+      frontStrength: number
+      hash: number     // deterministic per-texel integer for tie-breaking
+    }
+    const candidates: Candidate[] = []
+
+    for (let face = 0; face < 6; face++) {
+      for (let ty = 0; ty < RES; ty++) {
+        for (let tx = 0; tx < RES; tx++) {
+          texelToDir(face, tx, ty, RES, dir)
+
+          // Cheap pre-reject: sample _convField at UNWARPED dir (no warp overhead).
+          // Threshold is 0.5× so the unwarped sample can never falsely reject a texel
+          // whose WARPED sample (used by the authoritative gate at line ~1986) would
+          // pass. WARP_AMP=0.08 rad can shift the sample point by up to ~0.08 rad on
+          // the sphere; the convField is blurred so the field varies smoothly, but to
+          // be a strict superset we need enough slack to absorb that displacement.
+          // 0.5× guarantees: any texel accepted by the real gate (conv > thresh) has
+          // unwarped conv > thresh×0.5 unless the field is pathologically non-monotone
+          // over an 0.08 rad neighbourhood, which the triple-blur ensures it isn't.
+          const convPre = sampleSmooth(this._convField, dir, RES, ssScratch)
+          if (convPre < ARC_CONV_THRESH_EFF * 0.5) continue
+
+          // Full query at texel-center direction (same warp as all later queries)
+          this.query(dir, q)
+          // Re-establish dir after query() (query() writes to its own _warpedDir, not dir — safe)
+          texelToDir(face, tx, ty, RES, dir)
+
+          if (q.convergence <= ARC_CONV_THRESH_EFF) continue
+          const bd = q.boundaryDist
+          if (bd < ARC_OFFSET - ARC_BAND || bd > ARC_OFFSET + ARC_BAND) continue
+
+          // Overriding-side / oceanic-subductor test (mirroring boundaryRelief polarity)
+          const wMine  = _ss(-0.10, 0.10, q.crustDist)
+          const wOther = _ss(-0.10, 0.10, q.otherCrustDist)
+          const own    = plates[q.plateId]
+          const other  = plates[q.neighborId]
+
+          // OC: continental overriding (Andes) — I'm continental, neighbor oceanic
+          const wCO = wMine * (1 - wOther)
+          // OO: oceanic-oceanic arc — both oceanic, higher id = overriding arc side
+          const wOO = (1 - wMine) * (1 - wOther)
+          const sideRamp = _ss(0.002, 0.015, bd)
+          const ooSubduct = 0.5 + ((own.id < other.id ? 1 : 0) - 0.5) * sideRamp
+
+          let frontStrength = 0
+          let isCandidate = false
+
+          if (wMine > 0.5 && wOther < 0.5) {
+            // OC regime, I'm the continental overriding side
+            frontStrength = wCO
+            isCandidate = true
+          } else if (wMine < 0.5 && wOther < 0.5 && own.id > other.id) {
+            // OO regime, I'm the higher-id arc side
+            frontStrength = wOO * (1 - ooSubduct)
+            isCandidate = true
+          }
+          if (!isCandidate) continue
+
+          const texIdx = texelIndex(face, tx, ty, RES)
+          const hash   = deriveSeed(texIdx, 14)  // stable per-texel hash
+
+          candidates.push({
+            px: dir.x, py: dir.y, pz: dir.z,
+            conv: q.convergence,
+            frontStrength,
+            hash,
+          })
+        }
+      }
+    }
+
+    if (candidates.length === 0) return
+
+    // ---- b. DART-THROWING with min-distance + render-consistent validation ----
+    //
+    // Two correctness requirements drive this pass:
+    //   1. SPACING — enforce a TRUE min-distance (ARC_SPACING_EFF) between accepted
+    //      volcanoes. A grid "one-per-cell" decimation does NOT do this: two winners
+    //      in adjacent cells can sit far closer than the cell size. Dart-throwing
+    //      (sort candidates by a seeded key, accept only if no already-accepted
+    //      volcano lies within ARC_SPACING_EFF) gives a hard min-distance guarantee.
+    //   2. PLACEMENT — validate each candidate at its FINAL (jittered) position by
+    //      calling the same query() the renderer / harness uses. The per-texel scan
+    //      above only finds candidates cheaply at texel centers; the jitter then
+    //      moves the volcano by up to ~ARC_SPACING_EFF*0.4, which can carry it out
+    //      of the [ARC_OFFSET ± ARC_BAND] band. Re-querying at the final pos and
+    //      re-checking the band/convergence/overriding-side gate makes placement
+    //      consistent-by-construction with what gets rendered.
+    //
+    // Proximity check is O(1): each accepted volcano stamps every grid cell within
+    // ARC_SPACING_EFF of it. A new candidate is rejected iff its own cell is already
+    // stamped — so we only ever read one cell. Stamping uses the cube-map grid, so
+    // it is correct across face seams (cells are addressed by (face,x,y)).
+
+    // Sort ALL candidates deterministically: highest convergence first, hash tie-break.
+    candidates.sort((a, b) => {
+      if (b.conv !== a.conv) return b.conv - a.conv
+      return b.hash - a.hash
+    })
+
+    // Min-distance occupancy grid (cube-map). Cell angular size ≲ ARC_SPACING_EFF so
+    // that a candidate's own cell is a sufficient proximity witness after stamping.
+    const occRes = Math.max(2, Math.ceil((Math.PI / 2) / ARC_SPACING_EFF))
+    const nOccCells = 6 * occRes * occRes
+    const occupied = new Uint8Array(nOccCells)           // 1 = within ARC_SPACING of an accepted volcano
+    const occCellAng = (Math.PI / 2) / occRes
+    const occReach = ARC_SPACING_EFF + occCellAng * Math.SQRT2  // stamp radius incl. cell diagonal
+    const occSearchR = Math.ceil(occReach / occCellAng) + 1
+    const occTexScratch = { face: 0, x: 0, y: 0 }
+    const occCellDir = new Vector3()
+
+    // query scratch for final-position re-validation (separate from q used elsewhere? q is free here)
+    const vq = q
+
+    const volcanoes: Volcano[] = []
+    const volPos:        number[] = []
+    const volBaseRadius: number[] = []
+    const volHeight:     number[] = []
+    const volCraterFrac: number[] = []
+
+    for (const cand of candidates) {
+      if (volcanoes.length >= ARC_MAX) break
+
+      // --- Seeded jitter keyed on the candidate's stable hash (independent of
+      //     acceptance order → deterministic regardless of which darts land). ---
+      const jitterRng = makeRng(deriveSeed(cand.hash ^ seed, 14))
+      const jitterAngle = jitterRng() * ARC_SPACING_EFF * 0.4
+      const jitterAzimuth = jitterRng() * Math.PI * 2
+
+      // Build orthonormal tangent frame from (cand.px, cand.py, cand.pz)
+      const px = cand.px, py = cand.py, pz = cand.pz
+      let ux = 0, uy = 1, uz = 0
+      if (Math.abs(py) > 0.9) { ux = 1; uy = 0; uz = 0 }
+      let t1x = py * uz - pz * uy
+      let t1y = pz * ux - px * uz
+      let t1z = px * uy - py * ux
+      const t1len = Math.sqrt(t1x * t1x + t1y * t1y + t1z * t1z) || 1
+      t1x /= t1len; t1y /= t1len; t1z /= t1len
+      const t2x = py * t1z - pz * t1y
+      const t2y = pz * t1x - px * t1z
+      const t2z = px * t1y - py * t1x
+      const cosA = Math.cos(jitterAzimuth), sinA = Math.sin(jitterAzimuth)
+      const tx2 = cosA * t1x + sinA * t2x
+      const ty2 = cosA * t1y + sinA * t2y
+      const tz2 = cosA * t1z + sinA * t2z
+      const axX = py * tz2 - pz * ty2
+      const axY = pz * tx2 - px * tz2
+      const axZ = px * ty2 - py * tx2
+      const axLen = Math.sqrt(axX * axX + axY * axY + axZ * axZ) || 1
+      const kx = axX / axLen, ky = axY / axLen, kz = axZ / axLen
+      const cosJ = Math.cos(jitterAngle), sinJ = Math.sin(jitterAngle)
+      const kdot = kx * px + ky * py + kz * pz
+      const jx = px * cosJ + (ky * pz - kz * py) * sinJ + kx * kdot * (1 - cosJ)
+      const jy = py * cosJ + (kz * px - kx * pz) * sinJ + ky * kdot * (1 - cosJ)
+      const jz = pz * cosJ + (kx * py - ky * px) * sinJ + kz * kdot * (1 - cosJ)
+      const jLen = Math.sqrt(jx * jx + jy * jy + jz * jz) || 1
+      const posX = jx / jLen, posY = jy / jLen, posZ = jz / jLen
+
+      // --- MIN-DISTANCE reject (O(1)): is this position's cell already occupied? ---
+      occCellDir.set(posX, posY, posZ)
+      dirToTexel(occCellDir, occRes, occTexScratch)
+      const myOccCell = texelIndex(occTexScratch.face, occTexScratch.x, occTexScratch.y, occRes)
+      if (occupied[myOccCell]) continue
+
+      // --- PLACEMENT re-validate at FINAL position via the real query() ---
+      // (same path the renderer + harness use → consistent by construction)
+      occCellDir.set(posX, posY, posZ)
+      this.query(occCellDir, vq)
+      if (vq.convergence <= ARC_CONV_THRESH_EFF) continue
+      const fbd = vq.boundaryDist
+      if (fbd < ARC_OFFSET - ARC_BAND || fbd > ARC_OFFSET + ARC_BAND) continue
+      const fwMine  = _ss(-0.10, 0.10, vq.crustDist)
+      const fwOther = _ss(-0.10, 0.10, vq.otherCrustDist)
+      const fown    = plates[vq.plateId]
+      const fother  = plates[vq.neighborId]
+      const sideOk =
+        (fwMine > 0.5 && fwOther < 0.5) ||
+        (fwMine < 0.5 && fwOther < 0.5 && fown.id > fother.id)
+      if (!sideOk) continue
+
+      // --- ACCEPTED. Instance props (convStrength from the re-validated conv). ---
+      const conv = vq.convergence
+      const convStrength = Math.max(0, Math.min(1, (conv - ARC_CONV_THRESH_EFF) / ARC_SIZE_SPAN))
+      const rJitter  = 1 + (jitterRng() * 2 - 1) * 0.15
+      const hJitter  = 1 + (jitterRng() * 2 - 1) * 0.15
+      const cfJitter = (jitterRng() * 2 - 1) * 0.03
+
+      // Radius floor raised (0.024) so the smallest cones aren't too steep: the
+      // cone flank's worst-case 120 m step scales as height/baseRadius, and a
+      // 0.018-rad / 0.55-height cone peaks right at the GATE X 120 m bound (0.10).
+      // Widening the floor + trimming the height top keeps the steepest flank's
+      // 120 m delta comfortably under 0.10 with no exemption, and (with the
+      // headroom blend) keeps cordillera summits ≤ ~0.95.
+      const baseRadius      = (0.054 + (0.070 - 0.054) * convStrength) * rJitter  // floor raised 0.024->0.054: gentler cone flanks keep 120 m step < 0.10 even where a breaching cone sits on the coast shelf
+      const height          = (0.37  + (0.62  - 0.37)  * convStrength) * hJitter  // [was 0.55..0.95] de-saturation — ocean cones still breach, land cones modest
+      const craterRadiusFrac = 0.12 + cfJitter
+
+      const pos = new Vector3(posX, posY, posZ)
+      volcanoes.push({ pos, baseRadius, height, craterRadiusFrac })
+      volPos.push(posX, posY, posZ)
+      volBaseRadius.push(baseRadius)
+      volHeight.push(height)
+      volCraterFrac.push(Math.max(0.05, craterRadiusFrac))
+
+      // --- STAMP min-distance footprint: mark every cell within ARC_SPACING_EFF. ---
+      const cFace = occTexScratch.face, cX = occTexScratch.x, cY = occTexScratch.y
+      for (let dFace = 0; dFace < 6; dFace++) {
+        for (let dty = 0; dty < occRes; dty++) {
+          for (let dtx = 0; dtx < occRes; dtx++) {
+            if (dFace === cFace) {
+              if (Math.abs(dtx - cX) > occSearchR || Math.abs(dty - cY) > occSearchR) continue
+            }
+            texelToDir(dFace, dtx, dty, occRes, occCellDir)
+            const dotVC = posX * occCellDir.x + posY * occCellDir.y + posZ * occCellDir.z
+            const angVC = Math.acos(Math.max(-1, Math.min(1, dotVC)))
+            if (angVC <= ARC_SPACING_EFF) {
+              occupied[texelIndex(dFace, dtx, dty, occRes)] = 1
+            }
+          }
+        }
+      }
+    }
+
+    if (volcanoes.length === 0) return
+
+    const nVol = volcanoes.length
+    this._volcanoes = volcanoes
+
+    // Flat typed arrays for hot path
+    this._volPos        = new Float32Array(volPos)
+    this._volBaseRadius = new Float32Array(volBaseRadius)
+    this._volHeight     = new Float32Array(volHeight)
+    this._volCraterFrac = new Float32Array(volCraterFrac)
+
+    // ---- d. BUILD SPATIAL INDEX ----
+    // Bucket res such that cell angular size ≳ max baseRadius.
+    // max baseRadius ≈ 0.045 * 1.15 ≈ 0.052 rad
+    // texAng(bucketRes) = (π/2)/bucketRes ≈ cell half-size → want cell diagonal ≳ maxBaseR
+    // cell angular size = (π/2)/bucketRes; want ≈ 0.05 → bucketRes = (π/2)/0.05 ≈ 31
+    // Use 24 which gives cellSize ≈ 0.065 rad ≥ maxBaseRadius
+    const bucketRes = 24
+    this._volBucketRes = bucketRes
+
+    const nBucketCells = 6 * bucketRes * bucketRes
+    // Per-cell count pass
+    const cellCount = new Int32Array(nBucketCells)
+    const volBucketScratch = { face: 0, x: 0, y: 0 }
+    const cellAngSize = (Math.PI / 2) / bucketRes
+    // cell diagonal ≈ cellAngSize * sqrt(2)
+    const cellDiag = cellAngSize * Math.SQRT2
+    // Dedicated scratch for cell-center direction (separate from dir/ssScratch)
+    const cellDir = new Vector3()
+
+    // For each volcano, find all cells within baseRadius + cellDiag and count
+    const volCells: Array<number[]> = new Array(nVol)
+    for (let vi = 0; vi < nVol; vi++) {
+      const vx = this._volPos[vi * 3]
+      const vy = this._volPos[vi * 3 + 1]
+      const vz = this._volPos[vi * 3 + 2]
+      const reach = this._volBaseRadius[vi] + cellDiag
+
+      // Find candidate cells by iterating all cells within the sphere cap
+      // Center cell of this volcano
+      dir.set(vx, vy, vz)
+      dirToTexel(dir, bucketRes, volBucketScratch)
+      const cFace = volBucketScratch.face
+      const cX    = volBucketScratch.x
+      const cY    = volBucketScratch.y
+
+      // Angular half-span in cells to search
+      const searchRadius = Math.ceil(reach / cellAngSize) + 1
+
+      const myVols: number[] = []
+      for (let dFace = 0; dFace < 6; dFace++) {
+        for (let dty = 0; dty < bucketRes; dty++) {
+          for (let dtx = 0; dtx < bucketRes; dtx++) {
+            // Quick manhattan filter on same face before angular test
+            if (dFace === cFace) {
+              if (Math.abs(dtx - cX) > searchRadius || Math.abs(dty - cY) > searchRadius) continue
+            }
+            // Angular distance from volcano pos to cell center
+            texelToDir(dFace, dtx, dty, bucketRes, cellDir)
+            const dotVC = vx * cellDir.x + vy * cellDir.y + vz * cellDir.z
+            const angVC = Math.acos(Math.max(-1, Math.min(1, dotVC)))
+            if (angVC <= reach) {
+              const bucketCell = texelIndex(dFace, dtx, dty, bucketRes)
+              myVols.push(bucketCell)
+              cellCount[bucketCell]++
+            }
+          }
+        }
+      }
+      volCells[vi] = myVols
+    }
+
+    // Build CSR offsets (prefix sum)
+    const bucketStart = new Int32Array(nBucketCells + 1)
+    for (let c = 0; c < nBucketCells; c++) {
+      bucketStart[c + 1] = bucketStart[c] + cellCount[c]
+    }
+    const totalInserts = bucketStart[nBucketCells]
+    const bucketIdx    = new Int32Array(totalInserts)
+
+    // Fill CSR (need write cursor per cell)
+    const writeCursor = new Int32Array(nBucketCells)
+    for (let vi = 0; vi < nVol; vi++) {
+      for (const cell of volCells[vi]) {
+        const writePos = bucketStart[cell] + writeCursor[cell]
+        bucketIdx[writePos] = vi
+        writeCursor[cell]++
+      }
+    }
+
+    this._volBucketStart = bucketStart
+    this._volBucketIdx   = bucketIdx
+  }
+
+  // ---------------------------------------------------------------------------
+  // volcanoElevation — zero-alloc hot path
+  //
+  // Cone profile: f(x) = (1 - x^2)^2, x = a / baseRadius ∈ [0,1).
+  //   C∞: d/dx = -4x(1-x^2), value 1 and slope 0 at x=0 (rounded summit),
+  //   value 0 and slope 0 at x=1 (smooth base).
+  //
+  // Crater dimple: craterDepth*(1-(x/craterFrac)^2)^2 subtracted for x < craterFrac.
+  //   C∞: value craterDepth and slope 0 at x=0 (caldera floor),
+  //   value 0 and slope 0 at x=craterFrac (seamless join onto cone — C1 satisfied).
+  //   Net: center ≈ height - craterDepth; rim at x≈craterFrac ≈ height — rim is high point. ✓
+  // ---------------------------------------------------------------------------
+
+  volcanoElevation(dir: Vector3): number {
+    const nVol = this._volcanoes.length
+    if (nVol === 0) return 0
+
+    const bucketRes = this._volBucketRes
+    if (bucketRes === 0) return 0
+    dirToTexel(dir, bucketRes, this._volScratchTexel)
+    const cell = texelIndex(
+      this._volScratchTexel.face,
+      this._volScratchTexel.x,
+      this._volScratchTexel.y,
+      bucketRes,
+    )
+
+    const start = this._volBucketStart[cell]
+    const end   = this._volBucketStart[cell + 1]
+    if (start === end) return 0
+
+    const dx = dir.x, dy = dir.y, dz = dir.z
+    let sum = 0
+
+    for (let i = start; i < end; i++) {
+      const vi = this._volBucketIdx[i]
+      const vx = this._volPos[vi * 3]
+      const vy = this._volPos[vi * 3 + 1]
+      const vz = this._volPos[vi * 3 + 2]
+
+      // Angular distance via dot product — alloc-free
+      const dotVal = dx * vx + dy * vy + dz * vz
+      const a = Math.acos(Math.max(-1, Math.min(1, dotVal)))
+      const br = this._volBaseRadius[vi]
+      if (a >= br) continue
+
+      const x = a / br
+      const x2 = x * x
+      const cone = this._volHeight[vi] * (1 - x2) * (1 - x2)
+
+      const cf = this._volCraterFrac[vi]
+      if (x < cf) {
+        const xc = x / cf
+        const xc2 = xc * xc
+        const craterDepth = 0.18 * this._volHeight[vi]
+        sum += cone - craterDepth * (1 - xc2) * (1 - xc2)
+      } else {
+        sum += cone
+      }
+    }
+
+    return sum
   }
 
   // ---------------------------------------------------------------------------
@@ -1720,14 +2610,16 @@ export class Tectonics {
     // --- Smooth boundary distance ---
     const boundaryDist = sampleSmooth(this._distField, w, RES, this._smoothScratch)
 
-    // --- Gradient-based tHat (unwarped dir) ---
-    // Use UNWARPED dir so velocity computation lives in the same space as the gradient.
-    //
-    // Strategy: central-difference on distField over ±1 texel neighbours along
-    // face U and V axes. Convert to world-space by subtracting neighbour directions
-    // (finite-difference approximation of the tangent-basis vectors). Project the
-    // result onto the tangent plane, negate → tHat points toward the boundary
-    // (steepest DESCENT of distField, which increases toward the plate interior).
+    // --- Convergence and shear from pre-baked blurred fields ---
+    // Sampling the blurred baked fields eliminates the gradient-direction sign-flips
+    // that caused cliff artefacts when tHat reversed across saddle points in the
+    // raw distField gradient. The baked fields are blurred 3× at construction time.
+    const convergence = sampleSmooth(this._convField,  w, RES, this._smoothScratch)
+    const shear       = sampleSmooth(this._shearField, w, RES, this._smoothScratch)
+
+    // --- Gradient-based tHat (unwarped dir) — ONLY used for otherCrustDist mirror ---
+    // The gradient is no longer used for convergence/shear; it is only needed to
+    // compute the Rodrigues rotation axis for the crust-dist mirror probe below.
     dirToTexel(dir, RES, this._tex)
     const { face, x: tx, y: ty } = this._tex
 
@@ -1736,7 +2628,6 @@ export class Tectonics {
     const _nt2 = this._gTex2
     const _nt3 = this._gTex3
 
-    // Neighbour texels: ±U (±1, 0), ±V (0, ±1) — cross-face safe via neighborTexel
     neighborTexel(face, tx, ty,  1,  0, RES, _nt0)
     neighborTexel(face, tx, ty, -1,  0, RES, _nt1)
     neighborTexel(face, tx, ty,  0,  1, RES, _nt2)
@@ -1747,12 +2638,6 @@ export class Tectonics {
     const d2 = this._distField[texelIndex(_nt2.face, _nt2.x, _nt2.y, RES)]
     const d3 = this._distField[texelIndex(_nt3.face, _nt3.x, _nt3.y, RES)]
 
-    // Central-difference scalar gradient along U and V axes
-    const gradU = (d0 - d1) * 0.5  // d/dU * (1 texel)
-    const gradV = (d2 - d3) * 0.5  // d/dV * (1 texel)
-
-    // World-space axis vectors via finite-difference of texel-centre directions.
-    // uAxis = dir(+1,0) - dir(-1,0) ≈ 2 * tangent_U (up to projection distortion).
     texelToDir(_nt0.face, _nt0.x, _nt0.y, RES, this._gDir0)
     texelToDir(_nt1.face, _nt1.x, _nt1.y, RES, this._gDir1)
     texelToDir(_nt2.face, _nt2.x, _nt2.y, RES, this._gDir2)
@@ -1765,59 +2650,20 @@ export class Tectonics {
     const vay = this._gDir2.y - this._gDir3.y
     const vaz = this._gDir2.z - this._gDir3.z
 
-    // World-space gradient vector (not yet normalised, not projected)
+    const gradU = (d0 - d1) * 0.5
+    const gradV = (d2 - d3) * 0.5
     const gwx = gradU * uax + gradV * vax
     const gwy = gradU * uay + gradV * vay
     const gwz = gradU * uaz + gradV * vaz
 
-    // Project onto tangent plane at dir (remove radial component)
     const gdot = gwx * dir.x + gwy * dir.y + gwz * dir.z
     const ptx = gwx - gdot * dir.x
     const pty = gwy - gdot * dir.y
     const ptz = gwz - gdot * dir.z
-
     const gLen = Math.sqrt(ptx * ptx + pty * pty + ptz * ptz)
 
-    let convergence = 0
-    let shear = 0
     if (gLen > 1e-7) {
-      // tHat = −∇dist / |∇dist|, i.e. toward boundary (steepest descent)
       this._tHat.set(-ptx / gLen, -pty / gLen, -ptz / gLen)
-
-      // Velocities using UNWARPED dir (unchanged from old code)
-      const omegaA = this.plates[plateId].omega
-      const omegaB = this.plates[neighborId].omega
-      const px = dir.x, py = dir.y, pz = dir.z
-
-      this._vA.set(
-        omegaA.y * pz - omegaA.z * py,
-        omegaA.z * px - omegaA.x * pz,
-        omegaA.x * py - omegaA.y * px,
-      )
-      this._vB.set(
-        omegaB.y * pz - omegaB.z * py,
-        omegaB.z * px - omegaB.x * pz,
-        omegaB.x * py - omegaB.y * px,
-      )
-
-      const diffX = this._vA.x - this._vB.x
-      const diffY = this._vA.y - this._vB.y
-      const diffZ = this._vA.z - this._vB.z
-
-      const raw = (diffX * this._tHat.x + diffY * this._tHat.y + diffZ * this._tHat.z) / 2
-      convergence = Math.max(-1, Math.min(1, raw))
-
-      // bHat = normalize(tHat × unwarped_dir) — the along-boundary tangent
-      // (tHat points toward boundary, cross with dir gives the tangential direction)
-      const bx = this._tHat.y * dir.z - this._tHat.z * dir.y
-      const by = this._tHat.z * dir.x - this._tHat.x * dir.z
-      const bz = this._tHat.x * dir.y - this._tHat.y * dir.x
-      const bLen = Math.sqrt(bx * bx + by * by + bz * bz)
-      if (bLen > 1e-7) {
-        this._bHat.set(bx / bLen, by / bLen, bz / bLen)
-        const rawShear = (diffX * this._bHat.x + diffY * this._bHat.y + diffZ * this._bHat.z) / 2
-        shear = Math.max(-1, Math.min(1, rawShear))
-      }
     }
 
     out.plateId      = plateId
@@ -1825,7 +2671,59 @@ export class Tectonics {
     out.boundaryDist = boundaryDist
     out.convergence  = convergence
     out.shear        = shear
-    out.crustDist    = sampleSmooth(this._crustDist, w, RES, this._crustScratch)
+
+    // paleoDist: sample using the standard warped direction w
+    out.paleoDist = sampleSmooth(this._paleoDist, w, RES, this._fineWarpScratch)
+
+    // Fine warp for coastline complexity — applied ONLY to crustDist sampling
+    // Plate/boundary/paleo fields keep using w (plate ownership must not pick up fine warp)
+    const fwn = this._fineWarpNoise
+    const fwDir = this._fineCrustScratch
+    const fw0x = fbm(fwn, dir.x + 5.1, dir.y + 5.1, dir.z + 5.1, { octaves: 3, frequency: 9 })
+    const fw0y = fbm(fwn, dir.x + 7.3, dir.y + 7.3, dir.z + 7.3, { octaves: 3, frequency: 9 })
+    const fw0z = fbm(fwn, dir.x + 11.7, dir.y + 11.7, dir.z + 11.7, { octaves: 3, frequency: 9 })
+    fwDir.set(
+      w.x + 0.025 * fw0x,
+      w.y + 0.025 * fw0y,
+      w.z + 0.025 * fw0z,
+    ).normalize()
+    out.crustDist = sampleSmooth(this._crustDist, fwDir, RES, this._crustScratch)
+
+    // --- otherCrustDist: mirror through boundary to the neighbor side ---
+    // Rotate the UNWARPED dir by 2·boundaryDist about the axis (dir × tHat).
+    // Clamp theta to avoid huge rotations for interior points; blend by gradient strength
+    // so weak-gradient regions gracefully fall back to crustDist (no discontinuous branch).
+    let mirroredCrustDist = out.crustDist
+    if (gLen > 1e-7) {
+      const ax2 = dir.y * this._tHat.z - dir.z * this._tHat.y
+      const ay2 = dir.z * this._tHat.x - dir.x * this._tHat.z
+      const az2 = dir.x * this._tHat.y - dir.y * this._tHat.x
+      const aLen2 = Math.sqrt(ax2 * ax2 + ay2 * ay2 + az2 * az2)
+      if (aLen2 > 1e-7) {
+        const mirrorAxis = this._otherCrustDir  // reuse scratch
+        mirrorAxis.set(ax2 / aLen2, ay2 / aLen2, az2 / aLen2)
+        // Clamp rotation angle to avoid wild overshoots for interior points
+        const theta = Math.min(2 * boundaryDist, 0.06)
+        const cosT = Math.cos(theta)
+        const sinT = Math.sin(theta)
+        const vx = dir.x, vy = dir.y, vz = dir.z
+        const kx = mirrorAxis.x, ky = mirrorAxis.y, kz = mirrorAxis.z
+        const kdotv = kx * vx + ky * vy + kz * vz
+        const crossX = ky * vz - kz * vy
+        const crossY = kz * vx - kx * vz
+        const crossZ = kx * vy - ky * vx
+        mirrorAxis.set(
+          vx * cosT + crossX * sinT + kx * kdotv * (1 - cosT),
+          vy * cosT + crossY * sinT + ky * kdotv * (1 - cosT),
+          vz * cosT + crossZ * sinT + kz * kdotv * (1 - cosT),
+        ).normalize()
+        mirroredCrustDist = sampleSmooth(this._crustDist, mirrorAxis, RES, this._smoothScratch)
+      }
+    }
+    // Blend by gradient strength: weak gradient → mirror equals self (no discontinuous jump)
+    const gradStrength = _ss(1e-6, 5e-6, gLen * gLen)
+    out.otherCrustDist = out.crustDist + gradStrength * (mirroredCrustDist - out.crustDist)
+
     return out
   }
 
@@ -1902,26 +2800,26 @@ const BR_TRENCH_DEPTH         = 0.60   // OC trench depth
 const BR_FLEX_BULGE           = 0.05   // outer flexural bulge amplitude
 const BR_FLEX_POS             = 0.030  // bulge center (rad)
 const BR_FLEX_WIDTH           = 0.012  // bulge width (rad)
-const BR_TRENCH_WIDTH         = 0.012  // trench width (rad)
-const BR_CORD_HEIGHT          = 0.55   // cordillera peak amplitude (Andes)
-const BR_CORD_POS             = 0.030  // cordillera center (rad)
-const BR_CORD_WIDTH           = 0.018  // cordillera width (rad)
+const BR_TRENCH_WIDTH         = 0.020  // trench width (rad)
+const BR_CORD_HEIGHT          = 0.72   // cordillera peak amplitude (Andes) [was 1.30 — de-saturation pass]
+const BR_CORD_POS             = 0.038  // cordillera center (rad) [was 0.030]
+const BR_CORD_WIDTH           = 0.024  // cordillera width (rad) [was 0.018] — narrowed: taller crest, smaller footprint
 const BR_CORD_RIDGE           = 0.60   // ridged texture amplitude on cordillera
 const BR_CORD_RIDGE_BASE      = 0.55   // ridged texture floor
 const BR_SHELF_DIP            = 0.06   // coastal shelf dip amplitude
 const BR_SHELF_WIDTH          = 0.006  // shelf dip width (rad)
 const BR_OO_TRENCH_DEPTH      = 0.50   // OO trench depth
-const BR_OO_TRENCH_WIDTH      = 0.011  // OO trench width
+const BR_OO_TRENCH_WIDTH      = 0.016  // OO trench width
 const BR_ARC_HEIGHT           = 0.55   // island arc peak amplitude (Japan)
 const BR_ARC_POS              = 0.026  // arc center (rad)
 const BR_ARC_WIDTH            = 0.014  // arc width (rad)
 const BR_ARC_RIDGE_THRESH     = 0.45   // ridged threshold for discrete islands
 const BR_ARC_RIDGE_SCALE      = 1 / 0.55 // normaliser for arc ridged
-const BR_BELT_HEIGHT          = 0.85   // collision belt amplitude (Himalaya)
-const BR_BELT_WIDTH           = 0.055  // belt width (rad)
-const BR_BELT_RIDGE           = 0.55   // ridged texture amplitude on belt
-const BR_BELT_RIDGE_BASE      = 0.60   // ridged texture floor
-const BR_PLATEAU_HEIGHT       = 0.30   // plateau amplitude (Tibetan Plateau)
+const BR_BELT_HEIGHT          = 0.82   // collision belt amplitude (Himalaya) [was 2.30 — de-saturation pass]
+const BR_BELT_WIDTH           = 0.075  // belt width (rad) [was 0.110 — narrower footprint]
+const BR_BELT_RIDGE           = 0.40   // ridged texture amplitude on belt [was 0.55 — trims belt peak to lower patchMax]
+const BR_BELT_RIDGE_BASE      = 0.58   // ridged texture floor [was 0.60 — raised back to hold belt MEAN (prominence)]
+const BR_PLATEAU_HEIGHT       = 0.24   // plateau amplitude (Tibetan Plateau) [was 0.30 — stacks on belt, trimmed for de-sat]
 const BR_PLATEAU_INNER        = 0.05   // plateau inner ramp start
 const BR_PLATEAU_OUTER        = 0.13   // plateau outer fade
 const BR_PLATEAU_NEAR         = 0.015  // plateau near ramp start
@@ -1930,15 +2828,15 @@ const BR_PLATEAU_FAR          = 0.05   // plateau near ramp end
 const BR_RIDGE_HEIGHT         = 0.22   // mid-ocean ridge amplitude
 const BR_RIDGE_WIDTH          = 0.05   // ridge flank width (rad)
 const BR_NOTCH_DEPTH          = 0.14   // axial rift notch depth
-const BR_NOTCH_WIDTH          = 0.006  // notch half-width (rad)
+const BR_NOTCH_WIDTH          = 0.012  // notch half-width (rad)
 const BR_RIFT_SHOULDER        = 0.18   // rift shoulder amplitude
 const BR_RIFT_SHOULDER_POS    = 0.022  // shoulder center (rad)
 const BR_RIFT_SHOULDER_WIDTH  = 0.012  // shoulder width (rad)
 const BR_GRABEN_DEPTH         = 0.24   // graben valley depth
-const BR_GRABEN_WIDTH         = 0.010  // graben half-width (rad)
+const BR_GRABEN_WIDTH         = 0.020  // graben half-width (rad)
 // Transform
 const BR_SCARP_DEPTH          = 0.10   // fault scarp/valley depth
-const BR_SCARP_WIDTH          = 0.005  // scarp half-width (rad)
+const BR_SCARP_WIDTH          = 0.008  // scarp half-width (rad)
 const BR_RIDGE2_HEIGHT        = 0.05   // parallel ridging amplitude
 const BR_RIDGE2_POS           = 0.012  // parallel ridge center (rad)
 const BR_RIDGE2_WIDTH         = 0.008  // parallel ridge width (rad)
@@ -1955,18 +2853,21 @@ const CRUST_CORD_SS_HI   =  0.01   // cordillera/belt smoothstep hi
  * only smooth magnitude-scaled envelopes). The only permitted discontinuity
  * is at the exact plate boundary where plateId flips.
  *
- * @param q        TectonicQuery for the current sample point
- * @param plates   full Plate array from the Tectonics instance
- * @param dir      unit planet-local direction (used for noise sampling only)
- * @param ridgedAt wraps a ridged noise call returning ≈[0,1]
+ * @param q          TectonicQuery for the current sample point
+ * @param plates     full Plate array from the Tectonics instance
+ * @param dir        unit planet-local direction (used for noise sampling only)
+ * @param ridgedAt   wraps a ridged noise call returning ≈[0,1]
+ * @param erosionAt  optional erosion-FBM callback for belt/cordillera (defaults to ridgedAt)
  */
 export function boundaryRelief(
   q: TectonicQuery,
   plates: Plate[],
   dir: Vector3,
   ridgedAt: (dir: Vector3, freq: number, octaves: number) => number,
+  erosionAt?: (dir: Vector3, freq: number, octaves: number) => number,
 ): number {
   const d    = q.boundaryDist   // radians
+  const sideRamp = _ss(0.002, 0.015, d)
   const own  = plates[q.plateId]
   const other = plates[q.neighborId]
   const conv  = q.convergence
@@ -1974,69 +2875,75 @@ export function boundaryRelief(
 
   // --- Convergent envelope ---
   const cp  = Math.max(0, conv)
-  const cp2 = cp * _ss(0.05, 0.18, cp)
+  const cp2 = cp * _ss(0.04, 0.15, cp)
 
   // --- Divergent envelope ---
   const absConv = Math.abs(conv)
-  const dp  = Math.max(0, -conv) * _ss(0.05, 0.18, absConv)
+  const dp  = Math.max(0, -conv) * _ss(0.04, 0.15, absConv)
 
   // --- Transform envelope (engages when sliding dominates) ---
   const abssh = Math.abs(sh)
   const tw  = abssh * _ss(0.10, 0.30, abssh) * (1 - _ss(0.05, 0.15, Math.abs(conv)))
 
-  // --- Local crust classification ---
-  const mineContinental = q.crustDist > CRUST_MINE_THRESH
-  // Far-side approximation: use nominal plate type
-  const otherContinental = other.type === 'continental'
-  // Scale factor for cordillera + collision-belt: mountains only on land
-  const cordScaleFactor = _ss(CRUST_CORD_SS_LO, CRUST_CORD_SS_HI, q.crustDist)
+  // No cross-boundary ramp: now that conv/shear are sampled from pre-baked blurred
+  // fields, cp2 and dp are smooth. The ramp was previously needed to suppress
+  // the gradient-direction sign flip, but that source of discontinuity is gone.
+  // Keeping the ramp would create artificial steep forearc drops.
+  const cp2r = cp2
+  const dpr  = dp
+
+  // --- Continuous regime weights (0=oceanic, 1=continental) ---
+  // Wide window (0.20 rad = ~16 texels on each side of zero) prevents rapid
+  // per-texel weight changes that would cause cliff-like height discontinuities.
+  const wMine  = _ss(-0.10, 0.10, q.crustDist)
+  const wOther = _ss(-0.10, 0.10, q.otherCrustDist)
+  // cordScaleFactor = wMine: reuse the same weight to avoid a second rapid
+  // smoothstep on crustDist that would compound the gradient slope.
+  const cordScaleFactor = wMine
 
   let relief = 0
 
-  if (cp2 > 0) {
-    if (!mineContinental && otherContinental) {
-      // Mariana Trench — oceanic subducting under continent
-      relief += -BR_TRENCH_DEPTH * cp2 * _g(d, 0, BR_TRENCH_WIDTH)
-             + BR_FLEX_BULGE  * cp2 * _g(d, BR_FLEX_POS, BR_FLEX_WIDTH)
+  if (cp2r > 0) {
+    // Continuous regime blending — weights 0=oceanic 1=continental
+    const wOC = (1 - wMine) * wOther        // oceanic subducting under continent
+    const wCO = wMine * (1 - wOther)         // continental overriding
+    const wOO = (1 - wMine) * (1 - wOther)  // oceanic-oceanic
+    const wCC = wMine * wOther               // continent-continent collision
 
-    } else if (mineContinental && !otherContinental) {
-      // Andes / Cascades — continental overriding side
-      const ridgeFactor = BR_CORD_RIDGE_BASE + BR_CORD_RIDGE * ridgedAt(dir, 6.0, 4)
-      relief += BR_CORD_HEIGHT  * cp2 * _g(d, BR_CORD_POS, BR_CORD_WIDTH) * ridgeFactor * cordScaleFactor
-             - BR_SHELF_DIP  * cp2 * _g(d, 0.004, BR_SHELF_WIDTH)
+    // OC: Mariana Trench (oceanic subducting side)
+    relief += wOC * (-BR_TRENCH_DEPTH * cp2r * _g(d, 0, BR_TRENCH_WIDTH)
+                    + BR_FLEX_BULGE  * cp2r * _g(d, BR_FLEX_POS, BR_FLEX_WIDTH))
 
-    } else if (!mineContinental && !otherContinental) {
-      // Japan arc — oceanic-oceanic, polarity by plate id
-      const subducting = own.id < other.id
-      if (subducting) {
-        relief += -BR_OO_TRENCH_DEPTH * cp2 * _g(d, 0, BR_OO_TRENCH_WIDTH)
-      } else {
-        const arcRidged = Math.max(0, ridgedAt(dir, 9.0, 4) - BR_ARC_RIDGE_THRESH) * BR_ARC_RIDGE_SCALE
-        relief += BR_ARC_HEIGHT * cp2 * _g(d, BR_ARC_POS, BR_ARC_WIDTH) * arcRidged
-      }
+    // CO: Andes / Cascades (continental overriding side)
+    const ridgeFactor = BR_CORD_RIDGE_BASE + BR_CORD_RIDGE * (erosionAt ?? ridgedAt)(dir, 6.0, 4)
+    relief += wCO * (BR_CORD_HEIGHT  * cp2r * _g(d, BR_CORD_POS, BR_CORD_WIDTH) * ridgeFactor * cordScaleFactor
+                    - BR_SHELF_DIP  * cp2r * _g(d, 0.004, BR_SHELF_WIDTH))
 
-    } else {
-      // CC collision — both continental
-      const beltRidged = BR_BELT_RIDGE_BASE + BR_BELT_RIDGE * ridgedAt(dir, 6.0, 5)
-      relief += BR_BELT_HEIGHT * cp2 * _g(d, 0, BR_BELT_WIDTH) * beltRidged * cordScaleFactor
-      if (own.id > other.id) {
-        const plateauMask = (1 - _ss(BR_PLATEAU_INNER, BR_PLATEAU_OUTER, d))
-                          * _ss(BR_PLATEAU_NEAR, BR_PLATEAU_FAR, d)
-        relief += BR_PLATEAU_HEIGHT * cp2 * plateauMask * cordScaleFactor
-      }
-    }
+    // OO: Japan arc — polarity ramps from 0.5 at the boundary to asymmetric beyond 0.015 rad
+    const ooSubduct = 0.5 + ((own.id < other.id ? 1 : 0) - 0.5) * sideRamp
+    const arcRidged = Math.max(0, ridgedAt(dir, 9.0, 4) - BR_ARC_RIDGE_THRESH) * BR_ARC_RIDGE_SCALE
+    relief += wOO * (
+        ooSubduct * (-BR_OO_TRENCH_DEPTH * cp2r * _g(d, 0, BR_OO_TRENCH_WIDTH))
+      + (1 - ooSubduct) * (BR_ARC_HEIGHT * cp2r * _g(d, BR_ARC_POS, BR_ARC_WIDTH) * arcRidged)
+    )
+
+    // CC: Himalaya / Alps collision belt
+    const beltRidged = BR_BELT_RIDGE_BASE + BR_BELT_RIDGE * (erosionAt ?? ridgedAt)(dir, 6.0, 5)
+    relief += wCC * (BR_BELT_HEIGHT * cp2r * _g(d, 0, BR_BELT_WIDTH) * beltRidged * cordScaleFactor)
+    // Tibetan Plateau — polarity ramps from 0.5 at the boundary to asymmetric beyond 0.015 rad
+    const ccPlateauSide = 0.5 + ((own.id > other.id ? 1 : 0) - 0.5) * sideRamp
+    const plateauMask = (1 - _ss(BR_PLATEAU_INNER, BR_PLATEAU_OUTER, d))
+                      * _ss(BR_PLATEAU_NEAR, BR_PLATEAU_FAR, d)
+    relief += wCC * ccPlateauSide * (BR_PLATEAU_HEIGHT * cp2r * plateauMask * cordScaleFactor)
   }
 
-  if (dp > 0) {
-    if (!mineContinental) {
-      // Mid-ocean ridge
-      relief += BR_RIDGE_HEIGHT * dp * _g(d, 0, BR_RIDGE_WIDTH)
-             - BR_NOTCH_DEPTH  * dp * _g(d, 0, BR_NOTCH_WIDTH)
-    } else {
-      // East African Rift
-      relief += BR_RIFT_SHOULDER * dp * _g(d, BR_RIFT_SHOULDER_POS, BR_RIFT_SHOULDER_WIDTH)
-             - BR_GRABEN_DEPTH   * dp * _g(d, 0, BR_GRABEN_WIDTH)
-    }
+  if (dpr > 0) {
+    // Mid-ocean ridge (oceanic side)
+    relief += (1 - wMine) * (BR_RIDGE_HEIGHT * dpr * _g(d, 0, BR_RIDGE_WIDTH)
+                           - BR_NOTCH_DEPTH  * dpr * _g(d, 0, BR_NOTCH_WIDTH))
+    // East African Rift (continental side)
+    relief += wMine * (BR_RIFT_SHOULDER * dpr * _g(d, BR_RIFT_SHOULDER_POS, BR_RIFT_SHOULDER_WIDTH)
+                     - BR_GRABEN_DEPTH  * dpr * _g(d, 0, BR_GRABEN_WIDTH))
   }
 
   if (tw > 0) {
