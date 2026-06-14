@@ -45,6 +45,10 @@ interface PlanetOptions {
   rotationPeriodS?: number
   /** Axial tilt in degrees — climate uses it for the > 54° insolation inversion (default 23.4). */
   axialTiltDeg?: number
+  /** Number of intraplate hotspot (mantle plume) volcanoes (default 6). */
+  hotspotCount?: number
+  /** Global intensity multiplier for hotspots (default 1). */
+  hotspotIntensity?: number
 }
 
 interface Stats {
@@ -56,6 +60,7 @@ interface Stats {
   lastBuildMs: number
   plates: number
   volcanoes: number
+  hotspots: number
   bandCount: number
 }
 
@@ -175,6 +180,8 @@ export class Planet extends Group {
 
   private plateCount: number
   private arcDensity = 1.0
+  private hotspotCount: number
+  private hotspotIntensity = 1
 
   // Climate knobs — stored, applied on the next regenerate() (which rebuilds the Climate).
   private baseTemp: number
@@ -301,6 +308,8 @@ export class Planet extends Group {
     this.maxDepth = opts.maxDepth ?? 10
     this.splitFactor = opts.splitFactor ?? 3.0
     this.plateCount = opts.plateCount ?? 16
+    this.hotspotCount = opts.hotspotCount ?? 6
+    this.hotspotIntensity = opts.hotspotIntensity ?? 1
     this.targetTriPx = opts.targetTriPx ?? 2.5
     this.baseTemp = opts.baseTemp ?? 15
     this.atmosphere = opts.atmosphere ?? 0.6
@@ -537,6 +546,22 @@ export class Planet extends Group {
   }
 
   /**
+   * Set the desired hotspot count for the next regenerate() call.
+   * Clamped to [0, 20]. Applied on the next regenerate(seed).
+   */
+  setHotspotCount(n: number): void {
+    this.hotspotCount = Math.max(0, Math.min(20, Math.round(n)))
+  }
+
+  /**
+   * Set the global hotspot intensity multiplier for the next regenerate() call.
+   * Clamped to [0, 3]. Applied on the next regenerate(seed).
+   */
+  setHotspotIntensity(v: number): void {
+    this.hotspotIntensity = Math.max(0, Math.min(3, v))
+  }
+
+  /**
    * Set the mean surface temperature (°C-ish) for the climate model.
    * Stored; applied on the next regenerate(seed) (which rebuilds the Climate).
    */
@@ -670,6 +695,7 @@ export class Planet extends Group {
       lastBuildMs: this.lastBuildMs,
       plates: this.tectonics.plates.length,
       volcanoes: this.tectonics.volcanoes.length,
+      hotspots: this.tectonics.hotspots.length,
       bandCount: this.deriveBandCount(),
     }
   }
@@ -712,6 +738,13 @@ export class Planet extends Group {
    * this method is a thin caller that assigns the results to Planet fields.
    */
   private buildHeightFn(seed: number): void {
+    const tectonics = new Tectonics({
+      seed,
+      plateCount: this.plateCount,
+      arcDensity: this.arcDensity,
+      hotspotCount: this.hotspotCount,
+      hotspotIntensity: this.hotspotIntensity,
+    })
     const sampler = makeTerrainSampler({
       seed,
       radius: this.radius,
@@ -722,6 +755,7 @@ export class Planet extends Group {
       atmosphere: this.atmosphere,
       bandCount: this.deriveBandCount(),
       axialTiltRad: (this.axialTiltDeg * Math.PI) / 180,
+      tectonics,
     })
     this.tectonics    = sampler.tectonics
     this.climateSim   = sampler.climate

@@ -271,15 +271,18 @@ export class TectonicsDebug extends Group {
     }
 
     // -----------------------------------------------------------------------
-    // 3. VOLCANO MARKERS — instanced octahedra, one per volcano
+    // 3. VOLCANO MARKERS — instanced octahedra, one per arc volcano
     //
     // OctahedronGeometry is orientation-free so no axis-bake needed.
     // Scale = radius * 0.012 (uniform) — large enough to read from orbit.
     // Lift = heightScale * 2.0 above surfaceRadiusAt (which already includes
     // the baked terrain cone height), matching the velocity-arrow hover idiom.
     // Color: 0xff5a1e (hot orange), MeshBasicMaterial (unlit / full-bright).
+    // Only arc volcanoes (kind === 'arc') are shown here; hotspot cones below.
     // -----------------------------------------------------------------------
-    if (tectonics.volcanoes.length > 0) {
+    const arcVolcs = tectonics.volcanoes.filter(v => v.kind === 'arc')
+
+    if (arcVolcs.length > 0) {
       const VOLCANO_SCALE = radius * 0.012
 
       const volcanoGeo = new OctahedronGeometry(1)
@@ -288,25 +291,105 @@ export class TectonicsDebug extends Group {
       const volcanoMat = new MeshBasicMaterial({ color: 0xff5a1e, vertexColors: false })
       this._materials.push(volcanoMat)
 
-      const volcanoMesh = new InstancedMesh(volcanoGeo, volcanoMat, tectonics.volcanoes.length)
+      const volcanoMesh = new InstancedMesh(volcanoGeo, volcanoMat, arcVolcs.length)
       volcanoMesh.count = 0
 
-      const _scaleVec = new Vector3(VOLCANO_SCALE, VOLCANO_SCALE, VOLCANO_SCALE)
+      const _scaleVec = new Vector3()
       const _identityQuat = new Quaternion()
 
-      for (let i = 0; i < tectonics.volcanoes.length; i++) {
-        const v = tectonics.volcanoes[i]
+      for (let i = 0; i < arcVolcs.length; i++) {
+        const v = arcVolcs[i]
         const surfR = surfaceRadiusAt(v.pos)
         _pos.copy(v.pos).multiplyScalar(surfR + heightScale * 2.0)
+        _scaleVec.setScalar(VOLCANO_SCALE)
         _mat4.compose(_pos, _identityQuat, _scaleVec)
         volcanoMesh.setMatrixAt(i, _mat4)
       }
 
-      volcanoMesh.count = tectonics.volcanoes.length
+      volcanoMesh.count = arcVolcs.length
       volcanoMesh.instanceMatrix.needsUpdate = true
 
       this.add(volcanoMesh)
       this._meshes.push(volcanoMesh)
+    }
+
+    // -----------------------------------------------------------------------
+    // 3b. HOTSPOT CONE MARKERS — instanced octahedra, one per hotspot volcano
+    //
+    // Color: 0xff2a6d (bright magenta-red), visually distinct from arc orange.
+    // Size: HOTSPOT_SCALE * (0.7 + 0.5 * clamp(intensity, 0, 3)) per instance,
+    // so intensity=1 → scale*1.2, intensity=3 → scale*2.2 (bigger than arc pins).
+    // -----------------------------------------------------------------------
+    const hotspotVolcs = tectonics.volcanoes.filter(v => v.kind === 'hotspot')
+
+    if (hotspotVolcs.length > 0) {
+      const HOTSPOT_SCALE = radius * 0.012
+
+      const hotspotGeo = new OctahedronGeometry(1)
+      this._geometries.push(hotspotGeo)
+
+      const hotspotMat = new MeshBasicMaterial({ color: 0xff2a6d, vertexColors: false })
+      this._materials.push(hotspotMat)
+
+      const hotspotMesh = new InstancedMesh(hotspotGeo, hotspotMat, hotspotVolcs.length)
+      hotspotMesh.count = 0
+
+      const _hsScaleVec = new Vector3()
+      const _identityQuat2 = new Quaternion()
+
+      for (let i = 0; i < hotspotVolcs.length; i++) {
+        const v = hotspotVolcs[i]
+        const scale = HOTSPOT_SCALE * (0.7 + 0.5 * Math.min(3, v.intensity))
+        const surfR = surfaceRadiusAt(v.pos)
+        _pos.copy(v.pos).multiplyScalar(surfR + heightScale * 2.0)
+        _hsScaleVec.setScalar(scale)
+        _mat4.compose(_pos, _identityQuat2, _hsScaleVec)
+        hotspotMesh.setMatrixAt(i, _mat4)
+      }
+
+      hotspotMesh.count = hotspotVolcs.length
+      hotspotMesh.instanceMatrix.needsUpdate = true
+
+      this.add(hotspotMesh)
+      this._meshes.push(hotspotMesh)
+    }
+
+    // -----------------------------------------------------------------------
+    // 3c. PLUME-SOURCE MARKERS — instanced arrows, one per hotspot plume
+    //
+    // Arrow points radially outward (+Z oriented along hs.pos) from the surface.
+    // Color: 0xff79c6 (bright pink) — distinct from both arc orange and hotspot red.
+    // Length: PLUME_LEN = radius * 0.05 * (0.8 + 0.4 * clamp(intensity, 0, 3))
+    // so a plume arrow is clearly larger than the ~radius*0.012..0.035 cone octahedra.
+    // Arrow shape: chunky pin — shaft 4%, head 11%, head-length 30%.
+    // -----------------------------------------------------------------------
+    if (tectonics.hotspots.length > 0) {
+      const plumeArrowGeo = buildArrowGeometry(0.04, 0.11, 0.30)
+      this._geometries.push(plumeArrowGeo)
+
+      const plumeArrowMat = new MeshBasicMaterial({ color: 0xff79c6, vertexColors: false })
+      this._materials.push(plumeArrowMat)
+
+      const plumeMesh = new InstancedMesh(plumeArrowGeo, plumeArrowMat, tectonics.hotspots.length)
+      plumeMesh.count = 0
+
+      for (let i = 0; i < tectonics.hotspots.length; i++) {
+        const hs = tectonics.hotspots[i]
+        const PLUME_LEN = radius * 0.05 * (0.8 + 0.4 * Math.min(3, hs.intensity))
+        const surfR = surfaceRadiusAt(hs.pos)
+        _pos.copy(hs.pos).multiplyScalar(surfR + heightScale * 2.0)
+        _q.setFromUnitVectors(_zHat, hs.pos.clone().normalize())
+        _mat4.makeRotationFromQuaternion(_q)
+        _mat4.scale(new Vector3(PLUME_LEN, PLUME_LEN, PLUME_LEN))
+        _mat4.setPosition(_pos)
+        plumeMesh.setMatrixAt(i, _mat4)
+      }
+
+      plumeMesh.count = tectonics.hotspots.length
+      plumeMesh.instanceMatrix.needsUpdate = true
+
+      this.add(plumeMesh)
+      this._meshes.push(plumeMesh)
     }
 
     // NOTE: Pole axis has been removed from TectonicsDebug.

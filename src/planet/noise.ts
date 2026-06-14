@@ -175,63 +175,6 @@ export function fbm(
   return value / maxAmp;
 }
 
-/**
- * Erosion-style FBM (Quilez gradient-damping trick).
- * Each octave's amplitude is damped by the accumulated gradient magnitude:
- *   octaveAmp_i = gain^i / (1 + erosion * |gradSum|²)
- * Uses 6 central-difference samples per octave (eps = half-wavelength = 0.5/freq).
- * Output ≈ [−1, 1]: normalized by UN-damped amplitude sum.
- * Deterministic, allocation-free.
- */
-export function erosionFbm(
-  noise: (x: number, y: number, z: number) => number,
-  x: number,
-  y: number,
-  z: number,
-  opts?: FbmOptions & { erosion?: number },
-): number {
-  const octaves    = opts?.octaves    ?? 6
-  const frequency  = opts?.frequency  ?? 1
-  const lacunarity = opts?.lacunarity ?? 2
-  const gain       = opts?.gain       ?? 0.5
-  const erosion    = opts?.erosion    ?? 8
-
-  let value     = 0.0
-  let amplitude = 1.0
-  let freq      = frequency
-  let maxAmp    = 0.0         // un-damped normalizer
-  let gradSumX  = 0.0         // accumulated gradient
-  let gradSumY  = 0.0
-  let gradSumZ  = 0.0
-
-  for (let i = 0; i < octaves; i++) {
-    // eps = half wavelength at this frequency
-    const eps = 0.5 / freq
-
-    // Central-difference gradient (6 extra samples)
-    const gx = (noise((x + eps) * freq, y * freq, z * freq) -
-                noise((x - eps) * freq, y * freq, z * freq)) / (2 * eps)
-    const gy = (noise(x * freq, (y + eps) * freq, z * freq) -
-                noise(x * freq, (y - eps) * freq, z * freq)) / (2 * eps)
-    const gz = (noise(x * freq, y * freq, (z + eps) * freq) -
-                noise(x * freq, y * freq, (z - eps) * freq)) / (2 * eps)
-
-    const gradMag2 = gradSumX * gradSumX + gradSumY * gradSumY + gradSumZ * gradSumZ
-    const damp = amplitude / (1 + erosion * gradMag2)
-
-    value  += damp * noise(x * freq, y * freq, z * freq)
-    maxAmp += amplitude          // un-damped normalizer
-
-    gradSumX += gx
-    gradSumY += gy
-    gradSumZ += gz
-
-    amplitude *= gain
-    freq      *= lacunarity
-  }
-
-  return maxAmp > 0 ? value / maxAmp : 0
-}
 
 /**
  * Ridged multifractal variant.

@@ -226,6 +226,8 @@ async function main(): Promise<void> {
     spinPeriodS: 600,
     plateCount: 16,
     arcDensity: 1,
+    hotspotCount: 6,
+    hotspotIntensity: 1,
     targetTriPx: 2.0,
     maxDepth: 18,
     water: true,
@@ -302,6 +304,14 @@ async function main(): Promise<void> {
   })
   tectonicsFolder.add(ui, 'arcDensity', 0.2, 3, 0.05).name('arc density').onChange((v: number) => {
     planet.setArcDensity(v)
+  })
+  // Hotspots = intraplate mantle-plume volcanoes (chains on moving plates, giant shields on
+  // slow/stagnant ones). Per-hotspot intensity varies; this is a global multiplier. On regenerate.
+  tectonicsFolder.add(ui, 'hotspotCount', 0, 20, 1).name('hotspot count').onChange((n: number) => {
+    planet.setHotspotCount(n)
+  })
+  tectonicsFolder.add(ui, 'hotspotIntensity', 0, 3, 0.05).name('hotspot intensity').onChange((v: number) => {
+    planet.setHotspotIntensity(v)
   })
 
   const motionFolder = gui.addFolder('Motion')
@@ -446,6 +456,7 @@ async function main(): Promise<void> {
         seed: String(seed),
         plates: String(stats.plates),
         volcanoes: String(stats.volcanoes),
+        hotspots: String(stats.hotspots),
         spin: ui.spin ? 'on' : 'off',
         view: ui.view,
         mode: navMode,

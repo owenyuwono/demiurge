@@ -455,13 +455,9 @@ export function computeChunkArrays(p: ChunkParams): ChunkMeshArrays {
   // Scratch objects — reused, no per-vertex allocation
   const dir    = new Vector3();
   const world  = new Vector3();
-  const dirL   = new Vector3();
   const worldL = new Vector3();
-  const dirR   = new Vector3();
   const worldR = new Vector3();
-  const dirD   = new Vector3();
   const worldD = new Vector3();
-  const dirU   = new Vector3();
   const worldU = new Vector3();
   const tan1   = new Vector3();
   const tan2   = new Vector3();
@@ -490,15 +486,21 @@ export function computeChunkArrays(p: ChunkParams): ChunkMeshArrays {
   const originY = _sphereDir.y * rCenter;
   const originZ = _sphereDir.z * rCenter;
 
-  // -- Skirt depth ----------------------------------------------------------
-  // Proportional to the chunk's arc length so skirts scale naturally as the
-  // quadtree deepens (depth 12→16 shrinks chunks ~16×, skirts shrink with them).
-  // A coarser neighbour's quads are ~2× larger, so the seam displacement is at
-  // most one quad-height step; SKIRT_FACTOR × chunkArcLen ≈ 1.6 quad-widths at
-  // res=32, which is enough to close any T-junction gap without wasted fill.
-  const SKIRT_FACTOR = 0.05; // tune here: 0.05 = skirt ≈ 5 % of chunk arc length
-  const chunkArcLen = (Math.PI / 2 * radius) / (1 << level);
-  const skirtDepth = SKIRT_FACTOR * chunkArcLen;
+  // -- Skirt depth (computed after Pass 1, once the chunk's relief is known) --
+  // A skirt only has to hide the LOD CRACK at a T-junction: the vertical gap
+  // between this chunk's edge and a coarser neighbour's edge. That gap is the
+  // height DISCONTINUITY between the two LOD samplings, which is bounded by the
+  // terrain relief across the chunk — NOT by the chunk's width. Sizing the skirt
+  // to arc length (the old bug) gave coarse distant chunks km-deep flanges that
+  // showed up as giant white walls on flat plains. So we size it to the chunk's
+  // own measured relief (maxH−minH over the interior grid) instead.
+  //   skirtDepth = clamp(RELIEF_FACTOR · reliefWorld + FLOOR, FLOOR, CAP)
+  const SKIRT_RELIEF_FACTOR = 1.5;  // cover up to ~1.5× the chunk's own relief
+  const SKIRT_FLOOR = 2.0;          // m — hairline skirt even on dead-flat chunks (fp noise / tiny cracks); invisibly small
+  const SKIRT_CAP = heightScale;    // m — never exceed total terrain relief (~1200 m); rugged chunks are fine-LOD & near anyway, so this rarely binds
+  // Track the chunk's normalized height range over the interior grid (Pass 1).
+  let minH = Infinity;
+  let maxH = -Infinity;
 
   // -- Ghost-edge position helper ---------------------------------------------
   // Computes the ORIGIN-RELATIVE world position of a vertex at grid index
@@ -522,18 +524,23 @@ export function computeChunkArrays(p: ChunkParams): ChunkMeshArrays {
   // -- Interior grid (two-pass) -----------------------------------------------
   //
   // Pass 1: compute every vertex's position (and cache height + sphere dir for Pass 2).
-  //         1 heightFn eval per vertex — same as before.
-  // Pass 2: compute normals.
-  //   - Border ring (gi==0||gi==res||gj==0||gj==res): sphere-tangent central-diff
-  //     (UNCHANGED — this is the seam-free path).
-  //   - Interior (gi in [1,res-1], gj in [1,res-1]): normal from 4 grid-neighbor
-  //     positions (0 extra heightFn evals).
+  //         1 heightFn eval per vertex.
+  // Pass 2: compute normals with ONE method for EVERY vertex —
   //         n = normalize( cross( P[gi+1,gj]-P[gi-1,gj],  P[gi,gj+1]-P[gi,gj-1] ) )
-  //     then flipped outward (dot with radial direction > 0).
+  //         flipped outward (dot with radial direction > 0).
+  //   - Interior neighbours read the cached `positions` (0 extra heightFn evals).
+  //   - Border vertices' off-edge neighbour(s) don't exist in the grid, so we
+  //     synthesise a "ghost" position one grid step beyond the edge via ghostPos
+  //     (1 heightFn eval each): a non-corner border vertex needs 1 ghost, a corner
+  //     needs 2. Because every vertex uses the identical estimator there is no
+  //     border↔interior discontinuity (the old seam ring), and because ghosts come
+  //     from the SAME continuous heightFn the neighbour tile samples for its real
+  //     edge-adjacent vertices, same-level chunk boundaries stay seam-free.
   //
-  // This reduces heightFn evals from ~5/vertex to ~1/vertex for interior verts.
-  // Border verts still pay the 4-eval cost, but they are only 4*(res+1)-4 of
-  // the (res+1)^2 total — at res=32 that is 128 of 1089.
+  // Cost: only border vertices do extra heightFn evals — 1 per non-corner border
+  // vertex + 2 per corner = 4*(res-1)+4*2 = 4*res+4 extra evals per chunk
+  // (res=32 → 132), vs the old all-CD interior alternative's ~4 per interior
+  // vertex (~res² extra). The interior stays free.
 
   // Scratch caches for the grid (allocated once here, not per-vertex).
   const hCache   = new Float32Array(gridVerts);       // height per grid vertex
@@ -556,9 +563,24 @@ export function computeChunkArrays(p: ChunkParams): ChunkMeshArrays {
       dirCache[vi * 3 + 1] = dir.y;
       dirCache[vi * 3 + 2] = dir.z;
 
+      // Track the chunk's relief (normalized height range) for the skirt depth.
+      if (h < minH) minH = h;
+      if (h > maxH) maxH = h;
+
       vi++;
     }
   }
+
+  // -- Skirt depth from measured relief (see rationale above) ----------------
+  // reliefWorld = the chunk's height span in WORLD units. The LOD T-junction gap
+  // against a one-level-coarser neighbour cannot exceed the terrain deviation
+  // across this chunk's edge, which is ≤ reliefWorld; RELIEF_FACTOR=1.5 adds
+  // margin so the (now-small) skirt still fully closes any crack. Flat plains →
+  // reliefWorld≈0 → skirtDepth≈SKIRT_FLOOR (~2 m), buried and invisible: no walls.
+  const reliefWorld = (maxH - minH) * heightScale;
+  let skirtDepth = SKIRT_RELIEF_FACTOR * reliefWorld + SKIRT_FLOOR;
+  if (skirtDepth < SKIRT_FLOOR) skirtDepth = SKIRT_FLOOR;
+  if (skirtDepth > SKIRT_CAP) skirtDepth = SKIRT_CAP;
 
   // --- Pass 2: normals + colors ------------------------------------------------
   vi = 0;
@@ -570,55 +592,44 @@ export function computeChunkArrays(p: ChunkParams): ChunkMeshArrays {
       dir.z = dirCache[vi * 3 + 2];
       const h = hCache[vi];
 
-      const onBorder = gi === 0 || gi === res || gj === 0 || gj === res;
-
-      if (onBorder) {
-        // --- Border: sphere-tangent central differences (UNCHANGED, seam-free) ---
-        if (Math.abs(dir.y) < 0.9) {
-          _tanUp.set(0, 1, 0);
-        } else {
-          _tanUp.set(1, 0, 0);
-        }
-        _tan1.crossVectors(dir, _tanUp).normalize(); // tangent 1 ⊥ dir
-        _tan2.crossVectors(dir, _tan1);              // tangent 2 ⊥ dir ⊥ _tan1 (already unit)
-
-        // Sample displaced surface at ±arcStep along each tangent direction.
-        evalSphereOffset(dir, _tan1, -arcStep, hFn, dirL, worldL);
-        evalSphereOffset(dir, _tan1,  arcStep, hFn, dirR, worldR);
-        evalSphereOffset(dir, _tan2, -arcStep, hFn, dirD, worldD);
-        evalSphereOffset(dir, _tan2,  arcStep, hFn, dirU, worldU);
-
-        // Tangent vectors of the displaced surface
-        tan1.subVectors(worldR, worldL); // ∂pos/∂_tan1 (unnormalized)
-        tan2.subVectors(worldU, worldD); // ∂pos/∂_tan2
-
-        nrm.crossVectors(tan1, tan2).normalize();
-
-        // Ensure outward-facing normal (should agree with sphere dir)
-        if (nrm.dot(dir) < 0) nrm.negate();
-      } else {
-        // --- Interior: cross product from 4 grid-neighbor positions ---------------
-        // Neighbor vertex indices in the flat grid array
+      // --- Unified normal: cross product of 4 grid-neighbour positions ---------
+      // Fetch each neighbour's ORIGIN-RELATIVE world position. In-bounds neighbours
+      // read the cached `positions`; off-edge neighbours (border vertices only) are
+      // synthesised as ghosts from the same continuous heightFn. The (gi,gj) grid
+      // axes map to (column,row): +gi → +1 in the flat array, +gj → +gridSize.
+      if (gi > 0) {
         const idxL = vi - 1;               // (gi-1, gj)
-        const idxR = vi + 1;               // (gi+1, gj)
-        const idxD = vi - gridSize;        // (gi,   gj-1)
-        const idxU = vi + gridSize;        // (gi,   gj+1)
-
-        // Read neighbor positions (origin-relative — offsets cancel in the cross product)
         worldL.set(positions[idxL * 3], positions[idxL * 3 + 1], positions[idxL * 3 + 2]);
-        worldR.set(positions[idxR * 3], positions[idxR * 3 + 1], positions[idxR * 3 + 2]);
-        worldD.set(positions[idxD * 3], positions[idxD * 3 + 1], positions[idxD * 3 + 2]);
-        worldU.set(positions[idxU * 3], positions[idxU * 3 + 1], positions[idxU * 3 + 2]);
-
-        // Central-difference tangent vectors
-        tan1.subVectors(worldR, worldL); // ∂pos/∂gi direction
-        tan2.subVectors(worldU, worldD); // ∂pos/∂gj direction
-
-        nrm.crossVectors(tan1, tan2).normalize();
-
-        // Ensure outward-facing (dot with radial direction of this vertex > 0)
-        if (nrm.dot(dir) < 0) nrm.negate();
+      } else {
+        ghostPos(gi - 1, gj, worldL);      // ghost at gi=-1
       }
+      if (gi < res) {
+        const idxR = vi + 1;               // (gi+1, gj)
+        worldR.set(positions[idxR * 3], positions[idxR * 3 + 1], positions[idxR * 3 + 2]);
+      } else {
+        ghostPos(gi + 1, gj, worldR);      // ghost at gi=res+1
+      }
+      if (gj > 0) {
+        const idxD = vi - gridSize;        // (gi, gj-1)
+        worldD.set(positions[idxD * 3], positions[idxD * 3 + 1], positions[idxD * 3 + 2]);
+      } else {
+        ghostPos(gi, gj - 1, worldD);      // ghost at gj=-1
+      }
+      if (gj < res) {
+        const idxU = vi + gridSize;        // (gi, gj+1)
+        worldU.set(positions[idxU * 3], positions[idxU * 3 + 1], positions[idxU * 3 + 2]);
+      } else {
+        ghostPos(gi, gj + 1, worldU);      // ghost at gj=res+1
+      }
+
+      // Central-difference tangent vectors (origin offsets cancel in the subtraction)
+      tan1.subVectors(worldR, worldL); // ∂pos/∂gi direction
+      tan2.subVectors(worldU, worldD); // ∂pos/∂gj direction
+
+      nrm.crossVectors(tan1, tan2).normalize();
+
+      // Ensure outward-facing (dot with radial direction of this vertex > 0)
+      if (nrm.dot(dir) < 0) nrm.negate();
 
       normals[vi * 3    ] = nrm.x;
       normals[vi * 3 + 1] = nrm.y;

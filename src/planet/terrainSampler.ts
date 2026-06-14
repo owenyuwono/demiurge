@@ -12,7 +12,7 @@
  */
 
 import { Vector3 } from 'three'
-import { createNoise3D, ridged, fbm, erosionFbm } from './noise'
+import { createNoise3D, ridged, fbm } from './noise'
 import { Tectonics, TectonicQuery, boundaryRelief } from './tectonics'
 import { Climate, ClimateSample } from './climate'
 
@@ -186,13 +186,6 @@ export function makeTerrainSampler(opts: TerrainSamplerOpts): TerrainSampler {
   const ridgedFn = (d: Vector3, freq: number, octaves: number): number =>
     ridged(noise, d.x * freq, d.y * freq, d.z * freq, { octaves })
 
-  // erosionFbmFn wraps erosionFbm for belt/cordillera texture terms in boundaryRelief
-  // erosionFbm outputs ≈[-1,1]; map to [0,1] like ridged does
-  const erosionFbmFn = (d: Vector3, freq: number, octaves: number): number => {
-    const ev = erosionFbm(noise, d.x * freq, d.y * freq, d.z * freq, { octaves, erosion: 8 })
-    return ev * 0.5 + 0.5
-  }
-
   // ---------------------------------------------------------------------------
   // Level-adaptive detail octave count:
   //
@@ -312,16 +305,7 @@ export function makeTerrainSampler(opts: TerrainSamplerOpts): TerrainSampler {
     const base = combinedLand + (oceanBase - combinedLand) * (1 - _ss3(-shelfW, TECT_COAST_LERP_HI, c))
 
     // --- Boundary relief profile (asymmetric, all regimes) ---
-    const relief = boundaryRelief(scratch, plates, dir, ridgedFn, erosionFbmFn)
-
-    // --- Hill dissection (replaces elevation-keyed hillAmp; tectonically gated) ---
-    // FIXED octave count (HILL_OCT=5, level-independent) → trivially LOD-invariant.
-    // erosionFbm gives dendritic ridge-and-valley texture; rugged≈0 in cratons → ≈no hills.
-    // Plateau tops are damped (flat-topped highlands; PLATEAU_HILL_DAMP fraction).
-    const hillNoise = erosionFbm(noise,
-      x * HILL_FREQ, y * HILL_FREQ, z * HILL_FREQ,
-      { octaves: HILL_OCT, erosion: 8 })  // ≈[-1,1] dendritic
-    const hills = HILL_AMP * (HILL_FLOOR + (1 - HILL_FLOOR) * rugged) * landGate * (1 - PLATEAU_HILL_DAMP * plateauFrac) * hillNoise
+    const relief = boundaryRelief(scratch, plates, dir, ridgedFn)
 
     // LOD-adaptive octave counts (clamped to [base, max])
     const fbmOctaves    = Math.min(Math.max(level + 2, FBM_BASE_OCTAVES),    14)
@@ -379,7 +363,7 @@ export function makeTerrainSampler(opts: TerrainSamplerOpts): TerrainSampler {
     // clamp (~0.88–0.97) so the crater stays visible and no crease forms.
     // broadUplift+plateau already inside base via combinedLand+shelf blend;
     // hills+detail added on top of the tectonic base.
-    const terrainH = base + relief + hills + detail + islandH + undulation  // pre-clamp terrain
+    const terrainH = base + relief + detail + islandH + undulation  // pre-clamp terrain
     const volcano  = Math.min(TECT_VOLC_SUM_MAX, tectonics.volcanoElevation(dir))
     const headroom = 1 - _ss3(TECT_VOLC_HEADROOM_LO, TECT_VOLC_HEADROOM_HI, terrainH)
     return Math.max(-1, Math.min(1, terrainH + volcano * headroom))

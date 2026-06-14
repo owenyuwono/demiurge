@@ -206,15 +206,11 @@ export function neighborTexel(
 }
 
 // ---------------------------------------------------------------------------
-// sampleSmooth — 4-sample average for smooth cross-face scalar sampling
+// sampleSmooth — true bilinear interpolation for smooth cross-face sampling
 // ---------------------------------------------------------------------------
 
-// Scratch state for sampleSmooth — module-level, no allocations in hot path
-const _ssDir0 = new Vector3()
-const _ssDir1 = new Vector3()
-const _ssDir2 = new Vector3()
-const _ssDir3 = new Vector3()
-const _ssTex:  { face: number; x: number; y: number } = { face: 0, x: 0, y: 0 }
+// Scratch state for sampleSmooth — module-level, no allocations in hot path.
+// Single-threaded use only (never nested / re-entrant), same as neighborTexel.
 const _ssTex0: { face: number; x: number; y: number } = { face: 0, x: 0, y: 0 }
 const _ssTex1: { face: number; x: number; y: number } = { face: 0, x: 0, y: 0 }
 const _ssTex2: { face: number; x: number; y: number } = { face: 0, x: 0, y: 0 }
@@ -223,13 +219,28 @@ const _ssTex3: { face: number; x: number; y: number } = { face: 0, x: 0, y: 0 }
 /**
  * Sample a per-texel Float32Array smoothly at direction `dir`.
  *
- * Method: offset dir by ±half-texel-angle along the local face's U and V
- * tangent axes (4 directions: +U, −U, +V, −V), fetch nearest texel for each,
- * then average. Cross-face safe — each nudge re-projects independently via
- * dirToTexel. Approximates bilinear at face seams without a table.
+ * Method: TRUE BILINEAR interpolation. Project `dir` to continuous cube-face
+ * coordinates (face + floating texel coords, where integer values are texel
+ * centres — matching texelToDir's `(x+0.5)` convention). Find the 2×2 cell of
+ * texels the point falls in plus the fractional weights (fu, fv), then bilinearly
+ * blend the 4 values:  lerp(lerp(t00,t10,fu), lerp(t01,t11,fu), fv).
  *
- * `scratch` is a caller-supplied Vector3 used as temporary storage.
- * All other state is preallocated at module level (zero allocations in hot path).
+ * Unlike the previous 4-tap box average (which was piecewise-constant within a
+ * texel and jumped at texel boundaries — producing visible ~300m blocky cells
+ * at coastlines), this varies continuously across the whole field.
+ *
+ * Interior fast path: all 4 texels in-bounds on the same face → direct fetch.
+ * Edge path: any of the 4 texels crosses a face boundary → fetch via
+ *   neighborTexel (the dir-roundtrip cross-face helper) so seams stay correct.
+ * Corner approximation: at the 8 cube corners only 3 distinct texels meet; the
+ *   diagonal neighbor there resolves (via neighborTexel) to one of the 3 real
+ *   texels, so the corner texel value is effectively reused — an accepted, tiny
+ *   approximation confined to the 8 corner cells.
+ *
+ * `scratch` is a caller-supplied Vector3 (unused now — kept for signature
+ * compatibility; callers pass a non-aliased temporary). All state is either the
+ * scratch or preallocated at module level — ZERO allocations in the hot path.
+ * Pure & deterministic: same (data, dir, res) → same result.
  */
 export function sampleSmooth(
   data: Float32Array,
@@ -237,37 +248,84 @@ export function sampleSmooth(
   res: number,
   scratch: Vector3,
 ): number {
-  // Find the face this direction projects to, for its tangent basis
-  dirToTexel(dir, res, _ssTex)
-  const b = FACE_BASES[_ssTex.face]
+  // --- Project dir onto the dominant cube face, capturing CONTINUOUS coords ---
+  const dx = dir.x, dy = dir.y, dz = dir.z
+  const ax = Math.abs(dx)
+  const ay = Math.abs(dy)
+  const az = Math.abs(dz)
 
-  const half = texAng(res) * 0.5
+  let face: number
+  let sc: number  // signed U-axis coord on this face
+  let tc: number  // signed V-axis coord on this face
+  let mc: number  // magnitude of dominant axis
 
-  // +U nudge
-  scratch.set(b.ux, b.uy, b.uz).multiplyScalar(half)
-  _ssDir0.copy(dir).add(scratch).normalize()
+  if (ax >= ay && ax >= az) {
+    if (dx > 0) { face = 0; mc = ax; sc =  dz; tc = dy }
+    else        { face = 1; mc = ax; sc = -dz; tc = dy }
+  } else if (ay >= ax && ay >= az) {
+    if (dy > 0) { face = 2; mc = ay; sc = dx; tc =  dz }
+    else        { face = 3; mc = ay; sc = dx; tc = -dz }
+  } else {
+    if (dz > 0) { face = 4; mc = az; sc = -dx; tc = dy }
+    else        { face = 5; mc = az; sc =  dx; tc = dy }
+  }
 
-  // −U nudge
-  scratch.set(b.ux, b.uy, b.uz).multiplyScalar(-half)
-  _ssDir1.copy(dir).add(scratch).normalize()
+  // Continuous texel coords: integer value == texel centre (matches texelToDir,
+  // which places centres at (i + 0.5)). dirToTexel uses floor((sc/mc+1)*half);
+  // a texel centre i sits at (sc/mc+1)*half = i + 0.5, so subtract 0.5 here.
+  const half = res * 0.5
+  const fx = (sc / mc + 1.0) * half - 0.5
+  const fy = (tc / mc + 1.0) * half - 0.5
 
-  // +V nudge
-  scratch.set(b.vx, b.vy, b.vz).multiplyScalar(half)
-  _ssDir2.copy(dir).add(scratch).normalize()
+  // Cell the point falls in: integer corner (x0,y0) and fractional weights.
+  const x0 = Math.floor(fx)
+  const y0 = Math.floor(fy)
+  const fu = fx - x0
+  const fv = fy - y0
+  const x1 = x0 + 1
+  const y1 = y0 + 1
 
-  // −V nudge
-  scratch.set(b.vx, b.vy, b.vz).multiplyScalar(-half)
-  _ssDir3.copy(dir).add(scratch).normalize()
+  let t00: number, t10: number, t01: number, t11: number
 
-  dirToTexel(_ssDir0, res, _ssTex0)
-  dirToTexel(_ssDir1, res, _ssTex1)
-  dirToTexel(_ssDir2, res, _ssTex2)
-  dirToTexel(_ssDir3, res, _ssTex3)
+  // --- Interior fast path: whole 2×2 cell on this face, in-bounds ---
+  if (x0 >= 0 && y0 >= 0 && x1 < res && y1 < res) {
+    const base = face * res * res
+    const row0 = base + y0 * res
+    const row1 = base + y1 * res
+    t00 = data[row0 + x0]
+    t10 = data[row0 + x1]
+    t01 = data[row1 + x0]
+    t11 = data[row1 + x1]
+  } else {
+    // --- Edge path: one or more neighbors cross a face boundary ---
+    // Anchor texel = nearest in-bounds texel of the 2×2 cell (clamped). All four
+    // corners are reached as integer (dx,dy) offsets from this anchor and routed
+    // through neighborTexel, which returns the correct cross-face texel (and is
+    // identity for in-bounds offsets).
+    const axx = x0 < 0 ? 0 : (x0 >= res ? res - 1 : x0)
+    const ayy = y0 < 0 ? 0 : (y0 >= res ? res - 1 : y0)
+    // Offsets of each cell corner relative to the anchor (each in {-1,0,1}).
+    const ox0 = (x0 - axx) as -1 | 0 | 1
+    const ox1 = (x1 - axx) as -1 | 0 | 1
+    const oy0 = (y0 - ayy) as -1 | 0 | 1
+    const oy1 = (y1 - ayy) as -1 | 0 | 1
 
-  return 0.25 * (
-    data[texelIndex(_ssTex0.face, _ssTex0.x, _ssTex0.y, res)] +
-    data[texelIndex(_ssTex1.face, _ssTex1.x, _ssTex1.y, res)] +
-    data[texelIndex(_ssTex2.face, _ssTex2.x, _ssTex2.y, res)] +
-    data[texelIndex(_ssTex3.face, _ssTex3.x, _ssTex3.y, res)]
-  )
+    neighborTexel(face, axx, ayy, ox0, oy0, res, _ssTex0)
+    neighborTexel(face, axx, ayy, ox1, oy0, res, _ssTex1)
+    neighborTexel(face, axx, ayy, ox0, oy1, res, _ssTex2)
+    neighborTexel(face, axx, ayy, ox1, oy1, res, _ssTex3)
+
+    t00 = data[texelIndex(_ssTex0.face, _ssTex0.x, _ssTex0.y, res)]
+    t10 = data[texelIndex(_ssTex1.face, _ssTex1.x, _ssTex1.y, res)]
+    t01 = data[texelIndex(_ssTex2.face, _ssTex2.x, _ssTex2.y, res)]
+    t11 = data[texelIndex(_ssTex3.face, _ssTex3.x, _ssTex3.y, res)]
+  }
+
+  // touch scratch to keep TS happy about the (now-unused) param without a
+  // separate eslint pragma; this is a no-op write the optimizer can drop.
+  void scratch
+
+  const a = t00 + (t10 - t00) * fu
+  const c = t01 + (t11 - t01) * fu
+  return a + (c - a) * fv
 }

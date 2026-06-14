@@ -98,6 +98,14 @@ export interface Volcano {
   baseRadius: number        // angular radius in radians
   height: number            // normalized, added to terrain
   craterRadiusFrac: number  // fraction of baseRadius for caldera
+  kind: 'arc' | 'hotspot'  // NEW — arc = subduction front, hotspot = mantle plume
+  intensity: number         // NEW — [0,1] relative intensity
+}
+
+export interface Hotspot {
+  pos: Vector3
+  intensity: number
+  isChain: boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -132,6 +140,23 @@ const ARC_SPACING       = 0.045   // rad — true min spacing (dart-throwing); e
 const ARC_MAX           = 2000    // safety cap on total volcanoes
 const ARC_SIZE_SPAN     = 0.25    // convergence span above threshold for convStrength ramp
 
+// --- hotspot volcano constants ---
+const HOTSPOT_V_MOVING   = 0.15          // |ω×pos| above this → plate is moving → chain
+const HOTSPOT_CHAIN_STEP = 0.035         // rad between chain cones
+const HOTSPOT_POLAR_COS  = Math.cos((8 * Math.PI) / 180)  // reject within 8° of poles
+const HOTSPOT_BASE_R     = 0.06          // baseline angular radius (comparable to arc baseline)
+const HOTSPOT_BASE_H     = 0.6           // baseline height (tall enough to breach sea level)
+
+// --- volcano roughening (break the perfect-cone look; fixed-frequency, LOD-invariant) ---
+// These perturb the analytic cone with 3D noise to produce irregular flanks,
+// non-circular base footprints, and erosion-style gullies (barrancos).
+// All frequencies chosen so that adjacent terrain samples (~30-120m apart on a 50km-radius
+// planet, i.e. angular delta ~0.0006-0.0024 rad) see smooth noise variation.
+const VOLC_BASE_WARP        = 0.32   // ± fractional wobble of the cone footprint radius
+const VOLC_BASE_WARP_FREQ   = 14.0   // spatial freq of the base-radius warp noise (on unit sphere)
+const VOLC_FLANK_ROUGH      = 0.22   // flank height roughness amplitude (fraction of local cone height)
+const VOLC_FLANK_FREQ       = 26.0   // spatial freq of flank roughness fbm (on unit sphere)
+
 // ---------------------------------------------------------------------------
 // Walker mechanics — Step 1
 // ---------------------------------------------------------------------------
@@ -155,6 +180,9 @@ const MAX_STEPS_HARD = 1200    // hard step cap per walker
 // 12   = paleo crack walker seeds (NEW)
 // 13   = fine warp noise sub-seed (NEW)
 // 15   = non-tectonic continental mask noise (NEW)
+// 16   = hotspot position RNG (NEW)
+// 17   = hotspot intensity RNG (NEW)
+// 18   = volcano roughening noise (NEW)
 
 // ---------------------------------------------------------------------------
 // Non-tectonic continental mask constants (tuned to hit land-fraction gate)
@@ -1205,6 +1233,13 @@ function blurField(src: Float32Array): Float32Array {
   return dst
 }
 
+/** Apply blurField n times. Used to smooth the Dijkstra crust SDF's TEX_ANG staircase. */
+function blurFieldN(src: Float32Array, n: number): Float32Array {
+  let r = src
+  for (let i = 0; i < n; i++) r = blurField(r)
+  return r
+}
+
 // ---------------------------------------------------------------------------
 // bakeConvShear — pre-bake per-texel convergence and shear
 // ---------------------------------------------------------------------------
@@ -1340,6 +1375,8 @@ export interface TectonicsBaked {
   res: number
   seed: number
   arcDensity: number
+  hotspotCount: number
+  hotspotIntensity: number
   plates: PlateWire[]
   compId: Uint16Array
   distField: Float32Array
@@ -1352,9 +1389,14 @@ export interface TectonicsBaked {
   volBaseRadius: Float32Array
   volHeight: Float32Array
   volCraterFrac: Float32Array
+  volKind: Uint8Array          // 0=arc, 1=hotspot per volcano
+  volIntensity: Float32Array   // intensity per volcano
   volBucketRes: number
   volBucketStart: Int32Array
   volBucketIdx: Int32Array
+  hotspotPos: Float32Array     // 3 per hotspot, xyz interleaved
+  hotspotIntensityArr: Float32Array
+  hotspotIsChain: Uint8Array
 }
 
 // ---------------------------------------------------------------------------
@@ -1367,6 +1409,8 @@ export class Tectonics {
   // Seed and arcDensity stored for toBaked() / fromBaked() round-trip
   private readonly _seed: number
   private readonly _arcDensity: number
+  private readonly _hotspotCount: number
+  private readonly _hotspotIntensity: number
 
   // Cube-map tables (read-only after construction)
   private readonly _compId:     Uint16Array   // per-texel plate id (0-based)
@@ -1381,6 +1425,8 @@ export class Tectonics {
   private readonly _warpNoise: (x: number, y: number, z: number) => number
   // Fine-warp noise for coastline complexity (stream 13)
   private readonly _fineWarpNoise: (x: number, y: number, z: number) => number
+  // Volcano roughening noise (stream 18) — irregular base + flank + gullies
+  private readonly _volNoise: (x: number, y: number, z: number) => number
 
   // Preallocated scratch — zero allocations in query() / velocityAt()
   private readonly _warpedDir  = new Vector3()
@@ -1406,6 +1452,7 @@ export class Tectonics {
 
   // Volcano bake products — populated last in constructor
   private _volcanoes: Volcano[] = []
+  private _hotspots:  Hotspot[] = []
   // Typed flat arrays for zero-alloc hot path (volcanoElevation)
   private _volPos:        Float32Array = new Float32Array(0)  // 3*nVol, xyz interleaved
   private _volBaseRadius: Float32Array = new Float32Array(0)
@@ -1430,12 +1477,17 @@ export class Tectonics {
   /** Public accessor: the baked volcanic arc candidates. */
   get volcanoes(): readonly Volcano[] { return this._volcanoes }
 
-  constructor(opts: { seed: number; plateCount?: number; arcDensity?: number }) {
-    const { seed, plateCount = 16, arcDensity: arcDensityRaw = 1.0 } = opts
+  /** Public accessor: the baked mantle-plume hotspot sources. */
+  get hotspots(): readonly Hotspot[] { return this._hotspots }
+
+  constructor(opts: { seed: number; plateCount?: number; arcDensity?: number; hotspotCount?: number; hotspotIntensity?: number }) {
+    const { seed, plateCount = 16, arcDensity: arcDensityRaw = 1.0, hotspotCount: hotspotCountRaw = 6, hotspotIntensity: hotspotIntensityRaw = 1 } = opts
     const arcDensity = Math.max(0.2, Math.min(3, arcDensityRaw))
     // Store seed and clamped arcDensity for toBaked() / fromBaked() round-trip
-    this._seed       = seed
-    this._arcDensity = arcDensity
+    this._seed             = seed
+    this._arcDensity       = arcDensity
+    this._hotspotCount     = Math.max(0, Math.min(20, Math.round(hotspotCountRaw)))
+    this._hotspotIntensity = Math.max(0, Math.min(3, hotspotIntensityRaw))
     // Clamp plateCount to [0, 48]; values ≤ 1 trigger the non-tectonic branch
     const plateCountClamped = Math.max(0, Math.min(48, plateCount))
     const target = plateCountClamped  // EXACT target plate count (for tectonic path)
@@ -1453,8 +1505,12 @@ export class Tectonics {
     //  12 = paleo crack walker seeds
     //  13 = fine warp noise
     //  15 = non-tectonic continental mask noise (NEW)
+    //  16 = hotspot position RNG (NEW)
+    //  17 = hotspot intensity RNG (NEW)
+    //  18 = volcano roughening noise (NEW)
     this._warpNoise = createNoise3D(deriveSeed(seed, 5))
     this._fineWarpNoise = createNoise3D(deriveSeed(seed, 13))
+    this._volNoise = createNoise3D(deriveSeed(seed, 18))
 
     // Non-tectonic branch: single plate, noise-driven crust SDF, no boundaries
     if (plateCountClamped <= 1) {
@@ -1468,7 +1524,7 @@ export class Tectonics {
       this._crustDist   = nt.crustDist
       this._paleoDist   = nt.paleoDist
       const _t0 = performance.now()
-      this._bakeVolcanoes(seed, arcDensity)
+      this._bakeVolcanoes(seed, arcDensity, this._hotspotCount, this._hotspotIntensity)
       this._volcanoBakeMs = performance.now() - _t0
       return
     }
@@ -1918,7 +1974,9 @@ export class Tectonics {
       }
     }
 
-    this._crustDist = blurField(blurField(blurField(crustDist)))
+    // Light blur removes the Dijkstra 8-connected diagonal artifacts. (The texel staircase
+    // that caused blocky coastlines is fixed by BILINEAR sampling at query time, not blur.)
+    this._crustDist = blurFieldN(crustDist, 3)
 
     // -------------------------------------------------------------------------
     // Step 6c — Paleo-orogen network (fossil plate boundaries)
@@ -2046,7 +2104,7 @@ export class Tectonics {
     // Step 8 — Bake arc volcanoes (LAST — reads _convField/_crustDist/_distField)
     // -------------------------------------------------------------------------
     const _t0 = performance.now();
-    this._bakeVolcanoes(seed, arcDensity);
+    this._bakeVolcanoes(seed, arcDensity, this._hotspotCount, this._hotspotIntensity);
     this._volcanoBakeMs = performance.now() - _t0;
   }
 
@@ -2157,7 +2215,8 @@ export class Tectonics {
       }
     }
 
-    const crustDist = blurField(blurField(blurField(crustDistRaw)))
+    // Light blur removes Dijkstra diagonal artifacts (staircase fixed by bilinear sampling).
+    const crustDist = blurFieldN(crustDistRaw, 3)
 
     // ---- 3. Single plate ----
     const plates: Plate[] = [{
@@ -2240,7 +2299,9 @@ export class Tectonics {
   // _bakeVolcanoes — one-time bake of subduction-arc volcano positions
   // ---------------------------------------------------------------------------
 
-  private _bakeVolcanoes(seed: number, arcDensity: number): void {
+  private _bakeVolcanoes(seed: number, arcDensity: number, hotspotCount: number, hotspotIntensity: number): void {
+    // Reset hotspots at top so early-exit paths always leave a clean state.
+    this._hotspots = []
     const ARC_CONV_THRESH_EFF = ARC_CONV_THRESH / arcDensity
     const ARC_SPACING_EFF     = ARC_SPACING / arcDensity
 
@@ -2326,9 +2387,15 @@ export class Tectonics {
       }
     }
 
-    if (candidates.length === 0) return
+    // Combined output arrays (arc volcanoes first, hotspot cones appended after)
+    const volcanoes: Volcano[] = []
+    const volPos:        number[] = []
+    const volBaseRadius: number[] = []
+    const volHeight:     number[] = []
+    const volCraterFrac: number[] = []
 
     // ---- b. DART-THROWING with min-distance + render-consistent validation ----
+    // Only runs when there are arc candidates; falls through to hotspot generation regardless.
     //
     // Two correctness requirements drive this pass:
     //   1. SPACING — enforce a TRUE min-distance (ARC_SPACING_EFF) between accepted
@@ -2349,6 +2416,7 @@ export class Tectonics {
     // stamped — so we only ever read one cell. Stamping uses the cube-map grid, so
     // it is correct across face seams (cells are addressed by (face,x,y)).
 
+    if (candidates.length > 0) {
     // Sort ALL candidates deterministically: highest convergence first, hash tie-break.
     candidates.sort((a, b) => {
       if (b.conv !== a.conv) return b.conv - a.conv
@@ -2368,12 +2436,6 @@ export class Tectonics {
 
     // query scratch for final-position re-validation (separate from q used elsewhere? q is free here)
     const vq = q
-
-    const volcanoes: Volcano[] = []
-    const volPos:        number[] = []
-    const volBaseRadius: number[] = []
-    const volHeight:     number[] = []
-    const volCraterFrac: number[] = []
 
     for (const cand of candidates) {
       if (volcanoes.length >= ARC_MAX) break
@@ -2453,7 +2515,7 @@ export class Tectonics {
       const craterRadiusFrac = 0.12 + cfJitter
 
       const pos = new Vector3(posX, posY, posZ)
-      volcanoes.push({ pos, baseRadius, height, craterRadiusFrac })
+      volcanoes.push({ pos, baseRadius, height, craterRadiusFrac, kind: 'arc', intensity: 1 })
       volPos.push(posX, posY, posZ)
       volBaseRadius.push(baseRadius)
       volHeight.push(height)
@@ -2478,7 +2540,25 @@ export class Tectonics {
       }
     }
 
-    if (volcanoes.length === 0) return
+    } // end if (candidates.length > 0)
+
+    // ---- c. HOTSPOT GENERATION ----
+    // Generate mantle-plume hotspot cones and append them to the same arrays.
+    // Done AFTER arc collection so arc count is stable, BEFORE flat-array build.
+    this._generateHotspots(seed, hotspotCount, hotspotIntensity, volcanoes, volPos, volBaseRadius, volHeight, volCraterFrac)
+
+    // If both arc and hotspot counts are zero, leave flat arrays empty and return.
+    if (volcanoes.length === 0) {
+      this._volcanoes     = []
+      this._volPos        = new Float32Array(0)
+      this._volBaseRadius = new Float32Array(0)
+      this._volHeight     = new Float32Array(0)
+      this._volCraterFrac = new Float32Array(0)
+      this._volBucketRes  = 0
+      this._volBucketStart = new Int32Array(0)
+      this._volBucketIdx   = new Int32Array(0)
+      return
+    }
 
     const nVol = volcanoes.length
     this._volcanoes = volcanoes
@@ -2491,10 +2571,11 @@ export class Tectonics {
 
     // ---- d. BUILD SPATIAL INDEX ----
     // Bucket res such that cell angular size ≳ max baseRadius.
-    // max baseRadius ≈ 0.045 * 1.15 ≈ 0.052 rad
+    // max baseRadius ≈ 0.045 * 1.15 ≈ 0.052 rad for arcs; hotspot shields up to ~0.11 rad.
     // texAng(bucketRes) = (π/2)/bucketRes ≈ cell half-size → want cell diagonal ≳ maxBaseR
-    // cell angular size = (π/2)/bucketRes; want ≈ 0.05 → bucketRes = (π/2)/0.05 ≈ 31
-    // Use 24 which gives cellSize ≈ 0.065 rad ≥ maxBaseRadius
+    // cell angular size = (π/2)/bucketRes; want ≈ 0.065 rad → bucketRes=24.
+    // The per-volcano searchRadius scales with reach=baseRadius+cellDiag, so larger hotspot
+    // shields simply stamp more cells — no change to the bucket res needed.
     const bucketRes = 24
     this._volBucketRes = bucketRes
 
@@ -2573,6 +2654,113 @@ export class Tectonics {
   }
 
   // ---------------------------------------------------------------------------
+  // _generateHotspots — mantle-plume hotspot cone generation
+  // Appends hotspot cones to the shared volcanoes / volPos / ... arrays,
+  // and populates this._hotspots with plume-source records.
+  // ---------------------------------------------------------------------------
+
+  private _generateHotspots(
+    seed: number,
+    hotspotCount: number,
+    hotspotIntensity: number,
+    volcanoes: Volcano[],
+    volPos: number[],
+    volBaseRadius: number[],
+    volHeight: number[],
+    volCraterFrac: number[],
+  ): void {
+    if (hotspotCount === 0) return
+
+    // Seeded RNG streams — created ONCE before the per-hotspot loop (determinism).
+    const posRng = makeRng(deriveSeed(seed, 16))
+    const intRng = makeRng(deriveSeed(seed, 17))
+
+    // Scratch vector for velocityAt (avoids allocation inside the loop)
+    const velScratch = new Vector3()
+    const posScratch = new Vector3()
+
+    for (let h = 0; h < hotspotCount; h++) {
+      // --- 1. Position: seeded random unit vector, boundary-independent ---
+      let hx = 0, hy = 0, hz = 0
+      for (let attempt = 0; attempt < 50; attempt++) {
+        const rx = posRng() * 2 - 1
+        const ry = posRng() * 2 - 1
+        const rz = posRng() * 2 - 1
+        const len = Math.sqrt(rx * rx + ry * ry + rz * rz)
+        if (len > 0.01 && len < 1.0) {
+          const nx = rx / len, ny = ry / len, nz = rz / len
+          // Reject within 8° of poles (bounded — fall back after 50 attempts)
+          if (Math.abs(ny) > HOTSPOT_POLAR_COS) continue
+          hx = nx; hy = ny; hz = nz
+          break
+        }
+      }
+      // If rejection sampling exhausted, hx/hy/hz remain 0 → skip this hotspot
+      if (hx === 0 && hy === 0 && hz === 0) continue
+
+      // --- 2. Intensity ---
+      const u = intRng()
+      const intensity = Math.max(0, Math.min(1, (0.45 + 0.55 * u * u) * hotspotIntensity))
+
+      // --- 3. Plate velocity at hotspot position ---
+      posScratch.set(hx, hy, hz)
+      this.velocityAt(posScratch, velScratch)
+      const speed = velScratch.length()
+
+      // --- 4. Chain vs Shield branch ---
+      if (speed > HOTSPOT_V_MOVING) {
+        // CHAIN — Hawaii-style: multiple cones trailing in the plate-motion direction
+        const vHatX = velScratch.x / speed
+        const vHatY = velScratch.y / speed
+        const vHatZ = velScratch.z / speed
+
+        const N = Math.max(2, Math.min(9, Math.round(2 + 4 * intensity)))
+
+        for (let i = 0; i < N; i++) {
+          const age = i / Math.max(1, N - 1)          // 0=newest, 1=oldest
+          const ageScale = 1 - 0.7 * age
+
+          // Step along +vHat: normalize(pos + vHat * step) — small-angle approximation
+          const stepDist = i * HOTSPOT_CHAIN_STEP
+          const cx = hx + vHatX * stepDist
+          const cy = hy + vHatY * stepDist
+          const cz = hz + vHatZ * stepDist
+          const cLen = Math.sqrt(cx * cx + cy * cy + cz * cz) || 1
+          const conePosX = cx / cLen, conePosY = cy / cLen, conePosZ = cz / cLen
+
+          const baseRadius      = HOTSPOT_BASE_R * (0.7 + 0.6 * intensity) * ageScale
+          const height          = HOTSPOT_BASE_H * (0.6 + 0.8 * intensity) * ageScale
+          const craterRadiusFrac = 0.12
+
+          const conePos = new Vector3(conePosX, conePosY, conePosZ)
+          volcanoes.push({ pos: conePos, baseRadius, height, craterRadiusFrac, kind: 'hotspot', intensity })
+          volPos.push(conePosX, conePosY, conePosZ)
+          volBaseRadius.push(baseRadius)
+          volHeight.push(height)
+          volCraterFrac.push(Math.max(0.05, craterRadiusFrac))
+        }
+
+        this._hotspots.push({ pos: new Vector3(hx, hy, hz), intensity, isChain: true })
+
+      } else {
+        // SHIELD — Olympus Mons-style: one large broad volcano at pos
+        const baseRadius      = HOTSPOT_BASE_R * 1.6 * (0.7 + 0.6 * intensity)
+        const height          = HOTSPOT_BASE_H * 1.3 * (0.6 + 0.8 * intensity)
+        const craterRadiusFrac = 0.15
+
+        const conePos = new Vector3(hx, hy, hz)
+        volcanoes.push({ pos: conePos, baseRadius, height, craterRadiusFrac, kind: 'hotspot', intensity })
+        volPos.push(hx, hy, hz)
+        volBaseRadius.push(baseRadius)
+        volHeight.push(height)
+        volCraterFrac.push(Math.max(0.05, craterRadiusFrac))
+
+        this._hotspots.push({ pos: new Vector3(hx, hy, hz), intensity, isChain: false })
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // volcanoElevation — zero-alloc hot path
   //
   // Cone profile: f(x) = (1 - x^2)^2, x = a / baseRadius ∈ [0,1).
@@ -2606,6 +2794,16 @@ export class Tectonics {
     const dx = dir.x, dy = dir.y, dz = dir.z
     let sum = 0
 
+    // Perturbation 1 (irregular base): single noise sample at dir
+    // — evaluated once per volcanoElevation call, not per cone.
+    // This is intentional: it warps the footprint in a direction-specific way
+    // without introducing per-cone allocations.
+    const nWarp = this._volNoise(
+      dx * VOLC_BASE_WARP_FREQ,
+      dy * VOLC_BASE_WARP_FREQ,
+      dz * VOLC_BASE_WARP_FREQ,
+    )
+
     for (let i = start; i < end; i++) {
       const vi = this._volBucketIdx[i]
       const vx = this._volPos[vi * 3]
@@ -2616,11 +2814,29 @@ export class Tectonics {
       const dotVal = dx * vx + dy * vy + dz * vz
       const a = Math.acos(Math.max(-1, Math.min(1, dotVal)))
       const br = this._volBaseRadius[vi]
-      if (a >= br) continue
 
-      const x = a / br
+      // Perturbation 1: warp the effective base radius to make it non-circular.
+      // VOLC_BASE_WARP < 1 guarantees brEff > 0; clamp defensively.
+      const brEff = Math.max(br * 0.3, br * (1 + VOLC_BASE_WARP * nWarp))
+      if (a >= brEff) continue
+
+      const x = a / brEff
       const x2 = x * x
-      const cone = this._volHeight[vi] * (1 - x2) * (1 - x2)
+      let cone = this._volHeight[vi] * (1 - x2) * (1 - x2)
+
+      // Perturbation 2: flank roughness — fbm modulated by a mid-flank mask.
+      // Mask peaks at mid-flank (x≈0.5) and fades to 0 at summit (x=0) and base (x=1),
+      // keeping the peak height and surrounding terrain joins clean.
+      const flankMask = Math.sin(Math.PI * x)  // 0 at x=0 and x=1, peak 1.0 at x=0.5
+      const rough = fbm(
+        this._volNoise,
+        dx * VOLC_FLANK_FREQ,
+        dy * VOLC_FLANK_FREQ,
+        dz * VOLC_FLANK_FREQ,
+        { octaves: 3 },
+      )
+      cone *= (1 + VOLC_FLANK_ROUGH * flankMask * rough)
+
 
       const cf = this._volCraterFrac[vi]
       if (x < cf) {
@@ -2857,10 +3073,33 @@ export class Tectonics {
   // ---------------------------------------------------------------------------
 
   toBaked(): TectonicsBaked {
+    const nVol = this._volcanoes.length
+    const volKind      = new Uint8Array(nVol)
+    const volIntensity = new Float32Array(nVol)
+    for (let vi = 0; vi < nVol; vi++) {
+      volKind[vi]      = this._volcanoes[vi].kind === 'hotspot' ? 1 : 0
+      volIntensity[vi] = this._volcanoes[vi].intensity
+    }
+
+    const nHot = this._hotspots.length
+    const hotspotPos          = new Float32Array(nHot * 3)
+    const hotspotIntensityArr = new Float32Array(nHot)
+    const hotspotIsChain      = new Uint8Array(nHot)
+    for (let hi = 0; hi < nHot; hi++) {
+      const hs = this._hotspots[hi]
+      hotspotPos[hi * 3]     = hs.pos.x
+      hotspotPos[hi * 3 + 1] = hs.pos.y
+      hotspotPos[hi * 3 + 2] = hs.pos.z
+      hotspotIntensityArr[hi] = hs.intensity
+      hotspotIsChain[hi]      = hs.isChain ? 1 : 0
+    }
+
     return {
-      res:          RES,
-      seed:         this._seed,
-      arcDensity:   this._arcDensity,
+      res:              RES,
+      seed:             this._seed,
+      arcDensity:       this._arcDensity,
+      hotspotCount:     this._hotspotCount,
+      hotspotIntensity: this._hotspotIntensity,
       plates:         this.plates.map(p => ({
         id:            p.id,
         seedDir:       [p.seedDir.x, p.seedDir.y, p.seedDir.z] as [number, number, number],
@@ -2869,20 +3108,25 @@ export class Tectonics {
         omega:         [p.omega.x, p.omega.y, p.omega.z] as [number, number, number],
         color:         [p.color[0], p.color[1], p.color[2]] as [number, number, number],
       })),
-      compId:         this._compId,
-      distField:      this._distField,
-      neighborId:     this._neighborId,
-      crustDist:      this._crustDist,
-      paleoDist:      this._paleoDist,
-      convField:      this._convField,
-      shearField:     this._shearField,
-      volPos:         this._volPos,
-      volBaseRadius:  this._volBaseRadius,
-      volHeight:      this._volHeight,
-      volCraterFrac:  this._volCraterFrac,
-      volBucketRes:   this._volBucketRes,
-      volBucketStart: this._volBucketStart,
-      volBucketIdx:   this._volBucketIdx,
+      compId:           this._compId,
+      distField:        this._distField,
+      neighborId:       this._neighborId,
+      crustDist:        this._crustDist,
+      paleoDist:        this._paleoDist,
+      convField:        this._convField,
+      shearField:       this._shearField,
+      volPos:           this._volPos,
+      volBaseRadius:    this._volBaseRadius,
+      volHeight:        this._volHeight,
+      volCraterFrac:    this._volCraterFrac,
+      volKind,
+      volIntensity,
+      volBucketRes:     this._volBucketRes,
+      volBucketStart:   this._volBucketStart,
+      volBucketIdx:     this._volBucketIdx,
+      hotspotPos,
+      hotspotIntensityArr,
+      hotspotIsChain,
     }
   }
 
@@ -2893,9 +3137,11 @@ export class Tectonics {
     // read must be assigned explicitly below.
     const t = Object.create(Tectonics.prototype) as Tectonics
 
-    // ---- 0. Seed / arcDensity (needed to rebuild noise and for further toBaked calls) ---
-    ;(t as any)._seed       = b.seed
-    ;(t as any)._arcDensity = b.arcDensity
+    // ---- 0. Seed / arcDensity / hotspot params (needed to rebuild noise and for further toBaked calls) ---
+    ;(t as any)._seed             = b.seed
+    ;(t as any)._arcDensity       = b.arcDensity
+    ;(t as any)._hotspotCount     = b.hotspotCount
+    ;(t as any)._hotspotIntensity = b.hotspotIntensity
 
     // ---- 1. Baked typed-array fields ----------------------------------------
     ;(t as any)._compId     = b.compId
@@ -2925,10 +3171,24 @@ export class Tectonics {
         baseRadius:      b.volBaseRadius[vi],
         height:          b.volHeight[vi],
         craterRadiusFrac: b.volCraterFrac[vi],
+        kind:            b.volKind[vi] === 1 ? 'hotspot' : 'arc',
+        intensity:       b.volIntensity[vi],
       })
     }
     ;(t as any)._volcanoes = volcanoes
     ;(t as any)._volcanoBakeMs = 0
+
+    // _hotspots: restore from flat arrays
+    const nHot = b.hotspotPos.length / 3
+    const hotspots: Hotspot[] = []
+    for (let hi = 0; hi < nHot; hi++) {
+      hotspots.push({
+        pos:       new Vector3(b.hotspotPos[hi * 3], b.hotspotPos[hi * 3 + 1], b.hotspotPos[hi * 3 + 2]),
+        intensity: b.hotspotIntensityArr[hi],
+        isChain:   b.hotspotIsChain[hi] === 1,
+      })
+    }
+    ;(t as any)._hotspots = hotspots
 
     // ---- 3. Rehydrate plates (Vector3 for seedDir and omega) ----------------
     ;(t as any).plates = b.plates.map(pw => ({
@@ -2940,10 +3200,11 @@ export class Tectonics {
       color:         [pw.color[0], pw.color[1], pw.color[2]] as [number, number, number],
     }))
 
-    // ---- 4. Rebuild noise closures from seed (streams 5 and 13) ------------
-    // Exact derivation mirrors lines 1413-1414 of the constructor.
+    // ---- 4. Rebuild noise closures from seed (streams 5, 13, 18) -----------
+    // Exact derivation mirrors the constructor.
     ;(t as any)._warpNoise     = createNoise3D(deriveSeed(b.seed, 5))
     ;(t as any)._fineWarpNoise = createNoise3D(deriveSeed(b.seed, 13))
+    ;(t as any)._volNoise      = createNoise3D(deriveSeed(b.seed, 18))
 
     // ---- 5. Preallocated scratch — class field initialisers were NOT run ----
     // query() uses: _warpedDir, _smoothScratch, _crustScratch,
@@ -3070,14 +3331,12 @@ const CRUST_CORD_SS_HI   =  0.01   // cordillera/belt smoothstep hi
  * @param plates     full Plate array from the Tectonics instance
  * @param dir        unit planet-local direction (used for noise sampling only)
  * @param ridgedAt   wraps a ridged noise call returning ≈[0,1]
- * @param erosionAt  optional erosion-FBM callback for belt/cordillera (defaults to ridgedAt)
  */
 export function boundaryRelief(
   q: TectonicQuery,
   plates: Plate[],
   dir: Vector3,
   ridgedAt: (dir: Vector3, freq: number, octaves: number) => number,
-  erosionAt?: (dir: Vector3, freq: number, octaves: number) => number,
 ): number {
   const d    = q.boundaryDist   // radians
   const sideRamp = _ss(0.002, 0.015, d)
@@ -3128,7 +3387,7 @@ export function boundaryRelief(
                     + BR_FLEX_BULGE  * cp2r * _g(d, BR_FLEX_POS, BR_FLEX_WIDTH))
 
     // CO: Andes / Cascades (continental overriding side)
-    const ridgeFactor = BR_CORD_RIDGE_BASE + BR_CORD_RIDGE * (erosionAt ?? ridgedAt)(dir, 6.0, 4)
+    const ridgeFactor = BR_CORD_RIDGE_BASE + BR_CORD_RIDGE * ridgedAt(dir, 6.0, 4)
     relief += wCO * (BR_CORD_HEIGHT  * cp2r * _g(d, BR_CORD_POS, BR_CORD_WIDTH) * ridgeFactor * cordScaleFactor
                     - BR_SHELF_DIP  * cp2r * _g(d, 0.004, BR_SHELF_WIDTH))
 
@@ -3141,7 +3400,7 @@ export function boundaryRelief(
     )
 
     // CC: Himalaya / Alps collision belt
-    const beltRidged = BR_BELT_RIDGE_BASE + BR_BELT_RIDGE * (erosionAt ?? ridgedAt)(dir, 6.0, 5)
+    const beltRidged = BR_BELT_RIDGE_BASE + BR_BELT_RIDGE * ridgedAt(dir, 6.0, 5)
     relief += wCC * (BR_BELT_HEIGHT * cp2r * _g(d, 0, BR_BELT_WIDTH) * beltRidged * cordScaleFactor)
     // Tibetan Plateau — polarity ramps from 0.5 at the boundary to asymmetric beyond 0.015 rad
     const ccPlateauSide = 0.5 + ((own.id > other.id ? 1 : 0) - 0.5) * sideRamp
