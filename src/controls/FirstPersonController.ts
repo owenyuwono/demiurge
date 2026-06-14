@@ -107,8 +107,12 @@ export class FirstPersonController {
   // spawn — place + orient; does NOT lock pointer
   // ---------------------------------------------------------------------------
   spawn(placement: SurfacePlacement): void {
-    this.position.copy(placement.position)
     this._up.copy(placement.up).normalize()
+    // Snap feet to the sampler-authoritative surface radius (same formula as update()).
+    // This guarantees spawn and per-frame re-projection are consistent even if
+    // placement.position has minor float drift from the analytic sphere intersection.
+    const spawnSurfR = this._sampler.surfaceRadiusAt(this._up)
+    this.position.copy(this._up).multiplyScalar(spawnSurfR)
 
     // Reset pitch; yaw is implicit in _forward (reset by building a fresh tangent)
     this._pitch = 0
@@ -126,9 +130,9 @@ export class FirstPersonController {
     _s.fwd.normalize()
     this._forward.copy(_s.fwd)
 
-    // Set camera: eye sits at eyeHeight above feet along radial up
-    const surfR = this.position.length()
-    _s.camPos.copy(this._up).multiplyScalar(surfR + this._eyeHeight)
+    // Set camera: eye sits at eyeHeight above feet along radial up.
+    // camera radial distance = surfaceRadiusAt(up) + eyeHeight
+    _s.camPos.copy(this._up).multiplyScalar(spawnSurfR + this._eyeHeight)
     this._camera.up.copy(this._up)
     this._camera.position.copy(_s.camPos)
 

@@ -127,6 +127,7 @@ const TEX_ANG = texAng(RES)
 const ARC_CONV_THRESH   = 0.14    // convergence threshold; effective = ARC_CONV_THRESH / arcDensity
 const ARC_OFFSET        = 0.020   // rad — volcanic-front offset onto overriding plate
 const ARC_BAND          = 0.006   // rad — half-width of front band
+const ARC_CRUST_WIDTH   = 0.090   // rad — arc-crust band half-width (wider than ARC_BAND so volcanoes land on crust) [was 0.035 — bumped so arc-land strip survives 3× blur on 256-res cubemap: TEX_ANG≈0.006rad, 3 blurs≈6 texels smoothing, need half-width>6 texels≈0.037rad; 0.090→14 texels half-width, comfortably positive after blur]
 const ARC_SPACING       = 0.045   // rad — true min spacing (dart-throwing); effective = ARC_SPACING / arcDensity
 const ARC_MAX           = 2000    // safety cap on total volcanoes
 const ARC_SIZE_SPAN     = 0.25    // convergence span above threshold for convStrength ramp
@@ -1222,7 +1223,10 @@ function bakeConvShear(
   distField: Float32Array,
   compId: Uint16Array,
   neighborId: Uint16Array,
-  plates: Plate[],
+  omegaX: Float64Array,
+  omegaY: Float64Array,
+  omegaZ: Float64Array,
+  plateCount: number,
 ): { convField: Float32Array; shearField: Float32Array } {
   const convField  = new Float32Array(TOTAL_TEXELS)
   const shearField = new Float32Array(TOTAL_TEXELS)
@@ -1285,17 +1289,15 @@ function bakeConvShear(
     const tHatZ = -ptz / gLen
 
     const pid = compId[idx]
-    const nid = Math.min(neighborId[idx], plates.length - 1)
-    const omA = plates[pid].omega
-    const omB = plates[nid].omega
+    const nid = Math.min(neighborId[idx], plateCount - 1)
     const cx = cDir.x, cy = cDir.y, cz = cDir.z
 
-    const vAx = omA.y * cz - omA.z * cy
-    const vAy = omA.z * cx - omA.x * cz
-    const vAz = omA.x * cy - omA.y * cx
-    const vBx = omB.y * cz - omB.z * cy
-    const vBy = omB.z * cx - omB.x * cz
-    const vBz = omB.x * cy - omB.y * cx
+    const vAx = omegaY[pid] * cz - omegaZ[pid] * cy
+    const vAy = omegaZ[pid] * cx - omegaX[pid] * cz
+    const vAz = omegaX[pid] * cy - omegaY[pid] * cx
+    const vBx = omegaY[nid] * cz - omegaZ[nid] * cy
+    const vBy = omegaZ[nid] * cx - omegaX[nid] * cz
+    const vBz = omegaX[nid] * cy - omegaY[nid] * cx
 
     const diffX = vAx - vBx
     const diffY = vAy - vBy
@@ -1322,11 +1324,49 @@ function bakeConvShear(
 }
 
 // ---------------------------------------------------------------------------
+// Serialisation wire types
+// ---------------------------------------------------------------------------
+
+export interface PlateWire {
+  id: number
+  seedDir: [number, number, number]
+  type: 'oceanic' | 'continental'
+  baseElevation: number
+  omega: [number, number, number]
+  color: [number, number, number]
+}
+
+export interface TectonicsBaked {
+  res: number
+  seed: number
+  arcDensity: number
+  plates: PlateWire[]
+  compId: Uint16Array
+  distField: Float32Array
+  neighborId: Uint16Array
+  crustDist: Float32Array
+  paleoDist: Float32Array
+  convField: Float32Array
+  shearField: Float32Array
+  volPos: Float32Array
+  volBaseRadius: Float32Array
+  volHeight: Float32Array
+  volCraterFrac: Float32Array
+  volBucketRes: number
+  volBucketStart: Int32Array
+  volBucketIdx: Int32Array
+}
+
+// ---------------------------------------------------------------------------
 // Tectonics — public class
 // ---------------------------------------------------------------------------
 
 export class Tectonics {
   readonly plates: Plate[]
+
+  // Seed and arcDensity stored for toBaked() / fromBaked() round-trip
+  private readonly _seed: number
+  private readonly _arcDensity: number
 
   // Cube-map tables (read-only after construction)
   private readonly _compId:     Uint16Array   // per-texel plate id (0-based)
@@ -1393,6 +1433,9 @@ export class Tectonics {
   constructor(opts: { seed: number; plateCount?: number; arcDensity?: number }) {
     const { seed, plateCount = 16, arcDensity: arcDensityRaw = 1.0 } = opts
     const arcDensity = Math.max(0.2, Math.min(3, arcDensityRaw))
+    // Store seed and clamped arcDensity for toBaked() / fromBaked() round-trip
+    this._seed       = seed
+    this._arcDensity = arcDensity
     // Clamp plateCount to [0, 48]; values ≤ 1 trigger the non-tectonic branch
     const plateCountClamped = Math.max(0, Math.min(48, plateCount))
     const target = plateCountClamped  // EXACT target plate count (for tectonic path)
@@ -1603,6 +1646,34 @@ export class Tectonics {
     this._neighborId = neighborId
 
     // -------------------------------------------------------------------------
+    // Step 6a — Omega pre-derivation + convergence/shear field bake (HOISTED)
+    // -------------------------------------------------------------------------
+    // Omega arrays are derived ONCE here (axisRng/speedRng consumed exactly once,
+    // same order as before). bakeConvShear is called here instead of after Step 5
+    // so that _convField is available during the crust-mask bake (arc-crust pass).
+    const plateOmX = new Float64Array(finalCount)
+    const plateOmY = new Float64Array(finalCount)
+    const plateOmZ = new Float64Array(finalCount)
+    for (let i = 0; i < finalCount; i++) {
+      const ax = axisRng() * 2 - 1
+      const ay = axisRng() * 2 - 1
+      const az = axisRng() * 2 - 1
+      const axisLen = Math.sqrt(ax * ax + ay * ay + az * az) || 1
+      const speed = 0.4 + speedRng() * 0.6
+      plateOmX[i] = ax / axisLen * speed
+      plateOmY[i] = ay / axisLen * speed
+      plateOmZ[i] = az / axisLen * speed
+    }
+    {
+      const { convField, shearField } = bakeConvShear(
+        this._distField, this._compId, this._neighborId,
+        plateOmX, plateOmY, plateOmZ, finalCount,
+      )
+      this._convField  = convField
+      this._shearField = shearField
+    }
+
+    // -------------------------------------------------------------------------
     // Step 6b — Crust mask bake + crust SDF
     // -------------------------------------------------------------------------
 
@@ -1665,22 +1736,7 @@ export class Tectonics {
       }
     }
 
-    // Omega arrays — derived ONCE here and reused in both the crust bake and Step 5.
-    // This is the single authoritative derivation; axisRng/speedRng are consumed here.
-    const plateOmX = new Float64Array(finalCount)
-    const plateOmY = new Float64Array(finalCount)
-    const plateOmZ = new Float64Array(finalCount)
-    for (let i = 0; i < finalCount; i++) {
-      const ax = axisRng() * 2 - 1
-      const ay = axisRng() * 2 - 1
-      const az = axisRng() * 2 - 1
-      const axisLen = Math.sqrt(ax * ax + ay * ay + az * az) || 1
-      const speed = 0.4 + speedRng() * 0.6
-      plateOmX[i] = ax / axisLen * speed
-      plateOmY[i] = ay / axisLen * speed
-      plateOmZ[i] = az / axisLen * speed
-    }
-
+    // plateOmX/Y/Z are derived earlier (Step 6a) and remain in scope here.
     for (let i = 0; i < finalCount; i++) {
       if (typesPre[i] === 'continental') {
         const area = plateAreaShare[i]
@@ -1730,7 +1786,9 @@ export class Tectonics {
 
     // --- Apply crust mask ---
     {
-      const tmpDir = new Vector3()
+      const tmpDir    = new Vector3()
+      const arcScratch = new Vector3()  // separate scratch for sampleSmooth (must not alias tmpDir)
+      const ARC_CONV_THRESH_EFF = ARC_CONV_THRESH / this._arcDensity
       for (let t = 0; t < TOTAL_TEXELS; t++) {
         const face = (t / (RES * RES)) | 0
         const rem  = t % (RES * RES)
@@ -1761,6 +1819,31 @@ export class Tectonics {
             const fbmVal3 = fbm(crustNoise, tx * 3, ty3 * 3, tz * 3, { octaves: 3 }) * 0.5 + 0.5
             const threshold = mr * (0.7 + 0.5 * fbmVal3)
             if (mAngle < threshold) crustMask[t] = 1
+          }
+        }
+
+        // --- Arc-crust pass ---
+        // Mark texels along oceanic-convergent boundaries (volcanic front, overriding
+        // side) as continental-type crust so volcanoes land on solid ground and the
+        // surrounding area becomes coastal plain/shelf.  Runs regardless of own plate
+        // type so OO arcs are also covered.  Only adds texels — never clears them.
+        if (!crustMask[t]) {
+          const convArc = sampleSmooth(this._convField, tmpDir, RES, arcScratch)
+          if (convArc > ARC_CONV_THRESH_EFF) {
+            const bd = this._distField[t]
+            if (bd >= ARC_OFFSET - ARC_CRUST_WIDTH && bd <= ARC_OFFSET + ARC_CRUST_WIDTH) {
+              const nid = Math.min(neighborId[t], finalCount - 1)
+              // Overriding-side gate (mirrors _bakeVolcanoes polarity):
+              //   OC: own = continental, neighbour = oceanic
+              //   OO: both oceanic, own id > neighbour id (arc-side convention)
+              const ownType = typesPre[pid]
+              const nbrType = typesPre[nid]
+              const isOC = ownType === 'continental' && nbrType === 'oceanic'
+              const isOO = ownType === 'oceanic'     && nbrType === 'oceanic' && pid > nid
+              if (isOC || isOO) {
+                crustMask[t] = 1
+              }
+            }
           }
         }
       }
@@ -1954,15 +2037,10 @@ export class Tectonics {
     this.plates = plates
 
     // -------------------------------------------------------------------------
-    // Step 7 — Bake convergence + shear fields (stable, pre-blurred)
+    // Step 7 — convergence + shear fields (hoisted to Step 6a; already assigned)
     // -------------------------------------------------------------------------
-    // Must come AFTER this.plates is assigned (omega is needed).
-    // Uses the already-blurred _distField so the gradient is as smooth as possible.
-    const { convField, shearField } = bakeConvShear(
-      this._distField, this._compId, this._neighborId, this.plates,
-    )
-    this._convField  = convField
-    this._shearField = shearField
+    // bakeConvShear was called in Step 6a (before the crust-mask bake) so that
+    // _convField is available for the arc-crust pass. Nothing to do here.
 
     // -------------------------------------------------------------------------
     // Step 8 — Bake arc volcanoes (LAST — reads _convField/_crustDist/_distField)
@@ -2766,6 +2844,141 @@ export class Tectonics {
       omega.x * ddy - omega.y * ddx,
     )
     return out
+  }
+
+  // ---------------------------------------------------------------------------
+  // Serialisation — toBaked / fromBaked
+  //
+  // toBaked()   : snapshot all baked state by reference (no copy; postMessage
+  //               will Structured-Clone / transfer the typed arrays).
+  // fromBaked() : reconstruct a query-only Tectonics WITHOUT running the bake.
+  //               Uses Object.create so class-field initialisers are skipped,
+  //               then manually assigns every field the hot paths need.
+  // ---------------------------------------------------------------------------
+
+  toBaked(): TectonicsBaked {
+    return {
+      res:          RES,
+      seed:         this._seed,
+      arcDensity:   this._arcDensity,
+      plates:         this.plates.map(p => ({
+        id:            p.id,
+        seedDir:       [p.seedDir.x, p.seedDir.y, p.seedDir.z] as [number, number, number],
+        type:          p.type,
+        baseElevation: p.baseElevation,
+        omega:         [p.omega.x, p.omega.y, p.omega.z] as [number, number, number],
+        color:         [p.color[0], p.color[1], p.color[2]] as [number, number, number],
+      })),
+      compId:         this._compId,
+      distField:      this._distField,
+      neighborId:     this._neighborId,
+      crustDist:      this._crustDist,
+      paleoDist:      this._paleoDist,
+      convField:      this._convField,
+      shearField:     this._shearField,
+      volPos:         this._volPos,
+      volBaseRadius:  this._volBaseRadius,
+      volHeight:      this._volHeight,
+      volCraterFrac:  this._volCraterFrac,
+      volBucketRes:   this._volBucketRes,
+      volBucketStart: this._volBucketStart,
+      volBucketIdx:   this._volBucketIdx,
+    }
+  }
+
+  static fromBaked(b: TectonicsBaked): Tectonics {
+    // Create instance without running constructor (and therefore without the bake).
+    // Class field initialisers with `= expression` are NOT run by Object.create,
+    // so every field that the hot paths (query / volcanoElevation / velocityAt)
+    // read must be assigned explicitly below.
+    const t = Object.create(Tectonics.prototype) as Tectonics
+
+    // ---- 0. Seed / arcDensity (needed to rebuild noise and for further toBaked calls) ---
+    ;(t as any)._seed       = b.seed
+    ;(t as any)._arcDensity = b.arcDensity
+
+    // ---- 1. Baked typed-array fields ----------------------------------------
+    ;(t as any)._compId     = b.compId
+    ;(t as any)._distField  = b.distField
+    ;(t as any)._neighborId = b.neighborId
+    ;(t as any)._crustDist  = b.crustDist
+    ;(t as any)._paleoDist  = b.paleoDist
+    ;(t as any)._convField  = b.convField
+    ;(t as any)._shearField = b.shearField
+
+    // ---- 2. Volcano flat arrays and spatial index ---------------------------
+    ;(t as any)._volPos        = b.volPos
+    ;(t as any)._volBaseRadius = b.volBaseRadius
+    ;(t as any)._volHeight     = b.volHeight
+    ;(t as any)._volCraterFrac = b.volCraterFrac
+    ;(t as any)._volBucketRes  = b.volBucketRes
+    ;(t as any)._volBucketStart = b.volBucketStart
+    ;(t as any)._volBucketIdx  = b.volBucketIdx
+
+    // _volcanoes: volcanoElevation only checks length; fromBaked reconstructs
+    // the Volcano[] from flat arrays so the `volcanoes` getter works too.
+    const nVol = b.volPos.length / 3
+    const volcanoes: Volcano[] = []
+    for (let vi = 0; vi < nVol; vi++) {
+      volcanoes.push({
+        pos:             new Vector3(b.volPos[vi * 3], b.volPos[vi * 3 + 1], b.volPos[vi * 3 + 2]),
+        baseRadius:      b.volBaseRadius[vi],
+        height:          b.volHeight[vi],
+        craterRadiusFrac: b.volCraterFrac[vi],
+      })
+    }
+    ;(t as any)._volcanoes = volcanoes
+    ;(t as any)._volcanoBakeMs = 0
+
+    // ---- 3. Rehydrate plates (Vector3 for seedDir and omega) ----------------
+    ;(t as any).plates = b.plates.map(pw => ({
+      id:            pw.id,
+      seedDir:       new Vector3(pw.seedDir[0], pw.seedDir[1], pw.seedDir[2]),
+      type:          pw.type,
+      baseElevation: pw.baseElevation,
+      omega:         new Vector3(pw.omega[0], pw.omega[1], pw.omega[2]),
+      color:         [pw.color[0], pw.color[1], pw.color[2]] as [number, number, number],
+    }))
+
+    // ---- 4. Rebuild noise closures from seed (streams 5 and 13) ------------
+    // Exact derivation mirrors lines 1413-1414 of the constructor.
+    ;(t as any)._warpNoise     = createNoise3D(deriveSeed(b.seed, 5))
+    ;(t as any)._fineWarpNoise = createNoise3D(deriveSeed(b.seed, 13))
+
+    // ---- 5. Preallocated scratch — class field initialisers were NOT run ----
+    // query() uses: _warpedDir, _smoothScratch, _crustScratch,
+    //               _fineWarpScratch, _fineCrustScratch, _tex,
+    //               _gDir0-3, _gTex0-3, _tHat, _otherCrustDir
+    // volcanoElevation() uses: _volScratchTexel
+    // velocityAt() uses: _warpedDir, _tex (shared with query)
+    // _bakeQueryScratch / _bakeDirScratch are only used by _bakeVolcanoes (not
+    // called after construction), but they are declared `readonly` on the class
+    // so we must still initialise them to avoid a potential undefined-property
+    // crash if any future code path reaches them.
+    ;(t as any)._warpedDir         = new Vector3()
+    ;(t as any)._smoothScratch     = new Vector3()
+    ;(t as any)._crustScratch      = new Vector3()
+    ;(t as any)._fineWarpScratch   = new Vector3()
+    ;(t as any)._fineCrustScratch  = new Vector3()
+    ;(t as any)._tex               = { face: 0, x: 0, y: 0 }
+    ;(t as any)._gDir0             = new Vector3()
+    ;(t as any)._gDir1             = new Vector3()
+    ;(t as any)._gDir2             = new Vector3()
+    ;(t as any)._gDir3             = new Vector3()
+    ;(t as any)._gTex0             = { face: 0, x: 0, y: 0 }
+    ;(t as any)._gTex1             = { face: 0, x: 0, y: 0 }
+    ;(t as any)._gTex2             = { face: 0, x: 0, y: 0 }
+    ;(t as any)._gTex3             = { face: 0, x: 0, y: 0 }
+    ;(t as any)._tHat              = new Vector3()
+    ;(t as any)._otherCrustDir     = new Vector3()
+    ;(t as any)._volScratchTexel   = { face: 0, x: 0, y: 0 }
+    ;(t as any)._bakeQueryScratch  = {
+      plateId: 0, neighborId: 0, boundaryDist: 0, convergence: 0,
+      shear: 0, crustDist: 0, paleoDist: 0, otherCrustDist: 0,
+    }
+    ;(t as any)._bakeDirScratch    = new Vector3()
+
+    return t
   }
 }
 

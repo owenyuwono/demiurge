@@ -216,12 +216,13 @@ async function main(): Promise<void> {
 
   // --- UI state (single source of truth for GUI + hotkeys) ---
   const ui = {
-    view: 'normal' as 'normal' | 'lod' | 'tectonics',
+    view: 'normal' as 'normal' | 'lod' | 'tectonics' | 'heightmap',
     wireframe: false,
     vertices: false,
     freezeLod: false,
     gizmos: true,
-    spin: true,
+    lodDiag: false,
+    spin: false,
     spinPeriodS: 600,
     plateCount: 16,
     arcDensity: 1,
@@ -251,6 +252,7 @@ async function main(): Promise<void> {
   function applyView(): void {
     planet.setDebugColors(ui.view === 'lod')
     planet.setTectonicsView(ui.view === 'tectonics')
+    planet.setHeightmapView(ui.view === 'heightmap')
   }
 
   function applyWireframe(): void {
@@ -282,7 +284,7 @@ async function main(): Promise<void> {
   const gui = new GUI({ title: 'Demiurge' })
 
   const viewFolder = gui.addFolder('View')
-  viewFolder.add(ui, 'view', ['normal', 'lod', 'tectonics']).name('mode').onChange(() => applyView())
+  viewFolder.add(ui, 'view', ['normal', 'lod', 'tectonics', 'heightmap']).name('mode').onChange(() => applyView())
   viewFolder.add(ui, 'wireframe').name('wireframe').onChange(() => applyWireframe())
   viewFolder.add(ui, 'vertices').name('vertices').onChange(() => applyVertices())
   viewFolder.add(ui, 'freezeLod').name('freeze LOD').onChange(() => applyFreeze())
@@ -328,6 +330,9 @@ async function main(): Promise<void> {
   })
   lodFolder.add(ui, 'maxDepth', 8, 20, 1).name('max depth').onChange((v: number) => {
     planet.setMaxDepth(v)
+  })
+  lodFolder.add(ui, 'lodDiag').name('lod diag').onChange((v: boolean) => {
+    planet.setDiagEnabled(v)
   })
 
   const waterFolder = gui.addFolder('Water')
@@ -383,6 +388,8 @@ async function main(): Promise<void> {
   let smoothFps = 0
   // Scratch for reading drawing-buffer size (zero-alloc per frame).
   const _drawingSize = new THREE.Vector2()
+  // Scratch for the camera view-projection matrix (zero-alloc per frame).
+  const _viewProj = new THREE.Matrix4()
 
   renderer.setAnimationLoop(() => {
     const dt = Math.min(clock.getDelta(), 0.1)
@@ -406,7 +413,8 @@ async function main(): Promise<void> {
     // terrain keeps loading under the player in FP mode.
     // camera.fov is in degrees (Three.js convention) — convert to radians for the SSE metric.
     renderer.getDrawingBufferSize(_drawingSize)
-    planet.update(camera.position, THREE.MathUtils.degToRad(camera.fov), _drawingSize.y)
+    _viewProj.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse)
+    planet.update(camera.position, THREE.MathUtils.degToRad(camera.fov), _drawingSize.y, _viewProj)
 
     // Lighting is fixed surround (set up once at init) — nothing to update per frame.
 

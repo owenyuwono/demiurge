@@ -59,6 +59,25 @@ export interface ClimateSample {
   moisture: number
 }
 
+/**
+ * Serialisable snapshot of a baked Climate — contains everything needed to
+ * reconstruct a sampler-only instance in a Web Worker WITHOUT re-baking.
+ *
+ * Transfer `moistureField` as a Transferable (ArrayBuffer) across the Worker
+ * message boundary; pass the rest as plain JSON.
+ */
+export interface ClimateBaked {
+  /** Resolution used during the bake (= MOIST_RES = 128). */
+  moistRes: number
+  /** Baked cube-map moisture field, length 6·moistRes². */
+  moistureField: Float32Array
+  /** Scalar params needed to recompute the sampler-side derived values. */
+  baseTemp: number
+  atmosphere: number
+  bandCount: number
+  axialTiltRad: number
+}
+
 interface ClimateDeps {
   /** Terrain height in [-1,1] for a unit dir at a given LOD level (for rain shadow). */
   heightFn: (dir: Vector3, level: number) => number
@@ -84,8 +103,18 @@ const LAPSE_PER_HEIGHT = 50
 const TILT_INVERT_LO = (54 * Math.PI) / 180
 const TILT_INVERT_HI = (75 * Math.PI) / 180
 
-/** Inland moisture falloff scale (radians of crustDist). Smaller → coasts dry out faster. */
-const MOIST_INLAND_SCALE = 0.18
+/** Inland moisture falloff scale (radians of crustDist). Smaller → coasts dry out faster.
+ *  Raised so moisture penetrates deep continental interiors (the ~9 km of 0.18 left
+ *  interiors at ~0 → all-desert). ~0.6 rad ≈ 30 km penetration on the 50 km planet:
+ *  coasts stay wetter than deep interiors (realistic gradient) without uniform desert. */
+const MOIST_INLAND_SCALE = 0.7
+/** Floor on sea-proximity so no land is at exactly 0 from inland distance alone —
+ *  the deepest interiors still get a little moisture (only the band model can fully dry them). */
+const MOIST_SEAPROX_FLOOR = 0.21
+/** Floor on the raw band wetness before the bandContrast power — descending dry
+ *  bands keep a little moisture (real dry bands aren't bone-dry; the deep-interior
+ *  desert comes from seaProximity/rainShadow, not from a literal-0 band). */
+const BAND_FLOOR = 0.075
 /** Rain-shadow strength: leeward drying per unit upwind height excess. */
 const SHADOW_K = 1.6
 /** Floor for the rain-shadow multiplier (a desert behind a wall still keeps a little moisture). */
@@ -95,8 +124,9 @@ const UPWIND_STEPS = 3
 const UPWIND_STEP_RAD = 0.02
 /** Coarse LOD level at which heightFn is sampled for rain shadow (cheap, stable). */
 const RAINSHADOW_LEVEL = 8
-/** Overall moisture gain before clamp (keeps the wettest places near saturation). */
-const MOIST_GAIN = 1.15
+/** Overall moisture gain before clamp (keeps the wettest places near saturation).
+ *  Raised so the overall moisture level lifts mid-latitudes above the desert threshold. */
+const MOIST_GAIN = 1.23
 /** Cold places hold less liquid moisture: below this temp (°C) moisture is attenuated. */
 const FROZEN_TEMP = -5
 /** Width (°C) over which the frozen attenuation ramps in below FROZEN_TEMP. */
@@ -188,10 +218,19 @@ export class Climate {
     this.lapseFactor = 0.3 + 0.7 * this.atmosphere
     // A thick atmosphere transports moisture efficiently: wetter overall and
     // softer bands. A thin atmosphere is arid with sharp, deep dry bands.
-    //   moistGain: 0.7 (thin) … 1.25 (thick) — overall wetness scale.
-    //   bandContrast: 2.2 (thin, deep dry bands) … 1.0 (thick, gentle bands).
-    this.moistGain = MOIST_GAIN * (0.7 + 0.55 * this.atmosphere)
-    this.bandContrast = 2.2 - 1.2 * this.atmosphere
+    //   moistGain (×MOIST_GAIN): 0.56 (thin) … 1.12 (thick) — overall wetness
+    //     scale; the steep thin end keeps arid worlds arid (≈0.69 at atm 0.2).
+    //   bandContrast: a power applied to the raw band wetness.
+    //     A power > 1 SHARPENS the bands — it crushes moderate (mid-latitude,
+    //     between-peak) moisture toward 0, leaving only the equatorial/60° peaks
+    //     wet (the old 2.2−1.2·atm ≈ 1.48 at default did exactly this → all-desert
+    //     mid-latitudes). We want BROAD wet bands at a normal atmosphere, so the
+    //     default lands ≤ 1 (a mild power that keeps some contrast — deserts still
+    //     form at descending bands — without flattening the wet zones to nothing):
+    //       1.19 (thin, sharp deep dry bands) … 0.75 (thick, broad gentle bands);
+    //       ≈0.97 at the default atmosphere 0.6.
+    this.moistGain = MOIST_GAIN * (0.34 + 1.1 * this.atmosphere)
+    this.bandContrast = 1.30 - 0.55 * this.atmosphere
 
     this.moistureField = this.bakeMoisture(opts.heightFn, opts.crustDistAt)
   }
@@ -234,7 +273,11 @@ export class Climate {
    */
   private bandWetness(dirY: number): number {
     const latAngle = Math.asin(dirY < -1 ? -1 : dirY > 1 ? 1 : dirY)
-    return 0.5 + 0.5 * Math.cos(2 * this.bandCount * latAngle)
+    const raw = 0.5 + 0.5 * Math.cos(2 * this.bandCount * latAngle)
+    // Raise the floor so descending bands aren't literally 0 — real "dry" bands
+    // still get a little moisture; only the driest deep interiors become true
+    // desert (via seaProximity/rainShadow). Floor 0.12, range 0.88.
+    return BAND_FLOOR + (1 - BAND_FLOOR) * raw
   }
 
   /**
@@ -278,9 +321,11 @@ export class Climate {
           //    pushes mid/low values toward 0, sharpening the descending-band troughs).
           const band = Math.pow(this.bandWetness(dir.y), this.bandContrast)
 
-          // 2. Sea proximity — drier inland.
+          // 2. Sea proximity — drier inland, but with a floor so deep interiors
+          //    aren't uniformly bone-dry (coasts still wetter than interiors).
           const cd = crustDistAt(dir)
-          const seaProx = Math.exp(-Math.max(0, cd) / MOIST_INLAND_SCALE)
+          const seaProx = MOIST_SEAPROX_FLOOR
+            + (1 - MOIST_SEAPROX_FLOOR) * Math.exp(-Math.max(0, cd) / MOIST_INLAND_SCALE)
 
           // 3. Rain shadow — march UPWIND along this band's zonal wind.
           //    east tangent = normalize(polarAxis × dir); wind sign alternates per band.
@@ -375,6 +420,73 @@ export class Climate {
     if (out.moisture < 0) out.moisture = 0
     else if (out.moisture > 1) out.moisture = 1
     return out
+  }
+
+  // -------------------------------------------------------------------------
+  // Serialisation helpers
+  // -------------------------------------------------------------------------
+
+  /**
+   * Snapshot this Climate's baked state so a Web Worker can reconstruct a
+   * sampler-only instance without re-baking.
+   *
+   * `moistureField` is returned BY REFERENCE — transfer its `.buffer` across
+   * the Worker boundary instead of copying it when possible.
+   */
+  toBaked(): ClimateBaked {
+    return {
+      moistRes: MOIST_RES,
+      moistureField: this.moistureField,
+      baseTemp: this.baseTemp,
+      atmosphere: this.atmosphere,
+      bandCount: this.bandCount,
+      axialTiltRad: this.axialTiltRad,
+    }
+  }
+
+  /**
+   * Reconstruct a sampler-only Climate from a baked snapshot.
+   * Does NOT call `bakeMoisture` — the field from `b` is used directly.
+   * `sample()` works identically to a normally constructed instance.
+   */
+  static fromBaked(b: ClimateBaked): Climate {
+    // Bypass the constructor so bakeMoisture is never called.
+    const c = Object.create(Climate.prototype) as Climate
+
+    // Field initialisers do not run under Object.create, so we must set every
+    // private field explicitly.
+
+    // --- identity scalars (mirrors constructor lines 188-191) ---
+    ;(c as unknown as Record<string, unknown>)['seed'] = 0 // not used post-bake
+    ;(c as unknown as Record<string, unknown>)['baseTemp'] = b.baseTemp
+    ;(c as unknown as Record<string, unknown>)['atmosphere'] = b.atmosphere
+    ;(c as unknown as Record<string, unknown>)['bandCount'] = b.bandCount
+    ;(c as unknown as Record<string, unknown>)['axialTiltRad'] = b.axialTiltRad
+
+    // --- sampler derived scalars (same formulas as constructor lines 195-214) ---
+    const atm = b.atmosphere
+    ;(c as unknown as Record<string, unknown>)['invertBlend'] =
+      smoothstep(TILT_INVERT_LO, TILT_INVERT_HI, b.axialTiltRad)
+    ;(c as unknown as Record<string, unknown>)['gradient'] =
+      EQUATOR_POLE_DELTA * (1 - 0.7 * atm)
+    ;(c as unknown as Record<string, unknown>)['lapseFactor'] =
+      0.3 + 0.7 * atm
+    ;(c as unknown as Record<string, unknown>)['moistGain'] =
+      MOIST_GAIN * (0.34 + 1.1 * atm)
+    ;(c as unknown as Record<string, unknown>)['bandContrast'] =
+      1.30 - 0.55 * atm
+
+    // --- baked field ---
+    ;(c as unknown as Record<string, unknown>)['moistureField'] = b.moistureField
+
+    // --- zero-alloc scratch (field initialisers don't run; must init manually) ---
+    ;(c as unknown as Record<string, unknown>)['_scratch'] = new Vector3()
+    ;(c as unknown as Record<string, unknown>)['_eastScratch'] = new Vector3()
+    ;(c as unknown as Record<string, unknown>)['_marchScratch'] = new Vector3()
+    ;(c as unknown as Record<string, unknown>)['_texelDir'] = new Vector3()
+    ;(c as unknown as Record<string, unknown>)['_polarAxis'] = new Vector3(0, 1, 0)
+
+    return c
   }
 
   dispose(): void {

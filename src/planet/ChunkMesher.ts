@@ -37,6 +37,17 @@ export interface ChunkMeshData {
   origin:   Vector3;
 }
 
+export interface ChunkMeshArrays {
+  positions:   Float32Array;
+  normals:     Float32Array;
+  colors:      Float32Array;
+  plateColors: Float32Array | null;
+  indices:     Uint32Array;
+  originX: number;
+  originY: number;
+  originZ: number;
+}
+
 // FACE_BASES, FaceBasis, and cubeToSphere are imported from ./faceBases (single source of truth).
 
 // ---------------------------------------------------------------------------
@@ -309,8 +320,11 @@ export function biomeColor(
     const rShf = 0x9c / 255, gShf = 0x8a / 255, bShf = 0x66 / 255;
 
     // --- 2. Dry vs vegetated axis -------------------------------------------
-    // dryness: 1 when very dry (M→0), 0 when moist (M ≥ ~0.3).
-    const dry = 1 - smoothstepM(0.25, 0.32, moisture);
+    // dryness: 1 when very dry (M→0), 0 once moisture clears the desert line.
+    // Calibrated to the moisture field: desert only below ~0.20 (M≥~0.22 vegetates),
+    // so deserts stay confined to the descending bands + driest deep interiors
+    // instead of swallowing every mid-latitude / continental interior.
+    const dry = 1 - smoothstepM(0.14, 0.22, moisture);
     // Within dry: hot deserts vs cold steppe (by temperature).
     const hotDry = smoothstepM(2, 14, temperature);
     const desertR = lerp(sandCold[0], sandHot[0], hotDry);
@@ -323,7 +337,7 @@ export function biomeColor(
     // temperate. Smoothstep windows keep the transitions soft (no hard edges).
     const tWarm = smoothstepM(2, 8, temperature);        // 0 cold (tundra), 1 by 8°C (forest)
     const tHot = smoothstepM(18, 24, temperature);       // 0 mild, 1 by 24°C
-    const tropWet = smoothstepM(0.45, 0.62, moisture);   // tropical needs moisture too
+    const tropWet = smoothstepM(0.42, 0.58, moisture);   // tropical needs moisture too (rainforest above ~0.45)
     const tropMix = tHot * tropWet;
     // mild-end color: temperate forest, pushed toward tropical when hot AND wet.
     const mildR = lerp(temperate[0], tropical[0], tropMix);
@@ -335,8 +349,11 @@ export function biomeColor(
     let vegB = lerp(tundra[2], mildB, tWarm);
 
     // --- 4. Grassland/steppe for middling moisture (between desert and forest) -
-    // Peaks around M ≈ 0.25..0.5; suppressed in true tropical (hot+wet) regions.
-    const grassW = smoothstepM(0.25, 0.4, moisture) * (1 - smoothstepM(0.5, 0.62, moisture)) * (1 - tropMix);
+    // Peaks around M ≈ 0.22..0.40 (the steppe belt just above the desert line),
+    // then fades out as forest takes over by ~0.46; suppressed in true tropical
+    // (hot+wet) regions. Calibrated to the moisture field so a grassland belt sits
+    // between the ±30° deserts and the wetter forested zones.
+    const grassW = smoothstepM(0.20, 0.30, moisture) * (1 - smoothstepM(0.38, 0.48, moisture)) * (1 - tropMix);
     vegR = lerp(vegR, grass[0], grassW);
     vegG = lerp(vegG, grass[1], grassW);
     vegB = lerp(vegB, grass[2], grassW);
@@ -389,10 +406,10 @@ export function biomeColor(
 }
 
 // ---------------------------------------------------------------------------
-// Main builder
+// Pure compute core — all meshing math, no THREE GPU objects (worker-safe).
 // ---------------------------------------------------------------------------
 
-export function buildChunkGeometry(p: ChunkParams): ChunkMeshData {
+export function computeChunkArrays(p: ChunkParams): ChunkMeshArrays {
   const { faceIndex, level, ix, iy, resolution: res, radius, heightScale, heightFn, plateColorFn, climateFn } = p;
   // Convenience: heightFn with level pre-bound — avoids repeating `level` at every call site
   // inside this function (all vertices in a chunk share the same LOD level).
@@ -449,10 +466,9 @@ export function buildChunkGeometry(p: ChunkParams): ChunkMeshData {
   const tan1   = new Vector3();
   const tan2   = new Vector3();
   const nrm    = new Vector3();
-  // Sphere-tangent normal scratch — tangent frame built from sphere direction
-  const _tanUp = new Vector3();
-  const _tan1  = new Vector3();
-  const _tan2  = new Vector3();
+  // Scratch unit-dir for ghost (off-edge) border neighbours — evalVertex needs
+  // a dir out-param but the ghost's normal only uses its world position.
+  const _ghostDir = new Vector3();
 
   // -- Chunk center (for origin-relative positions) -------------------------
   // Center of tile = (ix+0.5)/2^level, (iy+0.5)/2^level on the face
@@ -470,11 +486,9 @@ export function buildChunkGeometry(p: ChunkParams): ChunkMeshData {
   _sphereDir.normalize();
   const hCenter = hFn(_sphereDir);
   const rCenter = radius + hCenter * heightScale;
-  const origin = new Vector3(
-    _sphereDir.x * rCenter,
-    _sphereDir.y * rCenter,
-    _sphereDir.z * rCenter,
-  );
+  const originX = _sphereDir.x * rCenter;
+  const originY = _sphereDir.y * rCenter;
+  const originZ = _sphereDir.z * rCenter;
 
   // -- Skirt depth ----------------------------------------------------------
   // Proportional to the chunk's arc length so skirts scale naturally as the
@@ -486,85 +500,131 @@ export function buildChunkGeometry(p: ChunkParams): ChunkMeshData {
   const chunkArcLen = (Math.PI / 2 * radius) / (1 << level);
   const skirtDepth = SKIRT_FACTOR * chunkArcLen;
 
-  // -- Central-difference step sizes ------------------------------------------
-  // cdStep: half a grid step in [0,1] face space.
-  // grid step in [0,1] face coords = 1 / (res * 2^level)
-  const cdStep = 0.5 / (res * (1 << level));
-
-  // arcStep: converts the face-UV step to an arc angle on the unit sphere.
-  // A cube face spans [-1,1] (2 units) which corresponds to π/2 radians.
-  // Therefore: cdStep in [0,1] face coords → cdStep*2 in [-1,1] cube coords
-  // → cdStep*2*(π/2)/2 = cdStep*(π/2) radians of arc.
-  // Using this arc step for sphere-tangent CDs keeps interior normals identical
-  // to the old face-local result (same sampling density, basis-independent normal).
-  const arcStep = cdStep * (Math.PI / 2);
-
-  // Helper: sample height at sphere direction `d` and return the world position.
-  // The direction is `normalize(centerDir + tangent * arcStep)` — already on the sphere.
-  function evalSphereOffset(
-    centerDir: Vector3,
-    tangent: Vector3,
-    step: number,
-    heightFnBound: (d: Vector3) => number,
-    outDir: Vector3,
-    outWorld: Vector3,
-  ): void {
-    outDir.copy(centerDir).addScaledVector(tangent, step).normalize();
-    const h = heightFnBound(outDir);
-    const r = radius + h * heightScale;
-    outWorld.copy(outDir).multiplyScalar(r);
+  // -- Ghost-edge position helper ---------------------------------------------
+  // Computes the ORIGIN-RELATIVE world position of a vertex at grid index
+  // (gi, gj) that may lie one step OUTSIDE the chunk grid (gi=-1, gi=res+1,
+  // gj=-1, or gj=res+1). gridToCubePoint's parameterisation u=(ix+gi/res)*scale
+  // is linear in gi, so an out-of-range index simply extrapolates the face
+  // parameter — landing exactly where the adjacent same-level tile's interior
+  // vertex sits. This lets the border ring use the SAME geometric normal method
+  // as the interior (cross of neighbor positions), with the off-edge "ghost"
+  // neighbor synthesised from the SAME continuous heightFn the neighbor chunk
+  // samples → border-ring discontinuity and same-level seams both vanish.
+  // 1 heightFn eval per call; only border vertices ever need it.
+  function ghostPos(gi: number, gj: number, outWorld: Vector3): void {
+    // _ghostDir is scratch; evalVertex writes the unit dir + world position.
+    evalVertex(basis, level, ix, iy, gi, gj, res, radius, heightScale, hFn, _ghostDir, outWorld);
+    outWorld.x -= originX;
+    outWorld.y -= originY;
+    outWorld.z -= originZ;
   }
 
-  // -- Interior grid --------------------------------------------------------
-  let vi = 0; // vertex write index
+  // -- Interior grid (two-pass) -----------------------------------------------
+  //
+  // Pass 1: compute every vertex's position (and cache height + sphere dir for Pass 2).
+  //         1 heightFn eval per vertex — same as before.
+  // Pass 2: compute normals.
+  //   - Border ring (gi==0||gi==res||gj==0||gj==res): sphere-tangent central-diff
+  //     (UNCHANGED — this is the seam-free path).
+  //   - Interior (gi in [1,res-1], gj in [1,res-1]): normal from 4 grid-neighbor
+  //     positions (0 extra heightFn evals).
+  //         n = normalize( cross( P[gi+1,gj]-P[gi-1,gj],  P[gi,gj+1]-P[gi,gj-1] ) )
+  //     then flipped outward (dot with radial direction > 0).
+  //
+  // This reduces heightFn evals from ~5/vertex to ~1/vertex for interior verts.
+  // Border verts still pay the 4-eval cost, but they are only 4*(res+1)-4 of
+  // the (res+1)^2 total — at res=32 that is 128 of 1089.
 
+  // Scratch caches for the grid (allocated once here, not per-vertex).
+  const hCache   = new Float32Array(gridVerts);       // height per grid vertex
+  const dirCache = new Float32Array(gridVerts * 3);   // unit sphere dir per grid vertex
+
+  // --- Pass 1: positions -------------------------------------------------------
+  let vi = 0; // vertex write index
   for (let gj = 0; gj < gridSize; gj++) {
     for (let gi = 0; gi < gridSize; gi++) {
-      evalVertex(basis, level, ix, iy, gi, gj, res, radius, heightScale, hFn, dir, world);
+      const h = evalVertex(basis, level, ix, iy, gi, gj, res, radius, heightScale, hFn, dir, world);
 
       // Position relative to chunk origin
-      const px = world.x - origin.x;
-      const py = world.y - origin.y;
-      const pz = world.z - origin.z;
-      positions[vi * 3    ] = px;
-      positions[vi * 3 + 1] = py;
-      positions[vi * 3 + 2] = pz;
+      positions[vi * 3    ] = world.x - originX;
+      positions[vi * 3 + 1] = world.y - originY;
+      positions[vi * 3 + 2] = world.z - originZ;
 
-      // Normal via sphere-tangent central differences.
-      // Build an orthonormal tangent frame from the sphere direction `dir` so
-      // that adjacent faces use the same frame at a shared edge vertex → seamless.
-      // Pole fallback: when dir ≈ (0,±1,0) use world X instead of world Y to
-      // avoid a degenerate cross product.
-      if (Math.abs(dir.y) < 0.9) {
-        _tanUp.set(0, 1, 0);
+      // Cache height and sphere direction for Pass 2
+      hCache[vi]          = h;
+      dirCache[vi * 3    ] = dir.x;
+      dirCache[vi * 3 + 1] = dir.y;
+      dirCache[vi * 3 + 2] = dir.z;
+
+      vi++;
+    }
+  }
+
+  // --- Pass 2: normals + colors ------------------------------------------------
+  vi = 0;
+  for (let gj = 0; gj < gridSize; gj++) {
+    for (let gi = 0; gi < gridSize; gi++) {
+      // Restore cached sphere direction and height
+      dir.x = dirCache[vi * 3    ];
+      dir.y = dirCache[vi * 3 + 1];
+      dir.z = dirCache[vi * 3 + 2];
+      const h = hCache[vi];
+
+      const onBorder = gi === 0 || gi === res || gj === 0 || gj === res;
+
+      if (onBorder) {
+        // --- Border: sphere-tangent central differences (UNCHANGED, seam-free) ---
+        if (Math.abs(dir.y) < 0.9) {
+          _tanUp.set(0, 1, 0);
+        } else {
+          _tanUp.set(1, 0, 0);
+        }
+        _tan1.crossVectors(dir, _tanUp).normalize(); // tangent 1 ⊥ dir
+        _tan2.crossVectors(dir, _tan1);              // tangent 2 ⊥ dir ⊥ _tan1 (already unit)
+
+        // Sample displaced surface at ±arcStep along each tangent direction.
+        evalSphereOffset(dir, _tan1, -arcStep, hFn, dirL, worldL);
+        evalSphereOffset(dir, _tan1,  arcStep, hFn, dirR, worldR);
+        evalSphereOffset(dir, _tan2, -arcStep, hFn, dirD, worldD);
+        evalSphereOffset(dir, _tan2,  arcStep, hFn, dirU, worldU);
+
+        // Tangent vectors of the displaced surface
+        tan1.subVectors(worldR, worldL); // ∂pos/∂_tan1 (unnormalized)
+        tan2.subVectors(worldU, worldD); // ∂pos/∂_tan2
+
+        nrm.crossVectors(tan1, tan2).normalize();
+
+        // Ensure outward-facing normal (should agree with sphere dir)
+        if (nrm.dot(dir) < 0) nrm.negate();
       } else {
-        _tanUp.set(1, 0, 0);
+        // --- Interior: cross product from 4 grid-neighbor positions ---------------
+        // Neighbor vertex indices in the flat grid array
+        const idxL = vi - 1;               // (gi-1, gj)
+        const idxR = vi + 1;               // (gi+1, gj)
+        const idxD = vi - gridSize;        // (gi,   gj-1)
+        const idxU = vi + gridSize;        // (gi,   gj+1)
+
+        // Read neighbor positions (origin-relative — offsets cancel in the cross product)
+        worldL.set(positions[idxL * 3], positions[idxL * 3 + 1], positions[idxL * 3 + 2]);
+        worldR.set(positions[idxR * 3], positions[idxR * 3 + 1], positions[idxR * 3 + 2]);
+        worldD.set(positions[idxD * 3], positions[idxD * 3 + 1], positions[idxD * 3 + 2]);
+        worldU.set(positions[idxU * 3], positions[idxU * 3 + 1], positions[idxU * 3 + 2]);
+
+        // Central-difference tangent vectors
+        tan1.subVectors(worldR, worldL); // ∂pos/∂gi direction
+        tan2.subVectors(worldU, worldD); // ∂pos/∂gj direction
+
+        nrm.crossVectors(tan1, tan2).normalize();
+
+        // Ensure outward-facing (dot with radial direction of this vertex > 0)
+        if (nrm.dot(dir) < 0) nrm.negate();
       }
-      _tan1.crossVectors(dir, _tanUp).normalize(); // tangent 1 ⊥ dir
-      _tan2.crossVectors(dir, _tan1);              // tangent 2 ⊥ dir ⊥ _tan1 (already unit)
-
-      // Sample displaced surface at ±arcStep along each tangent direction.
-      evalSphereOffset(dir, _tan1, -arcStep, hFn, dirL, worldL);
-      evalSphereOffset(dir, _tan1,  arcStep, hFn, dirR, worldR);
-      evalSphereOffset(dir, _tan2, -arcStep, hFn, dirD, worldD);
-      evalSphereOffset(dir, _tan2,  arcStep, hFn, dirU, worldU);
-
-      // Tangent vectors of the displaced surface
-      tan1.subVectors(worldR, worldL); // ∂pos/∂_tan1 (unnormalized)
-      tan2.subVectors(worldU, worldD); // ∂pos/∂_tan2
-
-      nrm.crossVectors(tan1, tan2).normalize();
-
-      // Ensure outward-facing normal (should agree with sphere dir)
-      if (nrm.dot(dir) < 0) nrm.negate();
 
       normals[vi * 3    ] = nrm.x;
       normals[vi * 3 + 1] = nrm.y;
       normals[vi * 3 + 2] = nrm.z;
 
-      // Vertex color — re-use the direction already set by evalVertex;
-      // hFn is pre-bound to this chunk's level so the same octave count applies.
-      const h = hFn(dir); // dir is set by evalVertex
+      // Vertex color — slope from dot(normal, sphere dir) same as before
       const slope = 1 - nrm.dot(dir);
       if (hasClimate) {
         const cs = climateFn!(dir, h);
@@ -618,15 +678,15 @@ export function buildChunkGeometry(p: ChunkParams): ChunkMeshData {
   // Also copies plateColor from border vertex when present.
   function emitSkirtVert(borderVI: number): void {
     // Read border vertex world position (origin-relative → add origin back)
-    const bx = positions[borderVI * 3    ] + origin.x;
-    const by = positions[borderVI * 3 + 1] + origin.y;
-    const bz = positions[borderVI * 3 + 2] + origin.z;
+    const bx = positions[borderVI * 3    ] + originX;
+    const by = positions[borderVI * 3 + 1] + originY;
+    const bz = positions[borderVI * 3 + 2] + originZ;
     const len = Math.sqrt(bx * bx + by * by + bz * bz);
     const pullScale = (len - skirtDepth) / len;
 
-    positions[vi * 3    ] = bx * pullScale - origin.x;
-    positions[vi * 3 + 1] = by * pullScale - origin.y;
-    positions[vi * 3 + 2] = bz * pullScale - origin.z;
+    positions[vi * 3    ] = bx * pullScale - originX;
+    positions[vi * 3 + 1] = by * pullScale - originY;
+    positions[vi * 3 + 2] = bz * pullScale - originZ;
 
     // Copy normal and color from border vertex
     normals[vi * 3    ] = normals[borderVI * 3    ];
@@ -717,16 +777,32 @@ export function buildChunkGeometry(p: ChunkParams): ChunkMeshData {
     emitSkirtQuad(border0, border1, skirt0, skirt1);
   }
 
-  // -- Assemble BufferGeometry ---------------------------------------------
+  return { positions, normals, colors, plateColors, indices, originX, originY, originZ };
+}
+
+// ---------------------------------------------------------------------------
+// Main-thread wrapper: raw arrays → BufferGeometry + origin Vector3.
+// ---------------------------------------------------------------------------
+
+export function arraysToGeometry(a: ChunkMeshArrays): ChunkMeshData {
   const geometry = new BufferGeometry();
-  geometry.setAttribute('position',  new BufferAttribute(positions, 3));
-  geometry.setAttribute('normal',    new BufferAttribute(normals,   3));
-  geometry.setAttribute('color',     new BufferAttribute(colors,    3));
-  if (hasPlateColor && plateColors !== null) {
-    geometry.setAttribute('plateColor', new BufferAttribute(plateColors, 3));
+  geometry.setAttribute('position',  new BufferAttribute(a.positions, 3));
+  geometry.setAttribute('normal',    new BufferAttribute(a.normals,   3));
+  geometry.setAttribute('color',     new BufferAttribute(a.colors,    3));
+  if (a.plateColors !== null) {
+    geometry.setAttribute('plateColor', new BufferAttribute(a.plateColors, 3));
   }
-  geometry.setIndex(new BufferAttribute(indices, 1));
+  geometry.setIndex(new BufferAttribute(a.indices, 1));
   geometry.computeBoundingSphere();
 
+  const origin = new Vector3(a.originX, a.originY, a.originZ);
   return { geometry, origin };
+}
+
+// ---------------------------------------------------------------------------
+// Public builder — thin composition of the two above.
+// ---------------------------------------------------------------------------
+
+export function buildChunkGeometry(p: ChunkParams): ChunkMeshData {
+  return arraysToGeometry(computeChunkArrays(p));
 }
