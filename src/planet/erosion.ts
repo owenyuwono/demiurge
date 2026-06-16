@@ -69,10 +69,11 @@ const LAKE_MIN_DEPTH = 0.002
 // Domain-warp constants for query-time grid-alignment suppression
 // ---------------------------------------------------------------------------
 // Amplitude in direction-space radians; 1 erosion cell ≈ 0.006 rad at res 256.
-// 0.012 = ~2 cells — enough to curve channels into organic shapes without
-// blurring fine structure. Low spatial frequency (2 octaves at freq 1.8) bends
-// whole features rather than adding high-freq jitter.
-const WARP_AMP   = 0.012
+// 0.03 = ~5 cells — raised from 0.012 to organically curve the 256²-grid iso-contour
+// bands without a resolution bump. Low spatial frequency (2 octaves at freq 1.8) bends
+// whole features rather than adding high-freq jitter. Determinism holds: warp uses
+// the seeded _warpNoise, identical on main thread and workers.
+const WARP_AMP   = 0.03
 const WARP_FREQ  = 1.8
 const WARP_OCT   = 2
 type Noise3DFn = (x: number, y: number, z: number) => number
@@ -631,8 +632,20 @@ export class Erosion {
       // l. Seam blur (same passes as existing path)
       // -----------------------------------------------------------------------
       erosionDelta = blurField(erosionDelta, 3)
-      const flowAccumBlurredB = blurField(flowAccum, 2)
+      const flowAccumBlurredB = blurField(flowAccum, 4)
       for (let c = 0; c < N; c++) flowAccum[c] = flowAccumBlurredB[c]
+
+      // Blur flowDir components to de-grid warp direction (Fix 3).
+      // Do NOT re-normalize — un-normalized magnitude is the coherence self-fade
+      // signal that prevents swirl/pinwheel artifacts at convergence singularities.
+      const flowDirXBlurredB = blurField(flowDirX, 4)
+      const flowDirYBlurredB = blurField(flowDirY, 4)
+      const flowDirZBlurredB = blurField(flowDirZ, 4)
+      for (let c = 0; c < N; c++) {
+        flowDirX[c] = flowDirXBlurredB[c]
+        flowDirY[c] = flowDirYBlurredB[c]
+        flowDirZ[c] = flowDirZBlurredB[c]
+      }
 
       // Store results
       this.erosionDelta = erosionDelta
@@ -984,13 +997,27 @@ export class Erosion {
       // Step 10 — Seam blur
       //   erosionDelta: 3 passes of 3×3 cross-face box blur (steep valley-edge
       //     ramps from a single pass bilinear-sample into terraces).
-      //   flowAccum: 2 passes so the `acc` feeding vIncision and warp is smoother.
+      //   flowAccum: 4 passes (raised from 2) — broadens the discharge gradient
+      //     from ~600 m to ~1200 m radius so detailAmp varies smoothly and the
+      //     256² grid iso-contour banding (Mechanism A) is suppressed.
+      //   flowDirX/Y/Z: 4 passes to de-grid warp direction (Fix 3 / Mechanism B).
+      //     Do NOT re-normalize — un-normalized magnitude is the coherence self-fade
+      //     signal that prevents swirl/pinwheel artifacts at convergence singularities.
       //   Bake-time cost only — paid once.
       // -----------------------------------------------------------------------
 
       erosionDelta = blurField(erosionDelta, 3)
-      const flowAccumBlurred = blurField(flowAccum, 2)
+      const flowAccumBlurred = blurField(flowAccum, 4)
       for (let c = 0; c < N; c++) flowAccum[c] = flowAccumBlurred[c]
+
+      const flowDirXBlurred = blurField(flowDirX, 4)
+      const flowDirYBlurred = blurField(flowDirY, 4)
+      const flowDirZBlurred = blurField(flowDirZ, 4)
+      for (let c = 0; c < N; c++) {
+        flowDirX[c] = flowDirXBlurred[c]
+        flowDirY[c] = flowDirYBlurred[c]
+        flowDirZ[c] = flowDirZBlurred[c]
+      }
 
       // -----------------------------------------------------------------------
       // Store results

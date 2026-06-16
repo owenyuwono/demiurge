@@ -74,10 +74,10 @@ export const HILL_AMP                 = 0.17   // hill-dissection amplitude
 export const HILL_FREQ                = 8.0    // hill spatial frequency
 export const HILL_OCT                 = 5      // FIXED octave count — level-independent, trivially LOD-invariant
 // Fine detail amplitude (replaces elevation-keyed hillAmp)
-export const CRATON_FLOOR             = 0.18   // min fine-detail amplitude fraction in stable interiors [was 0.12 — raised for more craton texture]
-export const TECT_DETAIL_FBM_BASE     = 0.10   // base fine-detail amplitude (scaled by craton floor + rugged)
+export const CRATON_FLOOR             = 0.22   // min fine-detail amplitude fraction in stable interiors [was 0.18 — raised so bare flats get ≳0.22×0.22×HEIGHT_SCALE ≈ ±58m baseline FBM, visible vs smooth B uplands]
+export const TECT_DETAIL_FBM_BASE     = 0.22   // base fine-detail amplitude (scaled by craton floor + rugged) [was 0.10 — raises max detail amplitude from ~120m to ~264m, meaningful vs ±660m bDelta]
 export const TECT_DETAIL_FBM_SCALE    = 3.2    // fbm frequency scale (unchanged)
-export const TECT_DETAIL_RIDGE        = 0.025  // ridged amplitude on land only [was 0.05 — halved to reduce spiky crease content]
+export const TECT_DETAIL_RIDGE        = 0.025  // ridged amplitude on land only [was 0.05 — halved to reduce spiky crease at convergent boundaries via boundaryRelief/relief; in B-mode relief is gated off so we use 0.05 there — see conditional below]
 export const TECT_DETAIL_RIDGE_SCALE  = 7.0    // ridged frequency scale (unchanged)
 // Broad undulation floor — gentle swells/basins on ALL land (not rugged-gated)
 export const UNDULATION_AMP           = 0.17   // broad swells/basins on all land [raised — plains read too flat]
@@ -90,14 +90,18 @@ export const CRATON_MASK_STR          = 0.70   // undulation tapers to 30% on fu
 export const HILL_FLOOR               = 0.80   // fraction of HILL_AMP always present on land [raised — plains need visible rolling hills]
 // Erosion-steered fine detail (Phase 4)
 // EROSION_WARP_STR: domain-warp magnitude along downhill flow in noise-space units.
-//   0 = isotropic (no steering), ~0.15 = visible gully elongation, keep ≤ 0.3.
-export const EROSION_WARP_STR         = 0.05
+//   0 = isotropic (no steering), ~0.10 = visible gully elongation.
+//   CAPPED AT 0.10 — was previously raised to 0.15 then LOWERED to 0.05 to kill
+//   swirl/pinwheel artifacts at flow-convergence singularities. Raised back to 0.10
+//   (not 0.15) because the un-normalized flowAt magnitude self-fades the warp at
+//   singularities. DO NOT raise above 0.10 — pinwheel artifacts return at 0.15+.
+export const EROSION_WARP_STR         = 0.10
 // EROSION_RIDGED_FLOOR: minimum ridged amplitude fraction on low-discharge interfluves.
 //   1.0 = no discharge deepening (pre-erosion behaviour), 0.0 = fully suppressed.
 export const EROSION_RIDGED_FLOOR     = 0.35
 // EROSION_VINCISION_AMP: peak V-channel depth at full discharge (acc=1, land).
-//   Keep conservative; the macro erosion.deltaAt() already carves the main channel.
-export const EROSION_VINCISION_AMP    = 0.008
+//   [was 0.008 ≈ 10m — invisible vs ±660m bDelta; raised to 0.03 ≈ 36m for readable channel incision]
+export const EROSION_VINCISION_AMP    = 0.03
 
 // Offshore island / skerry band
 export const TECT_ISLAND_AMP          = 0.12
@@ -388,11 +392,6 @@ export function makeTerrainSampler(opts: TerrainSamplerOpts): TerrainSampler {
     const fbmOctaves    = Math.min(Math.max(level + 2, FBM_BASE_OCTAVES),    18)
     const ridgedOctaves = Math.min(Math.max(level - 2, RIDGED_BASE_OCTAVES), 10)
 
-    // ---- Detail FBM: additive-octave formulation for LOD consistency --------
-    // Outer amplitude scales by ruggedness: cratons get a small floor (CRATON_FLOOR),
-    // rugged areas get full detail. Additive-octave loop and MAX_AMP_FBM6 UNCHANGED.
-    const detailAmp = TECT_DETAIL_FBM_BASE * (CRATON_FLOOR + (1 - CRATON_FLOOR) * rugged)
-
     // ---- Phase-4 Steered fine detail (erosion present only) ----------------
     // When an Erosion instance is available we warp the FBM input along the
     // downhill flow direction so ridges/gullies elongate into valleys, and we
@@ -427,6 +426,24 @@ export function makeTerrainSampler(opts: TerrainSamplerOpts): TerrainSampler {
       acc = erosion.accAt(dir)   // 0..1 discharge (pure fn of dir)
     }
 
+    // ---- Detail FBM: additive-octave formulation for LOD consistency --------
+    // Outer amplitude scales by a drainage proxy: max of tectonic ruggedness (convergent
+    // relief) and erosion discharge development when erosion is active.
+    // This re-keys detail to the EROSION/drainage signal so B-mode uplands (where rugged
+    // is near zero because orogenic stamps are gated off) still get meaningful detail in
+    // developed drainage areas.
+    // Smoothstep bounds: 0.30..0.85 match the _ss3(0.30, 0.85, acc) gate used in chan
+    // below, so detail peaks in the same zones. Reuses the already-computed `acc` —
+    // no second accAt call. Pure fn of dir only (acc queries fixed-resolution baked fields).
+    // drainProxy/detailAmp declared HERE — after both `rugged` (line ~329) and `acc`
+    // (set above) — so declaration order is: rugged → acc → drainProxy → detailAmp → FBM.
+    const drainProxy = erosion ? Math.max(rugged, _ss3(0.30, 0.85, acc)) : rugged
+    // Smoothstep drainProxy before applying to detailAmp so the amplitude transition
+    // is C1 across 256² erosion cell edges (Fix 2 / Mechanism A).
+    const detailAmp  = Number.isFinite(drainProxy)
+      ? TECT_DETAIL_FBM_BASE * (CRATON_FLOOR + (1 - CRATON_FLOOR) * _ss3(0.10, 0.70, drainProxy))
+      : TECT_DETAIL_FBM_BASE * CRATON_FLOOR
+
     let fbmValue = 0; let fbmAmp = 1;
     let fbmFreq = 1;
     for (let o = 0; o < fbmOctaves; o++) {
@@ -455,7 +472,11 @@ export function makeTerrainSampler(opts: TerrainSamplerOpts): TerrainSampler {
       ridgedAmp   *= FBM_GAIN;
       ridgedFreq  *= FBM_LAC;
     }
-    const detailRidged = TECT_DETAIL_RIDGE * ridgedScale * (ridgedValue / MAX_AMP_RIDGED4) * _ss3(0, 0.08, c)
+    // In B/erosion mode, relief (orogenic boundary stamps) is gated off, so the original
+    // justification for halving TECT_DETAIL_RIDGE (reduce spiky crease at convergent boundaries)
+    // no longer applies. Use 0.05 when erosion is active, TECT_DETAIL_RIDGE (0.025) otherwise.
+    const ridgeAmp = erosion ? 0.05 : TECT_DETAIL_RIDGE
+    const detailRidged = ridgeAmp * ridgedScale * (ridgedValue / MAX_AMP_RIDGED4) * _ss3(0, 0.08, c)
                        * (0.7 + 0.3 * Math.exp(-scratch.boundaryDist / 0.18))
 
     // ---- V-shaped incision deepened by discharge ----------------------------
