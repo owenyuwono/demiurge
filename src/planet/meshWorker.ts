@@ -16,6 +16,7 @@ import { computeChunkArrays } from './ChunkMesher'
 import { makeTerrainSampler } from './terrainSampler'
 import { Tectonics } from './tectonics'
 import { Climate } from './climate'
+import { Erosion } from './erosion'
 import type { WorkerInMsg, WorkerOutMsg, ReadyMsg, DoneMsg } from './meshProtocol'
 
 // ---------------------------------------------------------------------------
@@ -39,6 +40,7 @@ let sampler: ReturnType<typeof makeTerrainSampler> | null = null
 let RADIUS       = 0
 let HEIGHT_SCALE = 0
 let RES          = 0
+let SEA_LEVEL    = 0
 
 // ---------------------------------------------------------------------------
 // Message handler
@@ -50,24 +52,31 @@ ctx.onmessage = (e: MessageEvent<WorkerInMsg>): void => {
   if (msg.type === 'init') {
     const tectonics = Tectonics.fromBaked(msg.tectonics)
     const climate   = Climate.fromBaked(msg.climate)
+    const erosion   = msg.erosion != null ? Erosion.fromBaked(msg.erosion) : undefined
 
     sampler = makeTerrainSampler({
-      seed:         msg.seed,
-      radius:       msg.radius,
-      heightScale:  msg.heightScale,
-      plateCount:   msg.plateCount,
-      arcDensity:   msg.arcDensity,
-      baseTemp:     msg.baseTemp,
-      atmosphere:   msg.atmosphere,
-      bandCount:    msg.bandCount,
-      axialTiltRad: msg.axialTiltRad,
+      seed:           msg.seed,
+      radius:         msg.radius,
+      heightScale:    msg.heightScale,
+      plateCount:     msg.plateCount,
+      arcDensity:     msg.arcDensity,
+      baseTemp:       msg.baseTemp,
+      atmosphere:     msg.atmosphere,
+      bandCount:      msg.bandCount,
+      axialTiltRad:   msg.axialTiltRad,
+      redistribution: msg.redistribution,
+      greenhouse:     msg.greenhouse,
+      lapseRate:      msg.lapseRate,
       tectonics,
       climate,
+      erosion,
+      bActive:        msg.bActive,
     })
 
     RADIUS       = msg.radius
     HEIGHT_SCALE = msg.heightScale
     RES          = msg.resolution
+    SEA_LEVEL    = msg.seaLevel
 
     const ready: ReadyMsg = { type: 'ready' }
     ctx.postMessage(ready, [])
@@ -84,21 +93,23 @@ ctx.onmessage = (e: MessageEvent<WorkerInMsg>): void => {
       heightFn:     sampler!.heightFn,
       plateColorFn: sampler!.plateColorFn,
       climateFn:    sampler!.climateFn,
-    })
+      erosion:      sampler!.erosion,
+    }, SEA_LEVEL)
 
     const done: DoneMsg = {
-      type:       'done',
-      id:         msg.id,
-      positions:  a.positions.buffer as ArrayBuffer,
-      normals:    a.normals.buffer as ArrayBuffer,
-      colors:     a.colors.buffer as ArrayBuffer,
-      plateColors: a.plateColors ? (a.plateColors.buffer as ArrayBuffer) : null,
-      indices:    a.indices.buffer as ArrayBuffer,
-      originX:    a.originX,
-      originY:    a.originY,
-      originZ:    a.originZ,
-      vertCount:  a.positions.length / 3,
-      indexCount: a.indices.length,
+      type:         'done',
+      id:           msg.id,
+      positions:    a.positions.buffer as ArrayBuffer,
+      normals:      a.normals.buffer as ArrayBuffer,
+      colors:       a.colors.buffer as ArrayBuffer,
+      plateColors:  a.plateColors   ? (a.plateColors.buffer   as ArrayBuffer) : null,
+      climateMoist: a.climateMoist  ? (a.climateMoist.buffer  as ArrayBuffer) : null,
+      indices:      a.indices.buffer as ArrayBuffer,
+      originX:      a.originX,
+      originY:      a.originY,
+      originZ:      a.originZ,
+      vertCount:    a.positions.length / 3,
+      indexCount:   a.indices.length,
     }
 
     const transferList: Transferable[] = [
@@ -109,6 +120,9 @@ ctx.onmessage = (e: MessageEvent<WorkerInMsg>): void => {
     ]
     if (a.plateColors) {
       transferList.push(a.plateColors.buffer)
+    }
+    if (a.climateMoist) {
+      transferList.push(a.climateMoist.buffer)
     }
 
     ctx.postMessage(done, transferList)

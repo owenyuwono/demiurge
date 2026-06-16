@@ -29,6 +29,25 @@ export interface ChunkParams {
    * stays usable standalone.
    */
   climateFn?: (dir: Vector3, height: number) => { temperature: number; moisture: number };
+  /**
+   * optional erosion sampler (pipeline step 9, Phase 3).
+   * When present, land vertices near rivers or inside lake basins receive a
+   * water tint blended over the base biome/elevation color.
+   */
+  erosion?: {
+    /** 0..1 normalized discharge (river-ness) for a unit sphere direction */
+    accAt(dir: Vector3): number;
+    /**
+     * Lake spill elevation for a unit sphere direction.
+     * Returns a SENTINEL value (~-999) where the vertex is NOT inside a lake basin.
+     */
+    lakeAt(dir: Vector3): number;
+    /**
+     * Lake presence mask for a unit sphere direction; bilinear sample of a clean
+     * 0/1 field (no sentinel mixing). Values > 0.5 are inside a lake basin.
+     */
+    lakeMaskAt(dir: Vector3): number;
+  } | null;
 }
 
 export interface ChunkMeshData {
@@ -41,7 +60,8 @@ export interface ChunkMeshArrays {
   positions:   Float32Array;
   normals:     Float32Array;
   colors:      Float32Array;
-  plateColors: Float32Array | null;
+  plateColors:  Float32Array | null;
+  climateMoist: Float32Array | null;
   indices:     Uint32Array;
   originX: number;
   originY: number;
@@ -120,20 +140,25 @@ function evalVertex(
 // below it — deep dark sediment → dark blue, shallow sand → turquoise — naturally, and
 // when the water level is lowered the exposed seabed reads as honest sediment.
 //
-// Band table (e = normalized elevation, 0 = sea level):
+// seaLevel is a normalized elevation value (same units as e, roughly [-1,1]) that
+// is the dynamic waterline. All waterline decisions key off seaLevel, not e=0.
 //
-//  SEABED (e < 0):
-//   e < −0.55          abyssal sediment  #232220  near-black warm grey
-//  −0.55..−0.18        deep sediment     →#3a352c  dark brown-grey
-//  −0.18..−0.045       slope sediment    →#605442  medium brown
-//  −0.045..0           sandy shelf       →#9c8a66  light tan
+// Band table (depth = seaLevel - e when e < seaLevel; haw = e - seaLevel when e >= seaLevel):
 //
-//  LAND (e ≥ 0):
-//   0..0.012           sand          →#b8a36e  beach (blends up from shelf tan)
-//   0.012..0.18        lowland       →#5a7a4a  desaturated green
-//   0.18..0.42         highland      →#8a7a55  brown-tan
-//   0.42..0.62         bare rock     →#7a7060  grey-brown
-//   e > 0.55 (blend)   snow          →#e6e8eb  near-white (full by 0.62)
+//  SEABED (e < seaLevel):
+//   depth > 0.55          abyssal sediment  #232220  near-black warm grey
+//   0.18..0.55            deep sediment     →#3a352c  dark brown-grey
+//   0.045..0.18           slope sediment    →#605442  medium brown
+//   0..0.045              sandy shelf       →#9c8a66  light tan
+//
+//  LAND (e >= seaLevel):
+//   0..0.012              exposed shelf / sediment →#8c7a58  barren beige (drained seabed)
+//                         → transitions to sand beach at haw=0.012
+//   0.012..0.18           sand beach        →#b8a36e
+//   0.012..0.18           lowland           →#5a7a4a  desaturated green
+//   0.18..0.42            highland          →#8a7a55  brown-tan
+//   0.42..0.62            bare rock         →#7a7060  grey-brown
+//   haw > 0.55 (blend)    snow              →#e6e8eb  near-white (full by 0.62)
 //
 //  SLOPE override (land only, slope > 0.22): blend toward rock #6e6a64
 // ---------------------------------------------------------------------------
@@ -146,11 +171,16 @@ function lerp(a: number, b: number, t: number): number {
   return a + (b - a) * t;
 }
 
-function elevationColor(e: number, slope: number, out: Float32Array, base: number): void {
+function elevationColor(e: number, slope: number, seaLevel: number, out: Float32Array, base: number): void {
   let r: number, g: number, b: number;
 
-  if (e < 0) {
+  const belowWater = e < seaLevel;
+
+  if (belowWater) {
     // ---- SEABED (geology, not water — the blue comes from the water shell) -----
+    // depth increases as e drops further below seaLevel
+    const depth = seaLevel - e;
+
     // Abyssal sediment #232220
     const rAby = 0x23 / 255, gAby = 0x22 / 255, bAby = 0x20 / 255;
     // Deep sediment   #3a352c
@@ -160,25 +190,24 @@ function elevationColor(e: number, slope: number, out: Float32Array, base: numbe
     // Sandy shelf  #9c8a66
     const rShf = 0x9c / 255, gShf = 0x8a / 255, bShf = 0x66 / 255;
 
-    if (e < -0.55) {
+    if (depth > 0.55) {
       // pure abyssal
       r = rAby; g = gAby; b = bAby;
-    } else if (e < -0.18) {
-      // abyssal → deep  (window ~0.015 around −0.55)
-      const t = clamp01((e + 0.55) / 0.015);
+    } else if (depth > 0.18) {
+      // abyssal → deep  (window ~0.015 around depth=0.55)
+      const t = clamp01((0.55 - depth) / 0.015);
       r = lerp(rAby, rDep, t);
       g = lerp(gAby, gDep, t);
       b = lerp(bAby, bDep, t);
-    } else if (e < -0.045) {
-      // deep → cont. slope  (window 0.015 around −0.18)
-      const t = clamp01((e + 0.18) / 0.015);
+    } else if (depth > 0.045) {
+      // deep → cont. slope  (window 0.015 around depth=0.18)
+      const t = clamp01((0.18 - depth) / 0.015);
       r = lerp(rDep, rSlp, t);
       g = lerp(gDep, gSlp, t);
       b = lerp(bDep, bSlp, t);
     } else {
-      // cont. slope → shelf  (window 0.015 around −0.045)
-      // but shelf→waterline kept crisp: transition window ≤ 0.004 handled at e≥0
-      const t = clamp01((e + 0.045) / 0.015);
+      // cont. slope → shelf  (window 0.015 around depth=0.045)
+      const t = clamp01((0.045 - depth) / 0.015);
       r = lerp(rSlp, rShf, t);
       g = lerp(gSlp, gShf, t);
       b = lerp(bSlp, bShf, t);
@@ -186,6 +215,11 @@ function elevationColor(e: number, slope: number, out: Float32Array, base: numbe
 
   } else {
     // ---- LAND --------------------------------------------------------
+    // heightAboveWater drives the land palette
+    const haw = e - seaLevel;
+
+    // Exposed shelf / drained seabed #8c7a58  (barren sediment for freshly-exposed basin)
+    const rExp = 0x8c / 255, gExp = 0x7a / 255, bExp = 0x58 / 255;
     // Sand      #b8a36e
     const rSnd = 0xb8 / 255, gSnd = 0xa3 / 255, bSnd = 0x6e / 255;
     // Lowland   #5a7a4a
@@ -197,29 +231,29 @@ function elevationColor(e: number, slope: number, out: Float32Array, base: numbe
     // Snow      #e6e8eb
     const rSnw = 0xe6 / 255, gSnw = 0xe8 / 255, bSnw = 0xeb / 255;
 
-    if (e < 0.012) {
-      // sandy shelf → beach sand, smooth (no crisp waterline — the water shell draws that now)
-      const t = clamp01(e / 0.012);
-      // sandy shelf color at e=0 (matches the seabed branch so the join is seamless)
-      const rShf = 0x9c / 255, gShf = 0x8a / 255, bShf = 0x66 / 255;
-      r = lerp(rShf, rSnd, t);
-      g = lerp(gShf, gSnd, t);
-      b = lerp(bShf, bSnd, t);
-    } else if (e < 0.18) {
-      // sand → lowland (window 0.015 around 0.012)
-      const t = clamp01((e - 0.012) / 0.015);
+    if (haw < 0.012) {
+      // Exposed shelf → beach sand transition
+      // Very small haw = freshly-drained seafloor (barren sediment/beige).
+      // Transitions to beach sand at haw=0.012.
+      const t = clamp01(haw / 0.012);
+      r = lerp(rExp, rSnd, t);
+      g = lerp(gExp, gSnd, t);
+      b = lerp(bExp, bSnd, t);
+    } else if (haw < 0.18) {
+      // sand → lowland (window 0.015 around haw=0.012)
+      const t = clamp01((haw - 0.012) / 0.015);
       r = lerp(rSnd, rLow, t);
       g = lerp(gSnd, gLow, t);
       b = lerp(bSnd, bLow, t);
-    } else if (e < 0.42) {
-      // lowland → highland (window 0.015 around 0.18)
-      const t = clamp01((e - 0.18) / 0.015);
+    } else if (haw < 0.42) {
+      // lowland → highland (window 0.015 around haw=0.18)
+      const t = clamp01((haw - 0.18) / 0.015);
       r = lerp(rLow, rHig, t);
       g = lerp(gLow, gHig, t);
       b = lerp(bLow, bHig, t);
-    } else if (e < 0.62) {
-      // highland → bare rock (window 0.015 around 0.42)
-      const t = clamp01((e - 0.42) / 0.015);
+    } else if (haw < 0.62) {
+      // highland → bare rock (window 0.015 around haw=0.42)
+      const t = clamp01((haw - 0.42) / 0.015);
       r = lerp(rHig, rRck, t);
       g = lerp(gHig, gRck, t);
       b = lerp(bHig, bRck, t);
@@ -227,9 +261,9 @@ function elevationColor(e: number, slope: number, out: Float32Array, base: numbe
       r = rRck; g = gRck; b = bRck;
     }
 
-    // Snow blend: start at 0.55, fully white by 0.62
-    if (e > 0.55) {
-      const snowT = clamp01((e - 0.55) / (0.62 - 0.55));
+    // Snow blend: start at haw=0.55, fully white by haw=0.62
+    if (haw > 0.55) {
+      const snowT = clamp01((haw - 0.55) / (0.62 - 0.55));
       r = lerp(r, rSnw, snowT);
       g = lerp(g, gSnw, snowT);
       b = lerp(b, bSnw, snowT);
@@ -251,15 +285,19 @@ function elevationColor(e: number, slope: number, out: Float32Array, base: numbe
 
 // ---------------------------------------------------------------------------
 // Biome coloring (climate-driven). Used when ChunkParams.climateFn is provided.
-//   - Seabed (e < 0): identical geology palette to elevationColor (verbatim) —
-//     the water shell draws the ocean, climate does not recolor the seabed.
-//   - Land (e ≥ 0): biome chosen from temperature (°C) + moisture (0..1), blended
-//     smoothly (no hard biome edges). Ice/snow where it's cold (caps poles AND
-//     peaks via a temperature-driven snow line), desert where dry, forests/
+//   - Seabed (e < seaLevel): identical geology palette to elevationColor (verbatim)
+//     keyed on depth = seaLevel - e — the water shell draws the ocean color.
+//     Cold seabed (temperature < SNOW_TEMP): rendered as sea ice (white), giving
+//     polar ice caps over the ocean.
+//   - Land (e >= seaLevel): biome chosen from temperature (°C) + moisture (0..1),
+//     blended smoothly (no hard biome edges). Ice/snow where it's cold (caps poles
+//     AND peaks via a temperature-driven snow line), desert where dry, forests/
 //     grassland/tundra otherwise. High elevation trends rocky; cliffs → rock grey.
+//     Very small heightAboveWater (= e - seaLevel) reads as barren exposed-shelf
+//     sediment so a drained ocean basin looks like exposed seabed, not grassland.
 // ---------------------------------------------------------------------------
 
-const SNOW_TEMP = -2;     // °C — below this, land trends to snow/ice (blended over a few °C)
+const SNOW_TEMP = -2;     // °C — below this, land/ocean trends to snow/ice (blended over a few °C)
 const SNOW_BLEND = 5;     // °C window over which snow fades in below SNOW_TEMP
 
 function smoothstepM(e0: number, e1: number, x: number): number {
@@ -272,39 +310,58 @@ export function biomeColor(
   slope: number,
   temperature: number,
   moisture: number,
+  seaLevel: number,
   out: Float32Array,
   base: number,
 ): void {
   let r: number, g: number, b: number;
 
-  if (e < 0) {
-    // ---- SEABED (verbatim copy of elevationColor's seabed branch) -----------
+  const belowWater = e < seaLevel;
+
+  if (belowWater) {
+    // ---- SEABED (geology, keyed on depth below seaLevel) --------------------
+    const depth = seaLevel - e;
+
     const rAby = 0x23 / 255, gAby = 0x22 / 255, bAby = 0x20 / 255;
     const rDep = 0x3a / 255, gDep = 0x35 / 255, bDep = 0x2c / 255;
     const rSlp = 0x60 / 255, gSlp = 0x54 / 255, bSlp = 0x42 / 255;
     const rShf = 0x9c / 255, gShf = 0x8a / 255, bShf = 0x66 / 255;
 
-    if (e < -0.55) {
+    if (depth > 0.55) {
       r = rAby; g = gAby; b = bAby;
-    } else if (e < -0.18) {
-      const t = clamp01((e + 0.55) / 0.015);
+    } else if (depth > 0.18) {
+      const t = clamp01((0.55 - depth) / 0.015);
       r = lerp(rAby, rDep, t);
       g = lerp(gAby, gDep, t);
       b = lerp(bAby, bDep, t);
-    } else if (e < -0.045) {
-      const t = clamp01((e + 0.18) / 0.015);
+    } else if (depth > 0.045) {
+      const t = clamp01((0.18 - depth) / 0.015);
       r = lerp(rDep, rSlp, t);
       g = lerp(gDep, gSlp, t);
       b = lerp(bDep, bSlp, t);
     } else {
-      const t = clamp01((e + 0.045) / 0.015);
+      const t = clamp01((0.045 - depth) / 0.015);
       r = lerp(rSlp, rShf, t);
       g = lerp(gSlp, gShf, t);
       b = lerp(bSlp, bShf, t);
     }
 
+    // --- Sea ice: cold ocean surface → white --------------------------------
+    // Where the ocean surface is cold enough, render it as polar ice.
+    // Blended over the same SNOW_BLEND window as land snow so the transition
+    // looks continuous at the coast.
+    if (temperature < SNOW_TEMP + SNOW_BLEND) {
+      const iceT = 1 - smoothstepM(SNOW_TEMP, SNOW_TEMP + SNOW_BLEND, temperature);
+      const rIce = 0xe8 / 255, gIce = 0xee / 255, bIce = 0xf2 / 255; // slightly blue-white
+      r = lerp(r, rIce, iceT);
+      g = lerp(g, gIce, iceT);
+      b = lerp(b, bIce, iceT);
+    }
+
   } else {
-    // ---- LAND: biome by (temperature, moisture) -----------------------------
+    // ---- LAND: biome by (temperature, moisture), keyed on heightAboveWater --
+    const haw = e - seaLevel;
+
     // Palette (all generic — Earth's look emerges from Earth-like params):
     const sandHot = [0xc2 / 255, 0xa8 / 255, 0x78 / 255];   // hot dry desert
     const sandCold = [0x9a / 255, 0x8c / 255, 0x70 / 255];  // cold dry / rocky steppe
@@ -315,15 +372,12 @@ export function biomeColor(
     const rock = [0x7a / 255, 0x70 / 255, 0x60 / 255];      // bare rock (matches elevationColor)
     const snow = [0xe6 / 255, 0xe8 / 255, 0xeb / 255];      // ice / snow
 
-    // --- 1. Beach sand at the waterline, seamless with the seabed shelf. -----
-    // (kept so coastlines read as sand regardless of biome, like elevationColor)
-    const rShf = 0x9c / 255, gShf = 0x8a / 255, bShf = 0x66 / 255;
+    // Exposed shelf / drained seabed — barren sediment for freshly-exposed basin.
+    // Blends in at very small haw so a drained ocean basin looks like exposed seabed.
+    const rExp = 0x8c / 255, gExp = 0x7a / 255, bExp = 0x58 / 255;
 
     // --- 2. Dry vs vegetated axis -------------------------------------------
     // dryness: 1 when very dry (M→0), 0 once moisture clears the desert line.
-    // Calibrated to the moisture field: desert only below ~0.20 (M≥~0.22 vegetates),
-    // so deserts stay confined to the descending bands + driest deep interiors
-    // instead of swallowing every mid-latitude / continental interior.
     const dry = 1 - smoothstepM(0.14, 0.22, moisture);
     // Within dry: hot deserts vs cold steppe (by temperature).
     const hotDry = smoothstepM(2, 14, temperature);
@@ -332,27 +386,18 @@ export function biomeColor(
     const desertB = lerp(sandCold[2], sandHot[2], hotDry);
 
     // --- 3. Vegetated biome by temperature ----------------------------------
-    // Build along the temperature axis: tundra (cold) → temperate forest (mild)
-    // → tropical (hot). Tropical additionally requires moisture, else it stays
-    // temperate. Smoothstep windows keep the transitions soft (no hard edges).
     const tWarm = smoothstepM(2, 8, temperature);        // 0 cold (tundra), 1 by 8°C (forest)
     const tHot = smoothstepM(18, 24, temperature);       // 0 mild, 1 by 24°C
-    const tropWet = smoothstepM(0.42, 0.58, moisture);   // tropical needs moisture too (rainforest above ~0.45)
+    const tropWet = smoothstepM(0.42, 0.58, moisture);   // tropical needs moisture too
     const tropMix = tHot * tropWet;
-    // mild-end color: temperate forest, pushed toward tropical when hot AND wet.
     const mildR = lerp(temperate[0], tropical[0], tropMix);
     const mildG = lerp(temperate[1], tropical[1], tropMix);
     const mildB = lerp(temperate[2], tropical[2], tropMix);
-    // blend from tundra (cold) up to the mild/hot color as it warms.
     let vegR = lerp(tundra[0], mildR, tWarm);
     let vegG = lerp(tundra[1], mildG, tWarm);
     let vegB = lerp(tundra[2], mildB, tWarm);
 
-    // --- 4. Grassland/steppe for middling moisture (between desert and forest) -
-    // Peaks around M ≈ 0.22..0.40 (the steppe belt just above the desert line),
-    // then fades out as forest takes over by ~0.46; suppressed in true tropical
-    // (hot+wet) regions. Calibrated to the moisture field so a grassland belt sits
-    // between the ±30° deserts and the wetter forested zones.
+    // --- 4. Grassland/steppe for middling moisture --------------------------
     const grassW = smoothstepM(0.20, 0.30, moisture) * (1 - smoothstepM(0.38, 0.48, moisture)) * (1 - tropMix);
     vegR = lerp(vegR, grass[0], grassW);
     vegG = lerp(vegG, grass[1], grassW);
@@ -363,19 +408,20 @@ export function biomeColor(
     g = lerp(vegG, desertG, dry);
     b = lerp(vegB, desertB, dry);
 
-    // --- 6. Beach sand at the immediate waterline ---------------------------
-    if (e < 0.012) {
-      const t = clamp01(e / 0.012);
-      // From shelf sand up to the chosen biome color (so beaches read sandy).
-      r = lerp(rShf, r, t);
-      g = lerp(gShf, g, t);
-      b = lerp(bShf, b, t);
+    // --- 6. Exposed-shelf / beach band at the immediate waterline ----------
+    // haw < 0.012: freshly-exposed seabed sediment (barren beige) blending up
+    // to the biome color. This handles both normal beaches and drained basins.
+    if (haw < 0.012) {
+      const t = clamp01(haw / 0.012);
+      r = lerp(rExp, r, t);
+      g = lerp(gExp, g, t);
+      b = lerp(bExp, b, t);
     }
 
-    // --- 7. High elevation trends rocky -------------------------------------
-    // Above e ≈ 0.5 blend toward bare rock (the T-driven snow below caps peaks).
-    if (e > 0.5) {
-      const rockT = smoothstepM(0.5, 0.72, e);
+    // --- 7. High elevation (keyed on haw) trends rocky ----------------------
+    // Above haw ≈ 0.5 blend toward bare rock (the T-driven snow below caps peaks).
+    if (haw > 0.5) {
+      const rockT = smoothstepM(0.5, 0.72, haw);
       r = lerp(r, rock[0], rockT);
       g = lerp(g, rock[1], rockT);
       b = lerp(b, rock[2], rockT);
@@ -383,7 +429,7 @@ export function biomeColor(
 
     // --- 8. Snow / ice by TEMPERATURE (latitude- AND altitude-dependent) -----
     // T already falls with both latitude and altitude, so this gives polar ice
-    // caps at sea level AND a natural snow line on cold peaks. Blended over a few °C.
+    // caps at sea level AND a natural snow line on cold peaks.
     if (temperature < SNOW_TEMP + SNOW_BLEND) {
       const snowT = 1 - smoothstepM(SNOW_TEMP, SNOW_TEMP + SNOW_BLEND, temperature);
       r = lerp(r, snow[0], snowT);
@@ -409,8 +455,29 @@ export function biomeColor(
 // Pure compute core — all meshing math, no THREE GPU objects (worker-safe).
 // ---------------------------------------------------------------------------
 
-export function computeChunkArrays(p: ChunkParams): ChunkMeshArrays {
-  const { faceIndex, level, ix, iy, resolution: res, radius, heightScale, heightFn, plateColorFn, climateFn } = p;
+// ---------------------------------------------------------------------------
+// Erosion tint constants (tunable by the user).
+//
+// River: muted flowing-water blue #4a6e8a. Kicks in above RIVER_THRESHOLD
+//   (0..1 discharge). Only trunk channels exceed the threshold; RIVER_MAX_BLEND
+//   caps the opacity so the underlying biome still reads through.
+// Lake:  still-water blue #3a5e7a. Applied when lakeMaskAt > 0.5 (clean 0/1 mask,
+//   bilinear-safe). Tint scales by mask value for a soft shoreline fade.
+// ---------------------------------------------------------------------------
+
+const RIVER_THRESHOLD      = 0.78;
+const RIVER_MAX_BLEND      = 0.65;
+const RIVER_R = 0x4a / 255;   // #4a6e8a
+const RIVER_G = 0x6e / 255;
+const RIVER_B = 0x8a / 255;
+
+const LAKE_BLEND           = 0.72;
+const LAKE_R = 0x3a / 255;   // #3a5e7a
+const LAKE_G = 0x5e / 255;
+const LAKE_B = 0x7a / 255;
+
+export function computeChunkArrays(p: ChunkParams, seaLevel: number): ChunkMeshArrays {
+  const { faceIndex, level, ix, iy, resolution: res, radius, heightScale, heightFn, plateColorFn, climateFn, erosion } = p;
   // Convenience: heightFn with level pre-bound — avoids repeating `level` at every call site
   // inside this function (all vertices in a chunk share the same LOD level).
   const hFn = (dir: Vector3): number => heightFn(dir, level);
@@ -450,6 +517,7 @@ export function computeChunkArrays(p: ChunkParams): ChunkMeshArrays {
   const normals      = new Float32Array(totalVerts * 3);
   const colors       = new Float32Array(totalVerts * 3);
   const plateColors  = hasPlateColor ? new Float32Array(totalVerts * 3) : null;
+  const climateMoist = hasClimate    ? new Float32Array(totalVerts)     : null;
   const indices      = new Uint32Array(totalIndices);
 
   // Scratch objects — reused, no per-vertex allocation
@@ -639,9 +707,39 @@ export function computeChunkArrays(p: ChunkParams): ChunkMeshArrays {
       const slope = 1 - nrm.dot(dir);
       if (hasClimate) {
         const cs = climateFn!(dir, h);
-        biomeColor(h, slope, cs.temperature, cs.moisture, colors, vi * 3);
+        biomeColor(h, slope, cs.temperature, cs.moisture, seaLevel, colors, vi * 3);
+        climateMoist![vi] = cs.moisture;
       } else {
-        elevationColor(h, slope, colors, vi * 3);
+        elevationColor(h, slope, seaLevel, colors, vi * 3);
+      }
+
+      // -- Erosion tinting: rivers + lakes (land only, guard on erosion present) --
+      // Applied after biome/elevation color so it overlays cleanly.
+      // Only queries land vertices (seabed already has a full geology palette).
+      if (erosion !== null && erosion !== undefined && h >= seaLevel) {
+        const base3 = vi * 3;
+
+        // River tint: muted flowing-water blue #4a6e8a
+        // Threshold 0.78 — only strong trunk channels read as water; small streams fade.
+        const acc = erosion.accAt(dir);
+        if (acc > RIVER_THRESHOLD) {
+          const riverT = clamp01((acc - RIVER_THRESHOLD) / (1.0 - RIVER_THRESHOLD)) * RIVER_MAX_BLEND;
+          colors[base3    ] = lerp(colors[base3    ], RIVER_R, riverT);
+          colors[base3 + 1] = lerp(colors[base3 + 1], RIVER_G, riverT);
+          colors[base3 + 2] = lerp(colors[base3 + 2], RIVER_B, riverT);
+        }
+
+        // Lake tint: still-water blue #3a5e7a
+        // Keys off the clean 0/1 lake mask (bilinear-safe — no sentinel mixing).
+        // The 0.5 isocontour is the clean shoreline; scale tint by mask for a
+        // soft fade at the shore rather than a hard edge.
+        const lkMask = erosion.lakeMaskAt(dir);
+        if (lkMask > 0.5) {
+          const lakeT = LAKE_BLEND * lkMask;
+          colors[base3    ] = lerp(colors[base3    ], LAKE_R, lakeT);
+          colors[base3 + 1] = lerp(colors[base3 + 1], LAKE_G, lakeT);
+          colors[base3 + 2] = lerp(colors[base3 + 2], LAKE_B, lakeT);
+        }
       }
 
       // Plate color (if provided)
@@ -712,6 +810,11 @@ export function computeChunkArrays(p: ChunkParams): ChunkMeshArrays {
       plateColors[vi * 3    ] = plateColors[borderVI * 3    ];
       plateColors[vi * 3 + 1] = plateColors[borderVI * 3 + 1];
       plateColors[vi * 3 + 2] = plateColors[borderVI * 3 + 2];
+    }
+
+    // Copy climateMoist from border vertex
+    if (hasClimate && climateMoist !== null) {
+      climateMoist[vi] = climateMoist[borderVI];
     }
 
     vi++;
@@ -788,7 +891,7 @@ export function computeChunkArrays(p: ChunkParams): ChunkMeshArrays {
     emitSkirtQuad(border0, border1, skirt0, skirt1);
   }
 
-  return { positions, normals, colors, plateColors, indices, originX, originY, originZ };
+  return { positions, normals, colors, plateColors, climateMoist, indices, originX, originY, originZ };
 }
 
 // ---------------------------------------------------------------------------
@@ -803,6 +906,9 @@ export function arraysToGeometry(a: ChunkMeshArrays): ChunkMeshData {
   if (a.plateColors !== null) {
     geometry.setAttribute('plateColor', new BufferAttribute(a.plateColors, 3));
   }
+  if (a.climateMoist !== null) {
+    geometry.setAttribute('climateMoist', new BufferAttribute(a.climateMoist, 1));
+  }
   geometry.setIndex(new BufferAttribute(a.indices, 1));
   geometry.computeBoundingSphere();
 
@@ -814,6 +920,6 @@ export function arraysToGeometry(a: ChunkMeshArrays): ChunkMeshData {
 // Public builder — thin composition of the two above.
 // ---------------------------------------------------------------------------
 
-export function buildChunkGeometry(p: ChunkParams): ChunkMeshData {
-  return arraysToGeometry(computeChunkArrays(p));
+export function buildChunkGeometry(p: ChunkParams, seaLevel = 0): ChunkMeshData {
+  return arraysToGeometry(computeChunkArrays(p, seaLevel));
 }

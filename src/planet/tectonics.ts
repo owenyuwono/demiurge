@@ -22,7 +22,6 @@ import {
   texelIndex,
   texAng,
   neighborTexel,
-  sampleSmooth,
 } from './cubemap'
 
 // ---------------------------------------------------------------------------
@@ -91,6 +90,7 @@ export interface TectonicQuery {
   crustDist: number     // signed distance: +inside crust, -outside crust (radians)
   paleoDist: number     // radians — distance to nearest fossil/paleo crack boundary
   otherCrustDist: number  // crustDist mirrored to neighbor side (coarse, no fine warp)
+  baseElevation: number   // blurred plate base elevation (smooth across Voronoi boundaries)
 }
 
 export interface Volcano {
@@ -123,7 +123,7 @@ const WARP_OCTAVES = 4
 // Cube-map resolution (private const)
 // ---------------------------------------------------------------------------
 
-const RES = 256
+const RES = 512
 const TOTAL_TEXELS = 6 * RES * RES
 
 // Pre-compute texel-angle constant at RES
@@ -135,7 +135,7 @@ const TEX_ANG = texAng(RES)
 const ARC_CONV_THRESH   = 0.14    // convergence threshold; effective = ARC_CONV_THRESH / arcDensity
 const ARC_OFFSET        = 0.020   // rad — volcanic-front offset onto overriding plate
 const ARC_BAND          = 0.006   // rad — half-width of front band
-const ARC_CRUST_WIDTH   = 0.090   // rad — arc-crust band half-width (wider than ARC_BAND so volcanoes land on crust) [was 0.035 — bumped so arc-land strip survives 3× blur on 256-res cubemap: TEX_ANG≈0.006rad, 3 blurs≈6 texels smoothing, need half-width>6 texels≈0.037rad; 0.090→14 texels half-width, comfortably positive after blur]
+const ARC_CRUST_WIDTH   = 0.090   // rad — arc-crust band half-width (wider than ARC_BAND so volcanoes land on crust) [was 0.035 — bumped so arc-land strip survives blur smoothing; at RES=512: TEX_ANG≈0.003rad, blur σ∝√(passes)·cellSize; 0.090→30 texels half-width, comfortably positive after 12-pass blur]
 const ARC_SPACING       = 0.045   // rad — true min spacing (dart-throwing); effective = ARC_SPACING / arcDensity
 const ARC_MAX           = 2000    // safety cap on total volcanoes
 const ARC_SIZE_SPAN     = 0.25    // convergence span above threshold for convStrength ramp
@@ -1241,6 +1241,22 @@ function blurFieldN(src: Float32Array, n: number): Float32Array {
 }
 
 // ---------------------------------------------------------------------------
+// bakeUpliftField — wide-smoothed signed convergence for broad deformation
+// ---------------------------------------------------------------------------
+/**
+ * Produces a wide-smoothed copy of convField for broad-belt deformation zones.
+ * Algorithm: downsample 512² → 64² per face, apply 3 box-blur passes at 64²,
+ * then bilinear-upsample back to 512². This creates a deformation zone ~8x the
+ * cell width cheaply. Pure arithmetic, fully deterministic.
+ */
+function bakeUpliftField(convField: Float32Array): Float32Array {
+  // Direct full-resolution smooth: convField is already 12-pass blurred.
+  // Apply 3 more passes at 512² via the cross-face-correct blurField.
+  // Target sigma: ~3 cells ≈ 600 m — sharp belts, not 2.5 km blobs.
+  return blurFieldN(convField, 3)
+}
+
+// ---------------------------------------------------------------------------
 // bakeConvShear — pre-bake per-texel convergence and shear
 // ---------------------------------------------------------------------------
 
@@ -1351,10 +1367,13 @@ function bakeConvShear(
     }
   }
 
-  // 3 blur passes — eliminates sign-flip artefacts at gradient saddle points
+  // 12 blur passes — eliminates sign-flip artefacts at gradient saddle points.
+  // Blur radius ∝ √(passes)·cellSize. To preserve the same angular smoothing
+  // when cell size halves (RES=512 vs RES=256), passes must scale 4×: 3→12.
+  // (6 passes at half-cell gives only √(6/3)·0.5 ≈ 0.71× the prior σ — not enough.)
   return {
-    convField:  blurField(blurField(blurField(convField))),
-    shearField: blurField(blurField(blurField(shearField))),
+    convField:  blurFieldN(convField,  12),
+    shearField: blurFieldN(shearField, 12),
   }
 }
 
@@ -1385,6 +1404,8 @@ export interface TectonicsBaked {
   paleoDist: Float32Array
   convField: Float32Array
   shearField: Float32Array
+  upliftField: Float32Array
+  baseElevField: Float32Array
   volPos: Float32Array
   volBaseRadius: Float32Array
   volHeight: Float32Array
@@ -1420,6 +1441,8 @@ export class Tectonics {
   private readonly _paleoDist:  Float32Array  // per-texel distance to paleo crack network (radians)
   private readonly _convField:  Float32Array  // per-texel baked convergence (stable, blurred)
   private readonly _shearField: Float32Array  // per-texel baked shear (stable, blurred)
+  private readonly _upliftField: Float32Array  // per-texel baked wide uplift (blurred convField)
+  private _baseElevField: Float32Array        // per-texel blurred plate base elevation (smooth across Voronoi boundaries)
 
   // Domain-warp noise
   private readonly _warpNoise: (x: number, y: number, z: number) => number
@@ -1434,6 +1457,7 @@ export class Tectonics {
   private readonly _crustScratch  = new Vector3()
   private readonly _fineWarpScratch = new Vector3()
   private readonly _fineCrustScratch = new Vector3()
+  private readonly _fineDistScratch = new Vector3()
 
   // Texel lookup scratch (reused in query)
   private readonly _tex = { face: 0, x: 0, y: 0 }
@@ -1470,7 +1494,7 @@ export class Tectonics {
   // Scratch for _bakeVolcanoes (one-time; preallocated to avoid GC churn during bake)
   private readonly _bakeQueryScratch: TectonicQuery = {
     plateId: 0, neighborId: 0, boundaryDist: 0, convergence: 0,
-    shear: 0, crustDist: 0, paleoDist: 0, otherCrustDist: 0,
+    shear: 0, crustDist: 0, paleoDist: 0, otherCrustDist: 0, baseElevation: 0,
   }
   private readonly _bakeDirScratch = new Vector3()
 
@@ -1480,8 +1504,9 @@ export class Tectonics {
   /** Public accessor: the baked mantle-plume hotspot sources. */
   get hotspots(): readonly Hotspot[] { return this._hotspots }
 
-  constructor(opts: { seed: number; plateCount?: number; arcDensity?: number; hotspotCount?: number; hotspotIntensity?: number }) {
-    const { seed, plateCount = 16, arcDensity: arcDensityRaw = 1.0, hotspotCount: hotspotCountRaw = 6, hotspotIntensity: hotspotIntensityRaw = 1 } = opts
+  constructor(opts: { seed: number; plateCount?: number; arcDensity?: number; hotspotCount?: number; hotspotIntensity?: number; driftScale?: number }) {
+    const _tBakeStart = performance.now()
+    const { seed, plateCount = 16, arcDensity: arcDensityRaw = 1.0, hotspotCount: hotspotCountRaw = 6, hotspotIntensity: hotspotIntensityRaw = 1, driftScale = 1.0 } = opts
     const arcDensity = Math.max(0.2, Math.min(3, arcDensityRaw))
     // Store seed and clamped arcDensity for toBaked() / fromBaked() round-trip
     this._seed             = seed
@@ -1521,11 +1546,14 @@ export class Tectonics {
       this._distField   = nt.distField
       this._convField   = nt.convField
       this._shearField  = nt.shearField
+      this._upliftField = new Float32Array(TOTAL_TEXELS)  // all zeros — no convergence
+      this._baseElevField = new Float32Array(TOTAL_TEXELS)  // all zeros — single plate, no variation
       this._crustDist   = nt.crustDist
       this._paleoDist   = nt.paleoDist
       const _t0 = performance.now()
       this._bakeVolcanoes(seed, arcDensity, this._hotspotCount, this._hotspotIntensity)
       this._volcanoBakeMs = performance.now() - _t0
+      console.log(`tectonic bake ${(performance.now() - _tBakeStart).toFixed(1)}ms`)
       return
     }
 
@@ -1715,7 +1743,7 @@ export class Tectonics {
       const ay = axisRng() * 2 - 1
       const az = axisRng() * 2 - 1
       const axisLen = Math.sqrt(ax * ax + ay * ay + az * az) || 1
-      const speed = 0.4 + speedRng() * 0.6
+      const speed = (0.4 + speedRng() * 0.6) * driftScale
       plateOmX[i] = ax / axisLen * speed
       plateOmY[i] = ay / axisLen * speed
       plateOmZ[i] = az / axisLen * speed
@@ -1728,6 +1756,7 @@ export class Tectonics {
       this._convField  = convField
       this._shearField = shearField
     }
+    this._upliftField = bakeUpliftField(this._convField)
 
     // -------------------------------------------------------------------------
     // Step 6b — Crust mask bake + crust SDF
@@ -1843,7 +1872,6 @@ export class Tectonics {
     // --- Apply crust mask ---
     {
       const tmpDir    = new Vector3()
-      const arcScratch = new Vector3()  // separate scratch for sampleSmooth (must not alias tmpDir)
       const ARC_CONV_THRESH_EFF = ARC_CONV_THRESH / this._arcDensity
       for (let t = 0; t < TOTAL_TEXELS; t++) {
         const face = (t / (RES * RES)) | 0
@@ -1884,7 +1912,7 @@ export class Tectonics {
         // surrounding area becomes coastal plain/shelf.  Runs regardless of own plate
         // type so OO arcs are also covered.  Only adds texels — never clears them.
         if (!crustMask[t]) {
-          const convArc = sampleSmooth(this._convField, tmpDir, RES, arcScratch)
+          const convArc = this._sampleC1(this._convField, tmpDir)
           if (convArc > ARC_CONV_THRESH_EFF) {
             const bd = this._distField[t]
             if (bd >= ARC_OFFSET - ARC_CRUST_WIDTH && bd <= ARC_OFFSET + ARC_CRUST_WIDTH) {
@@ -1976,6 +2004,8 @@ export class Tectonics {
 
     // Light blur removes the Dijkstra 8-connected diagonal artifacts. (The texel staircase
     // that caused blocky coastlines is fixed by BILINEAR sampling at query time, not blur.)
+    // 3 passes intentional — staircase smoothing is delegated to _sampleC1 C1 interpolation,
+    // not extra blur. Don't raise this to match conv/shear; the mechanisms differ.
     this._crustDist = blurFieldN(crustDist, 3)
 
     // -------------------------------------------------------------------------
@@ -2051,6 +2081,7 @@ export class Tectonics {
       }
     }
 
+    // 1 pass (blurField) intentional — staircase smoothing delegated to _sampleC1 C1 sampling.
     this._paleoDist = blurField(paleoDist)
 
     // -------------------------------------------------------------------------
@@ -2095,6 +2126,22 @@ export class Tectonics {
     this.plates = plates
 
     // -------------------------------------------------------------------------
+    // Step 5b — Bake smooth base elevation field
+    // -------------------------------------------------------------------------
+    // Nearest-neighbor baseElevation reads (plates[compId[t]].baseElevation) cause
+    // a hard ~30 m cliff at Voronoi plate boundaries. Blurring the field converts
+    // the pixel-sharp step into a smooth ~1 km gradient that eliminates the seam.
+    // K=6 at 512²: each cell ≈ 177 m → 6 passes ramps transition over ~1 km,
+    // far less than plate scale (tens of km) so plate-to-plate contrast is preserved.
+    {
+      const baseElevRaw = new Float32Array(TOTAL_TEXELS)
+      for (let i = 0; i < TOTAL_TEXELS; i++) {
+        baseElevRaw[i] = plates[this._compId[i]].baseElevation
+      }
+      this._baseElevField = blurFieldN(baseElevRaw, 6)
+    }
+
+    // -------------------------------------------------------------------------
     // Step 7 — convergence + shear fields (hoisted to Step 6a; already assigned)
     // -------------------------------------------------------------------------
     // bakeConvShear was called in Step 6a (before the crust-mask bake) so that
@@ -2106,6 +2153,7 @@ export class Tectonics {
     const _t0 = performance.now();
     this._bakeVolcanoes(seed, arcDensity, this._hotspotCount, this._hotspotIntensity);
     this._volcanoBakeMs = performance.now() - _t0;
+    console.log(`tectonic bake ${(performance.now() - _tBakeStart).toFixed(1)}ms`)
   }
 
   // ---------------------------------------------------------------------------
@@ -2215,7 +2263,8 @@ export class Tectonics {
       }
     }
 
-    // Light blur removes Dijkstra diagonal artifacts (staircase fixed by bilinear sampling).
+    // Light blur removes Dijkstra diagonal artifacts. 3 passes intentional — staircase smoothing
+    // delegated to _sampleC1 C1 sampling, not extra blur. See tectonic path note above.
     const crustDist = blurFieldN(crustDistRaw, 3)
 
     // ---- 3. Single plate ----
@@ -2307,8 +2356,6 @@ export class Tectonics {
 
     const q       = this._bakeQueryScratch
     const dir     = this._bakeDirScratch
-    // Separate scratch vector for sampleSmooth — must not be dir itself
-    const ssScratch = new Vector3()
     const plates  = this.plates
 
     // ---- a. FRONT CANDIDATES ----
@@ -2335,7 +2382,7 @@ export class Tectonics {
           // 0.5× guarantees: any texel accepted by the real gate (conv > thresh) has
           // unwarped conv > thresh×0.5 unless the field is pathologically non-monotone
           // over an 0.08 rad neighbourhood, which the triple-blur ensures it isn't.
-          const convPre = sampleSmooth(this._convField, dir, RES, ssScratch)
+          const convPre = this._sampleC1(this._convField, dir)
           if (convPre < ARC_CONV_THRESH_EFF * 0.5) continue
 
           // Full query at texel-center direction (same warp as all later queries)
@@ -2853,6 +2900,113 @@ export class Tectonics {
   }
 
   // ---------------------------------------------------------------------------
+  // _sampleC1 — C1 smoothstep bilinear sampler (continuous fields only)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Sample a per-texel Float32Array at direction `dir` with C1 continuity.
+   * Mirrors erosion.ts's _sampleC1: identical to sampleSmooth from cubemap.ts
+   * except smoothstep is applied to fractional texel coords before the bilinear lerp:
+   *   fu = fu*fu*(3-2*fu)   fv = fv*fv*(3-2*fv)
+   * This eliminates C0 kinks at cell edges that produce visible boundary staircasing.
+   * NOT safe for sentinel-valued fields (_compId, _neighborId — use direct lookup).
+   * Uses a local scratch object for cross-face neighbors (no module-level state aliasing).
+   */
+  private _sampleC1(data: Float32Array, dir: Vector3): number {
+    const dx = dir.x, dy = dir.y, dz = dir.z
+    const ax = Math.abs(dx)
+    const ay = Math.abs(dy)
+    const az = Math.abs(dz)
+
+    let face: number
+    let sc: number
+    let tc: number
+    let mc: number
+
+    if (ax >= ay && ax >= az) {
+      if (dx > 0) { face = 0; mc = ax; sc =  dz; tc = dy }
+      else        { face = 1; mc = ax; sc = -dz; tc = dy }
+    } else if (ay >= ax && ay >= az) {
+      if (dy > 0) { face = 2; mc = ay; sc = dx; tc =  dz }
+      else        { face = 3; mc = ay; sc = dx; tc = -dz }
+    } else {
+      if (dz > 0) { face = 4; mc = az; sc = -dx; tc = dy }
+      else        { face = 5; mc = az; sc =  dx; tc = dy }
+    }
+
+    const half = RES * 0.5
+    const fx = (sc / mc + 1.0) * half - 0.5
+    const fy = (tc / mc + 1.0) * half - 0.5
+
+    const x0 = Math.floor(fx)
+    const y0 = Math.floor(fy)
+    let fu = fx - x0
+    let fv = fy - y0
+    // smoothstep for C1 continuity — zero slope at cell edges, no kinks
+    fu = fu * fu * (3 - 2 * fu)
+    fv = fv * fv * (3 - 2 * fv)
+
+    const x1 = x0 + 1
+    const y1 = y0 + 1
+
+    let t00: number, t10: number, t01: number, t11: number
+
+    if (x0 >= 0 && y0 >= 0 && x1 < RES && y1 < RES) {
+      const base = face * RES * RES
+      const row0 = base + y0 * RES
+      const row1 = base + y1 * RES
+      t00 = data[row0 + x0]
+      t10 = data[row0 + x1]
+      t01 = data[row1 + x0]
+      t11 = data[row1 + x1]
+    } else {
+      const nb: { face: number; x: number; y: number } = { face: 0, x: 0, y: 0 }
+      const axx = x0 < 0 ? 0 : (x0 >= RES ? RES - 1 : x0)
+      const ayy = y0 < 0 ? 0 : (y0 >= RES ? RES - 1 : y0)
+      const ox0 = (x0 - axx) as -1 | 0 | 1
+      const ox1 = (x1 - axx) as -1 | 0 | 1
+      const oy0 = (y0 - ayy) as -1 | 0 | 1
+      const oy1 = (y1 - ayy) as -1 | 0 | 1
+      neighborTexel(face, axx, ayy, ox0, oy0, RES, nb)
+      t00 = data[texelIndex(nb.face, nb.x, nb.y, RES)]
+      neighborTexel(face, axx, ayy, ox1, oy0, RES, nb)
+      t10 = data[texelIndex(nb.face, nb.x, nb.y, RES)]
+      neighborTexel(face, axx, ayy, ox0, oy1, RES, nb)
+      t01 = data[texelIndex(nb.face, nb.x, nb.y, RES)]
+      neighborTexel(face, axx, ayy, ox1, oy1, RES, nb)
+      t11 = data[texelIndex(nb.face, nb.x, nb.y, RES)]
+    }
+
+    const a = t00 + (t10 - t00) * fu
+    const c = t01 + (t11 - t01) * fu
+    return a + (c - a) * fv
+  }
+
+  /**
+   * Returns the wide-smoothed uplift field value at the given direction.
+   * Positive = convergence zone (broad orogen), negative = divergence zone (broad basin).
+   * Uses the same domain-warp as query() for spatial continuity.
+   */
+  upliftAt(dir: Vector3): number {
+    const wn = this._warpNoise
+    const w  = this._smoothScratch
+
+    const dx = fbm(wn, dir.x + WARP_O1.x, dir.y + WARP_O1.y, dir.z + WARP_O1.z,
+      { octaves: WARP_OCTAVES, frequency: WARP_FREQ })
+    const dy = fbm(wn, dir.x + WARP_O2.x, dir.y + WARP_O2.y, dir.z + WARP_O2.z,
+      { octaves: WARP_OCTAVES, frequency: WARP_FREQ })
+    const dz = fbm(wn, dir.x + WARP_O3.x, dir.y + WARP_O3.y, dir.z + WARP_O3.z,
+      { octaves: WARP_OCTAVES, frequency: WARP_FREQ })
+    w.set(
+      dir.x + WARP_AMP * dx,
+      dir.y + WARP_AMP * dy,
+      dir.z + WARP_AMP * dz,
+    ).normalize()
+
+    return this._sampleC1(this._upliftField, w)
+  }
+
+  // ---------------------------------------------------------------------------
   // query — hot path, zero-alloc
   // ---------------------------------------------------------------------------
 
@@ -2902,14 +3056,23 @@ export class Tectonics {
     const neighborId = Math.min(this._neighborId[idx], this.plates.length - 1)
 
     // --- Smooth boundary distance ---
-    const boundaryDist = sampleSmooth(this._distField, w, RES, this._smoothScratch)
+    // Fine warp for distField: breaks 177m staircase isoline without large profile drift.
+    // Amplitude 0.006 ≈ 3 cells; same noise basis as crustDist warp; frequency 9 = ~2° wavelength.
+    // Seed offsets (3.7, 8.2, 12.9) differ from crustDist (5.1, 7.3, 11.7) so warps are uncorrelated.
+    const _fdw = this._fineDistScratch
+    _fdw.set(
+      w.x + 0.006 * fbm(this._fineWarpNoise, dir.x + 3.7, dir.y + 3.7, dir.z + 3.7, { octaves: 3, frequency: 9 }),
+      w.y + 0.006 * fbm(this._fineWarpNoise, dir.x + 8.2, dir.y + 8.2, dir.z + 8.2, { octaves: 3, frequency: 9 }),
+      w.z + 0.006 * fbm(this._fineWarpNoise, dir.x + 12.9, dir.y + 12.9, dir.z + 12.9, { octaves: 3, frequency: 9 }),
+    ).normalize()
+    const boundaryDist = this._sampleC1(this._distField, _fdw)
 
     // --- Convergence and shear from pre-baked blurred fields ---
     // Sampling the blurred baked fields eliminates the gradient-direction sign-flips
     // that caused cliff artefacts when tHat reversed across saddle points in the
-    // raw distField gradient. The baked fields are blurred 3× at construction time.
-    const convergence = sampleSmooth(this._convField,  w, RES, this._smoothScratch)
-    const shear       = sampleSmooth(this._shearField, w, RES, this._smoothScratch)
+    // raw distField gradient. The baked fields are blurred 6× at construction time.
+    const convergence = this._sampleC1(this._convField,  w)
+    const shear       = this._sampleC1(this._shearField, w)
 
     // --- Gradient-based tHat (unwarped dir) — ONLY used for otherCrustDist mirror ---
     // The gradient is no longer used for convergence/shear; it is only needed to
@@ -2967,7 +3130,10 @@ export class Tectonics {
     out.shear        = shear
 
     // paleoDist: sample using the standard warped direction w
-    out.paleoDist = sampleSmooth(this._paleoDist, w, RES, this._fineWarpScratch)
+    out.paleoDist = this._sampleC1(this._paleoDist, w)
+
+    // baseElevation: blurred per-plate base elevation sampled continuously (no Voronoi step)
+    out.baseElevation = this._sampleC1(this._baseElevField, w)
 
     // Fine warp for coastline complexity — applied ONLY to crustDist sampling
     // Plate/boundary/paleo fields keep using w (plate ownership must not pick up fine warp)
@@ -2981,7 +3147,7 @@ export class Tectonics {
       w.y + 0.025 * fw0y,
       w.z + 0.025 * fw0z,
     ).normalize()
-    out.crustDist = sampleSmooth(this._crustDist, fwDir, RES, this._crustScratch)
+    out.crustDist = this._sampleC1(this._crustDist, fwDir)
 
     // --- otherCrustDist: mirror through boundary to the neighbor side ---
     // Rotate the UNWARPED dir by 2·boundaryDist about the axis (dir × tHat).
@@ -3011,7 +3177,7 @@ export class Tectonics {
           vy * cosT + crossY * sinT + ky * kdotv * (1 - cosT),
           vz * cosT + crossZ * sinT + kz * kdotv * (1 - cosT),
         ).normalize()
-        mirroredCrustDist = sampleSmooth(this._crustDist, mirrorAxis, RES, this._smoothScratch)
+        mirroredCrustDist = this._sampleC1(this._crustDist, mirrorAxis)
       }
     }
     // Blend by gradient strength: weak gradient → mirror equals self (no discontinuous jump)
@@ -3115,6 +3281,8 @@ export class Tectonics {
       paleoDist:        this._paleoDist,
       convField:        this._convField,
       shearField:       this._shearField,
+      upliftField:      this._upliftField,
+      baseElevField:    this._baseElevField,
       volPos:           this._volPos,
       volBaseRadius:    this._volBaseRadius,
       volHeight:        this._volHeight,
@@ -3149,8 +3317,10 @@ export class Tectonics {
     ;(t as any)._neighborId = b.neighborId
     ;(t as any)._crustDist  = b.crustDist
     ;(t as any)._paleoDist  = b.paleoDist
-    ;(t as any)._convField  = b.convField
-    ;(t as any)._shearField = b.shearField
+    ;(t as any)._convField   = b.convField
+    ;(t as any)._shearField  = b.shearField
+    ;(t as any)._upliftField = b.upliftField
+    ;(t as any)._baseElevField = b.baseElevField
 
     // ---- 2. Volcano flat arrays and spatial index ---------------------------
     ;(t as any)._volPos        = b.volPos
@@ -3221,6 +3391,7 @@ export class Tectonics {
     ;(t as any)._crustScratch      = new Vector3()
     ;(t as any)._fineWarpScratch   = new Vector3()
     ;(t as any)._fineCrustScratch  = new Vector3()
+    ;(t as any)._fineDistScratch   = new Vector3()
     ;(t as any)._tex               = { face: 0, x: 0, y: 0 }
     ;(t as any)._gDir0             = new Vector3()
     ;(t as any)._gDir1             = new Vector3()
@@ -3235,7 +3406,7 @@ export class Tectonics {
     ;(t as any)._volScratchTexel   = { face: 0, x: 0, y: 0 }
     ;(t as any)._bakeQueryScratch  = {
       plateId: 0, neighborId: 0, boundaryDist: 0, convergence: 0,
-      shear: 0, crustDist: 0, paleoDist: 0, otherCrustDist: 0,
+      shear: 0, crustDist: 0, paleoDist: 0, otherCrustDist: 0, baseElevation: 0,
     }
     ;(t as any)._bakeDirScratch    = new Vector3()
 
@@ -3275,7 +3446,7 @@ const BR_FLEX_BULGE           = 0.05   // outer flexural bulge amplitude
 const BR_FLEX_POS             = 0.030  // bulge center (rad)
 const BR_FLEX_WIDTH           = 0.012  // bulge width (rad)
 const BR_TRENCH_WIDTH         = 0.020  // trench width (rad)
-const BR_CORD_HEIGHT          = 0.72   // cordillera peak amplitude (Andes) [was 1.30 — de-saturation pass]
+const BR_CORD_HEIGHT          = 0.45   // cordillera peak amplitude (Andes) [was 0.72 — Option C broad uplift takes over]
 const BR_CORD_POS             = 0.038  // cordillera center (rad) [was 0.030]
 const BR_CORD_WIDTH           = 0.024  // cordillera width (rad) [was 0.018] — narrowed: taller crest, smaller footprint
 const BR_CORD_RIDGE           = 0.60   // ridged texture amplitude on cordillera
@@ -3284,12 +3455,12 @@ const BR_SHELF_DIP            = 0.06   // coastal shelf dip amplitude
 const BR_SHELF_WIDTH          = 0.006  // shelf dip width (rad)
 const BR_OO_TRENCH_DEPTH      = 0.50   // OO trench depth
 const BR_OO_TRENCH_WIDTH      = 0.016  // OO trench width
-const BR_ARC_HEIGHT           = 0.55   // island arc peak amplitude (Japan)
+const BR_ARC_HEIGHT           = 0.50   // island arc peak amplitude — high enough to reach the sea-level emergence clamp at gated cone peaks
 const BR_ARC_POS              = 0.026  // arc center (rad)
 const BR_ARC_WIDTH            = 0.014  // arc width (rad)
 const BR_ARC_RIDGE_THRESH     = 0.45   // ridged threshold for discrete islands
 const BR_ARC_RIDGE_SCALE      = 1 / 0.55 // normaliser for arc ridged
-const BR_BELT_HEIGHT          = 0.82   // collision belt amplitude (Himalaya) [was 2.30 — de-saturation pass]
+const BR_BELT_HEIGHT          = 0.52   // collision belt amplitude (Himalaya) [was 0.82 — Option C broad uplift takes over]
 const BR_BELT_WIDTH           = 0.075  // belt width (rad) [was 0.110 — narrower footprint]
 const BR_BELT_RIDGE           = 0.40   // ridged texture amplitude on belt [was 0.55 — trims belt peak to lower patchMax]
 const BR_BELT_RIDGE_BASE      = 0.58   // ridged texture floor [was 0.60 — raised back to hold belt MEAN (prominence)]
@@ -3303,14 +3474,14 @@ const BR_RIDGE_HEIGHT         = 0.22   // mid-ocean ridge amplitude
 const BR_RIDGE_WIDTH          = 0.05   // ridge flank width (rad)
 const BR_NOTCH_DEPTH          = 0.14   // axial rift notch depth
 const BR_NOTCH_WIDTH          = 0.012  // notch half-width (rad)
-const BR_RIFT_SHOULDER        = 0.18   // rift shoulder amplitude
+const BR_RIFT_SHOULDER        = 0.07   // rift shoulder amplitude [was 0.18 — reduced for modest shoulder relief]
 const BR_RIFT_SHOULDER_POS    = 0.022  // shoulder center (rad)
 const BR_RIFT_SHOULDER_WIDTH  = 0.012  // shoulder width (rad)
 const BR_GRABEN_DEPTH         = 0.24   // graben valley depth
 const BR_GRABEN_WIDTH         = 0.020  // graben half-width (rad)
 // Transform
 const BR_SCARP_DEPTH          = 0.10   // fault scarp/valley depth
-const BR_SCARP_WIDTH          = 0.008  // scarp half-width (rad)
+const BR_SCARP_WIDTH          = 0.024  // scarp half-width (rad) [was 0.008 — widened to ~1200m to hide 177m cell staircase]
 const BR_RIDGE2_HEIGHT        = 0.05   // parallel ridging amplitude
 const BR_RIDGE2_POS           = 0.012  // parallel ridge center (rad)
 const BR_RIDGE2_WIDTH         = 0.008  // parallel ridge width (rad)
@@ -3337,6 +3508,7 @@ export function boundaryRelief(
   plates: Plate[],
   dir: Vector3,
   ridgedAt: (dir: Vector3, freq: number, octaves: number) => number,
+  base: number,
 ): number {
   const d    = q.boundaryDist   // radians
   const sideRamp = _ss(0.002, 0.015, d)
@@ -3391,12 +3563,24 @@ export function boundaryRelief(
     relief += wCO * (BR_CORD_HEIGHT  * cp2r * _g(d, BR_CORD_POS, BR_CORD_WIDTH) * ridgeFactor * cordScaleFactor
                     - BR_SHELF_DIP  * cp2r * _g(d, 0.004, BR_SHELF_WIDTH))
 
-    // OO: Japan arc — polarity ramps from 0.5 at the boundary to asymmetric beyond 0.015 rad
+    // OO: island arc (Japan-style) — polarity ramps from 0.5 at the boundary to asymmetric beyond 0.015 rad
     const ooSubduct = 0.5 + ((own.id < other.id ? 1 : 0) - 0.5) * sideRamp
+    // 1a: low-freq along-strike envelope (~125 km features) gates discrete island clusters;
+    //     smooth ramp keeps cluster edges soft and lets a faint submarine arc survive between clusters
+    const arcActivity = ridgedAt(dir, 0.4, 2)  // feature size ≈ RADIUS/0.4 ≈ 125 km
+    const arcClusterGate = _ss(0.45, 0.65, arcActivity)
     const arcRidged = Math.max(0, ridgedAt(dir, 9.0, 4) - BR_ARC_RIDGE_THRESH) * BR_ARC_RIDGE_SCALE
+    // 1b: sea-level emergence clamp — BR_ARC_HEIGHT is large enough for arcRelief to hit the cap at
+    //     strong cone peaks (base≈-0.42 → cap≈0.45), so `base + arcRelief ≈ +0.03` (low island);
+    //     everywhere below the cap arcRelief stays submarine.  SEA_ISLAND_HEADROOM = 0.05 is the
+    //     small extra lift that lets the very tip of a gated cone break the surface.
+    const SEA_MARGIN = 0.02
+    const SEA_ISLAND_HEADROOM = 0.05
+    let arcRelief = BR_ARC_HEIGHT * cp2r * _g(d, BR_ARC_POS, BR_ARC_WIDTH) * arcRidged * arcClusterGate
+    arcRelief = Math.min(arcRelief, Math.max(0, -base - SEA_MARGIN) + SEA_ISLAND_HEADROOM)
     relief += wOO * (
         ooSubduct * (-BR_OO_TRENCH_DEPTH * cp2r * _g(d, 0, BR_OO_TRENCH_WIDTH))
-      + (1 - ooSubduct) * (BR_ARC_HEIGHT * cp2r * _g(d, BR_ARC_POS, BR_ARC_WIDTH) * arcRidged)
+      + (1 - ooSubduct) * arcRelief
     )
 
     // CC: Himalaya / Alps collision belt
@@ -3410,11 +3594,13 @@ export function boundaryRelief(
   }
 
   if (dpr > 0) {
-    // Mid-ocean ridge (oceanic side)
-    relief += (1 - wMine) * (BR_RIDGE_HEIGHT * dpr * _g(d, 0, BR_RIDGE_WIDTH)
-                           - BR_NOTCH_DEPTH  * dpr * _g(d, 0, BR_NOTCH_WIDTH))
+    // Mid-ocean ridge (oceanic side) — stays submarine; ridgeCap suppresses emergence
+    const ridgeCap = 1 - _ss(-0.10, -0.02, base)
+    relief += (1 - wMine) * ridgeCap * (BR_RIDGE_HEIGHT * dpr * _g(d, 0, BR_RIDGE_WIDTH)
+                                       - BR_NOTCH_DEPTH  * dpr * _g(d, 0, BR_NOTCH_WIDTH))
     // East African Rift (continental side)
-    relief += wMine * (BR_RIFT_SHOULDER * dpr * _g(d, BR_RIFT_SHOULDER_POS, BR_RIFT_SHOULDER_WIDTH)
+    const shoulderSuppress = 1 - _ss(0.05, 0.25, base)
+    relief += wMine * (BR_RIFT_SHOULDER * shoulderSuppress * dpr * _g(d, BR_RIFT_SHOULDER_POS, BR_RIFT_SHOULDER_WIDTH)
                      - BR_GRABEN_DEPTH  * dpr * _g(d, 0, BR_GRABEN_WIDTH))
   }
 

@@ -13,10 +13,32 @@ import {
   Quaternion,
 } from 'three'
 import { MeshBasicNodeMaterial } from 'three/webgpu'
-import { attribute, positionWorld, uniform, vec3, saturate } from 'three/tsl'
-import { Tectonics } from './tectonics'
+import {
+  attribute,
+  positionWorld,
+  uniform,
+  vec3,
+  saturate,
+  mix,
+  clamp,
+  dot,
+  normalize,
+  max,
+  sqrt,
+  cross,
+  asin,
+  atan2,
+  sin,
+  cos,
+  fract,
+  step,
+} from 'three/tsl'
+import { Tectonics, TectonicQuery } from './tectonics'
 import { Climate, ClimateSample } from './climate'
+import { Erosion } from './erosion'
 import { makeTerrainSampler } from './terrainSampler'
+import { texelToDir, texelIndex, neighborTexel } from './cubemap'
+import { InteriorParams, DerivedInterior, DEFAULT_INTERIOR, deriveInterior } from './interior'
 import { buildChunkGeometry, arraysToGeometry, ChunkMeshArrays, ChunkMeshData } from './ChunkMesher'
 import { MeshWorkerPool } from './MeshWorkerPool'
 import { QuadtreeNode } from './QuadtreeNode'
@@ -37,7 +59,8 @@ interface PlanetOptions {
   plateCount?: number
   /** Target triangle pixel size for the SSE LOD metric (default 2.5). */
   targetTriPx?: number
-  /** Mean surface temperature, °C-ish, for the climate model (default 15 = Earth). */
+  /** Mean surface temperature, °C-ish, for the climate model (default 15 = Earth).
+   *  Ignored when interior params are active — use interior.surfaceTemp instead. */
   baseTemp?: number
   /** Atmospheric thickness 0..1 — thick shrinks gradients, thin makes extremes (default 0.6). */
   atmosphere?: number
@@ -49,6 +72,15 @@ interface PlanetOptions {
   hotspotCount?: number
   /** Global intensity multiplier for hotspots (default 1). */
   hotspotIntensity?: number
+  /** Interior physics parameters (new 5-root model). Merged over DEFAULT_INTERIOR.
+   *  When present and overrideInterior is false (the default), these drive all
+   *  derived fields (plateCount/arcDensity/hotspotCount/surfaceTemp/atmosphere/etc.)
+   *  via deriveInterior(). */
+  interior?: Partial<InteriorParams>
+  /** When true, ignore the derived interior and use the manual mid-layer knob values
+   *  (manualHeat/manualSurfaceTemp/manualAtmosphere) directly as internalHeat/surfaceTemp/
+   *  atmosphere overrides to deriveInterior(). Defaults to false. */
+  overrideInterior?: boolean
 }
 
 interface Stats {
@@ -141,6 +173,7 @@ const BUILD_BUDGET_MS = 16        // ms/frame ceiling on meshing
 const LRU_CAPACITY = 8192         // res=32: ~38 KB/chunk × 8192 ≈ 311 MB geometry cache ceiling
 const HYSTERESIS = 0.15 // 15% — SSE merge fires at threshold * (1 + HYSTERESIS)
 const EPS_DIST = 0.1    // minimum camera-to-node distance (prevents div-by-zero at contact)
+const DEBUG_TIMING = false        // set true to log bake timings (erosion etc.) to the console
 
 // ---------------------------------------------------------------------------
 // Planet
@@ -183,13 +216,51 @@ export class Planet extends Group {
   private hotspotCount: number
   private hotspotIntensity = 1
 
+  // Interior physics parameters — merged over DEFAULT_INTERIOR at construction.
+  // When overrideInterior is false, deriveInterior(this.interior) drives the tectonic knobs.
+  private interior: InteriorParams
+  private overrideInterior: boolean
+  /** Cached result of the most recent deriveInterior() call — populated in buildHeightFn. */
+  private _derived!: DerivedInterior
+
   // Climate knobs — stored, applied on the next regenerate() (which rebuilds the Climate).
+  // baseTemp and atmosphere are sourced from d.surfaceTemp / d.atmosphere in derived mode;
+  // these fields are kept as fallbacks for legacy callers and the manual override path.
   private baseTemp: number
   private atmosphere: number
   private rotationPeriodS: number
-  private readonly axialTiltDeg: number
+  /** Axial tilt in degrees — live, settable via setAxialTilt(). */
+  private axialTiltDeg: number
+
+  // Manual mid-layer overrides — active when overrideInterior is true.
+  // These pin specific DerivedInterior inputs (passed as overrides to deriveInterior).
+  private manualHeat: number        // 0..1, maps to internalHeat override
+  private manualSurfaceTemp: number // °C, maps to surfaceTemp override
+  private manualAtmosphere: number  // 0..1, maps to atmosphere override
+
+  // Erosion bake parameters — applied on the next buildHeightFn call (triggered by regenerate).
+  /** Cubemap resolution for the erosion bake (128 | 256 | 512). Default 256. */
+  private erosionRes: 128 | 256 | 512
+  /** Multiplier on the incision rate K0. 1.0 = default carve, 0 = no erosion, 3 = heavy. */
+  private erosionStrength: number
+  /** Multiplier on the deposition coefficient G. 1.0 = default, 0 = no deposition, 3 = heavy fans. */
+  private erosionDeposition: number
+  // B (iterated uplift+erode) parameters
+  /** Number of B loop iterations (default 30). */
+  private bSteps: number = 30
+  /** Uplift magnitude per B step in metres (default 40). */
+  private bUpliftRate: number = 40
 
   private heightFn!: (dir: Vector3, level: number) => number
+  /** Erosion instance — set by buildHeightFn, passed to sync-fallback meshing. */
+  private _erosion: Erosion | null = null
+
+  /**
+   * Waterline elevation — normalized units matching heightFn output (~[-1,1]).
+   * Computed once per buildHeightFn via Fibonacci-sphere hypsometry and the
+   * derived oceanCoverage from interior.ts. Shipped to workers via InitMsg.
+   */
+  private _seaLevel = 0
 
   /** Tectonic simulation — rebuilt on regenerate(). */
   tectonics!: Tectonics
@@ -266,6 +337,35 @@ export class Planet extends Group {
   private wireframeActive = false
   private _showVertices = false
 
+  // Climate debug view
+  /** Climate node material — built once in constructor, disposed in dispose(). */
+  private readonly climateMaterial: MeshBasicNodeMaterial
+  private climateViewActive = false
+  private _climateField: 'temperature' | 'moisture' | 'insolation' = 'temperature'
+
+  // Wind debug view
+  /** Wind node material — built once in constructor, disposed in dispose(). */
+  private readonly windMaterial: MeshBasicNodeMaterial
+  private windViewActive = false
+  private _windField: 'flow' | 'speed' | 'direction' = 'flow'
+
+  // Wind material uniforms (all live-updatable via setters; _uPoleAxis is shared with climate)
+  private readonly _uWindBands     = uniform(3)      // N band pairs, initialised from deriveBandCount()
+  private readonly _uWindStrength  = uniform(1)      // global speed multiplier
+  private readonly _uTurbulence    = uniform(0)      // 0 = off, >0 = perturbation strength
+  private readonly _uRetrograde    = uniform(1)      // +1 prograde / -1 retrograde
+  private readonly _uWindTime      = uniform(0)      // per-frame animation clock
+  private readonly _uWindField     = uniform(0)      // 0=flow 1=speed 2=direction
+
+  // Climate material uniforms (all world-frame; live-updatable via setters)
+  private readonly _uSunDir   = uniform(new Vector3(0, 1, 0))   // normalised world sun direction
+  private readonly _uPoleAxis = uniform(new Vector3(0, 1, 0))   // planet pole in world space
+  private readonly _uRedistribution = uniform(0.5)              // 0=day/night 1=latitude field
+  private readonly _uBaseTemp  = uniform(15)                     // °C
+  private readonly _uGreenhouse = uniform(0)                     // °C offset
+  private readonly _uTempRange  = uniform(55)                    // °C equator→pole spread
+  private readonly _uLapseRate  = uniform(50)                    // °C over full height
+
   // Cached inverse world matrix + quaternion for rotation-safe transforms
   // Re-computed each update() call.
   private readonly _invWorldMatrix = new Matrix4()
@@ -315,6 +415,16 @@ export class Planet extends Group {
     this.atmosphere = opts.atmosphere ?? 0.6
     this.rotationPeriodS = opts.rotationPeriodS ?? 600
     this.axialTiltDeg = opts.axialTiltDeg ?? 23.4
+    this.interior = { ...DEFAULT_INTERIOR, ...opts.interior }
+    this.overrideInterior = opts.overrideInterior ?? false
+    // Manual mid-layer defaults — used when overrideInterior is true.
+    this.manualHeat = 0.5
+    this.manualSurfaceTemp = 15
+    this.manualAtmosphere = 0.6
+    // Erosion bake defaults.
+    this.erosionRes = 256
+    this.erosionStrength = 1.0
+    this.erosionDeposition = 1.0
     // Safe fallbacks — caller updates these on the first update() call.
     this._vFovRadians = Math.PI / 3  // 60°
     this._screenHeightPx = 1080
@@ -351,6 +461,17 @@ export class Planet extends Group {
       this.heightmapMaterial.vertexColors = false
     }
 
+    // Climate debug material: unlit, reads per-vertex 'climateMoist' float attribute and
+    // several world-frame uniforms to shade one of three climate fields. A single integer
+    // uniform `uField` selects temperature(0)/moisture(1)/insolation(2) so we need only
+    // one material instance; setClimateField flips `uField` and re-swaps visible meshes.
+    this.climateMaterial = this._buildClimateMaterial()
+
+    // Wind debug material: purely analytical in-shader, no per-vertex attributes.
+    // Defaults: band count from rotation period; strength from equator-pole temp range.
+    // Both are updated after buildHeightFn initialises the climate sim (see below).
+    this.windMaterial = this._buildWindMaterial()
+
     // Pure unlit wireframe: white edges only, no fill, no lighting.
     // When wireframe mode is on, every chunk renders with this material regardless of view mode.
     this.wireMaterial = new MeshBasicMaterial({ color: 0xffffff, wireframe: true })
@@ -359,7 +480,19 @@ export class Planet extends Group {
     // them at a fixed pixel size at any zoom level).
     this.pointsMaterial = new PointsMaterial({ color: 0xffff00, size: 2.5, sizeAttenuation: false })
 
+    // Sync climate uniforms with initial option values.
+    this._uBaseTemp.value     = this.baseTemp
+    this._uRedistribution.value = 0.5
+    this._updatePoleAxis()
+
     this.buildHeightFn(opts.seed)
+
+    // Sync wind uniforms from the rotation/climate systems now that buildHeightFn has run.
+    // bandCount → how many E-W band pairs the shader draws (matches the climate cell count).
+    // uWindStrength is a plain manual gain (default 1); the ΔT→speed coupling is
+    // handled in-shader via effStrength = uWindStrength * (uTempRange / 55).
+    this._uWindBands.value    = this.deriveBandCount()
+    this._uWindStrength.value = 1.0
     this.buildTectonicsDebug(opts.seed)
 
     // Gizmos are seed-independent — built once, never rebuilt on regenerate().
@@ -502,6 +635,163 @@ export class Planet extends Group {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Climate debug view API
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Enable or disable the climate debug view.
+   * Mutually exclusive with the other debug views.
+   */
+  setClimateView(on: boolean): void {
+    this.climateViewActive = on
+    if (on) {
+      this.debugColorsActive   = false
+      this.tectonicsViewActive = false
+      this.tectonicsDebug.visible = false
+      this.heightmapViewActive = false
+    }
+    if (!this.wireframeActive) {
+      for (const [, mesh] of this.visibleMeshes) {
+        mesh.material = this.materialFor(this.levelFromKey(mesh.userData.key as string))
+      }
+    }
+  }
+
+  /**
+   * Switch which climate field is visualised.
+   * Re-applies the material swap so the change is visible immediately.
+   */
+  setClimateField(f: 'temperature' | 'moisture' | 'insolation'): void {
+    this._climateField = f
+    // Flip the field integer uniform that _buildClimateMaterial references.
+    // 0 = temperature, 1 = moisture, 2 = insolation
+    const fieldIndex = f === 'temperature' ? 0 : f === 'moisture' ? 1 : 2
+    ;(this.climateMaterial.userData as { uField?: { value: number } }).uField!.value = fieldIndex
+    // Re-swap visible meshes if the climate view is active so the change shows immediately.
+    if (this.climateViewActive && !this.wireframeActive) {
+      for (const [, mesh] of this.visibleMeshes) {
+        mesh.material = this.climateMaterial
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Wind debug view API
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Enable or disable the wind debug view.
+   * Mutually exclusive with the other debug views (climate/tectonics/heightmap/lod).
+   */
+  setWindView(on: boolean): void {
+    this.windViewActive = on
+    if (on) {
+      this.climateViewActive   = false
+      this.debugColorsActive   = false
+      this.tectonicsViewActive = false
+      this.tectonicsDebug.visible = false
+      this.heightmapViewActive = false
+    }
+    if (!this.wireframeActive) {
+      for (const [, mesh] of this.visibleMeshes) {
+        mesh.material = this.materialFor(this.levelFromKey(mesh.userData.key as string))
+      }
+    }
+  }
+
+  /**
+   * Switch which wind sub-field is visualised.
+   * 'flow' (0) = animated direction+speed streaks (default).
+   * 'speed' (1) = heatmap of wind magnitude.
+   * 'direction' (2) = pure hue-wheel by bearing.
+   * Re-applies material swap so the change is visible immediately.
+   */
+  setWindField(f: 'flow' | 'speed' | 'direction'): void {
+    this._windField = f
+    const idx = f === 'flow' ? 0 : f === 'speed' ? 1 : 2
+    this._uWindField.value = idx
+    if (this.windViewActive && !this.wireframeActive) {
+      for (const [, mesh] of this.visibleMeshes) {
+        mesh.material = this.windMaterial
+      }
+    }
+  }
+
+  /** Global wind speed multiplier. Live — updates uniform immediately. */
+  setWindStrength(n: number): void {
+    this._uWindStrength.value = Math.max(0, n)
+  }
+
+  /** Zonal band-pair count N. Live — updates uniform immediately. */
+  setWindBands(n: number): void {
+    this._uWindBands.value = Math.max(1, n)
+  }
+
+  /** Turbulence perturbation strength. 0 = off. Live — updates uniform immediately. */
+  setTurbulence(n: number): void {
+    this._uTurbulence.value = Math.max(0, n)
+  }
+
+  /**
+   * Rotation direction. +1 = prograde (Earth-like westerlies blow east).
+   * -1 = retrograde (Venus-like; reverses E-W flow). Live — updates uniform immediately.
+   */
+  setRetrograde(b: boolean): void {
+    this._uRetrograde.value = b ? -1 : 1
+  }
+
+  /** Per-frame animation clock for the 'flow' sub-mode. Live — updates uniform immediately. */
+  setWindTime(t: number): void {
+    this._uWindTime.value = t
+  }
+
+  /**
+   * Set the world-space sun direction (normalised). Live — no rebake.
+   * This is the direction FROM the sun (i.e. towards which lit faces point),
+   * stored in world frame so it can be passed directly without conversion.
+   */
+  setSunDir(worldSunDir: Vector3): void {
+    this._uSunDir.value.copy(worldSunDir).normalize()
+  }
+
+  /**
+   * Heat redistribution factor in [0,1].
+   * 0 = pure day/night terminator; 1 = pure latitudinal field.
+   * Live — updates uniform immediately, no rebake.
+   */
+  setRedistribution(n: number): void {
+    this._uRedistribution.value = Math.max(0, Math.min(1, n))
+  }
+
+  /**
+   * Greenhouse offset in °C.
+   * Updates the live uniform immediately. Does NOT trigger regenerate — the caller
+   * is responsible for calling regenerate(seed) via onFinishChange to rebake the
+   * baked biome temperature.
+   */
+  setGreenhouse(n: number): void {
+    this._uGreenhouse.value = n
+  }
+
+  /**
+   * Lapse rate in °C over full normalised terrain height.
+   * Updates the live uniform immediately. Does NOT trigger regenerate — the caller
+   * is responsible for calling regenerate(seed) via onFinishChange to rebake the
+   * baked biome temperature.
+   */
+  setLapseRate(n: number): void {
+    this._uLapseRate.value = n
+  }
+
+  /**
+   * Equator-to-pole temperature spread in °C.
+   * Live — updates uniform immediately, no rebake.
+   */
+  setTempRange(n: number): void {
+    this._uTempRange.value = n
+  }
+
   setFrozen(on: boolean): void {
     this.frozen = on
   }
@@ -561,12 +851,155 @@ export class Planet extends Group {
     this.hotspotIntensity = Math.max(0, Math.min(3, v))
   }
 
+  // ---------------------------------------------------------------------------
+  // Interior physics API
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Merge additional interior parameters into the active InteriorParams and regenerate.
+   * Accepts the new 5-root params: mass, composition, age, insolation, waterBudget.
+   * surfaceTemp is now a derived output — use setManualSurfaceTemp() to pin it directly.
+   */
+  setInteriorParams(p: Partial<InteriorParams>): void {
+    this.interior = { ...this.interior, ...p }
+    this.regenerate(this.seed)
+  }
+
+  /**
+   * Switch between derived-interior mode (false, default) and manual mid-layer override
+   * mode (true). In override mode, manualHeat/manualSurfaceTemp/manualAtmosphere are
+   * passed as internalHeat/surfaceTemp/atmosphere overrides into deriveInterior().
+   * Triggers a full regenerate so the terrain updates immediately.
+   */
+  setOverrideInterior(on: boolean): void {
+    this.overrideInterior = on
+    this.regenerate(this.seed)
+  }
+
+  // ---------------------------------------------------------------------------
+  // Manual mid-layer setters (active when overrideInterior is true)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Set the manual internal heat override in [0..1].
+   * Only active when overrideInterior is true. Triggers regenerate.
+   */
+  setManualHeat(n: number): void {
+    this.manualHeat = Math.max(0, Math.min(1, n))
+    this.regenerate(this.seed)
+  }
+
+  /**
+   * Set the manual surface temperature override in °C.
+   * Only active when overrideInterior is true. Triggers regenerate
+   * and pushes the value to the live _uBaseTemp uniform immediately.
+   */
+  setManualSurfaceTemp(n: number): void {
+    this.manualSurfaceTemp = n
+    this._uBaseTemp.value = n
+    this.regenerate(this.seed)
+  }
+
+  /**
+   * Set the manual atmosphere override in [0..1].
+   * Only active when overrideInterior is true. Triggers regenerate.
+   */
+  setManualAtmosphere(n: number): void {
+    this.manualAtmosphere = Math.max(0, Math.min(1, n))
+    this.regenerate(this.seed)
+  }
+
+  // ---------------------------------------------------------------------------
+  // Erosion tuning API
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Set the erosion bake resolution (128 | 256 | 512).
+   * Stored; takes effect on the next regenerate() call (full rebake).
+   */
+  setErosionRes(n: 128 | 256 | 512): void {
+    this.erosionRes = n
+    this.regenerate(this.seed)
+  }
+
+  /**
+   * Set the erosion incision-rate multiplier (0..3, default 1).
+   * Scales K0 by this factor: 0 = no erosion, 1 = default, 3 = heavy carve.
+   * Stored; takes effect on the next regenerate() call (full rebake).
+   */
+  setErosionStrength(n: number): void {
+    this.erosionStrength = Math.max(0, Math.min(3, n))
+    this.regenerate(this.seed)
+  }
+
+  /**
+   * Set the deposition coefficient multiplier (0..3, default 1).
+   * Scales G by this factor: 0 = no deposition (pure incision), 1 = default, 3 = heavy fans/deltas.
+   * Stored; takes effect on the next regenerate() call (full rebake).
+   */
+  setErosionDeposition(n: number): void {
+    this.erosionDeposition = Math.max(0, Math.min(3, n))
+    this.regenerate(this.seed)
+  }
+
+  /**
+   * Set the number of B (iterated uplift+erode) loop steps.
+   * Clamped to [1, 200]. Takes effect on the next regenerate() call.
+   */
+  setBSteps(n: number): void {
+    this.bSteps = Math.max(1, Math.min(200, Math.round(n)))
+    this.regenerate(this.seed)
+  }
+
+  /**
+   * Set the B uplift rate in metres per step.
+   * Clamped to [0, 500]. Takes effect on the next regenerate() call.
+   */
+  setBUpliftRate(n: number): void {
+    this.bUpliftRate = Math.max(0, Math.min(500, n))
+    this.regenerate(this.seed)
+  }
+
+  /**
+   * Set the axial tilt in degrees. Updates planet.rotation.z, refreshes the pole-axis
+   * uniform, and regenerates so the climate rebuilds with the new axialTiltRad.
+   */
+  setAxialTilt(deg: number): void {
+    this.axialTiltDeg = deg
+    this.rotation.z = (deg * Math.PI) / 180
+    this.refreshPoleAxis()
+    this.regenerate(this.seed)
+  }
+
+  /**
+   * Return the derived interior computed during the most recent buildHeightFn call.
+   * Includes the new Stage-A outputs: gravity, internalHeat, surfaceTemp, atmosphere,
+   * equilibriumTemp (populated by the new interior.ts contract).
+   */
+  getDerivedInterior(): DerivedInterior {
+    return this._derived
+  }
+
+  /**
+   * Return the waterline elevation in normalized units (~[-1,1], same as heightFn output).
+   * Computed once per regenerate() via Fibonacci-sphere hypsometry from oceanCoverage.
+   * Use this to position the water shell or shade land vs. ocean on the GPU.
+   */
+  getSeaLevel(): number {
+    return this._seaLevel
+  }
+
   /**
    * Set the mean surface temperature (°C-ish) for the climate model.
-   * Stored; applied on the next regenerate(seed) (which rebuilds the Climate).
+   * Stored for rebake on the next regenerate(seed).
+   * Also updates the climate material uniform live so the debug view responds instantly.
+   * Note: surfaceTemp is now a derived field — in non-override mode use
+   * setInteriorParams({ insolation: v }) or other roots to influence it indirectly.
+   * In override mode use setManualSurfaceTemp() to pin it directly.
    */
   setBaseTemp(t: number): void {
     this.baseTemp = t
+    this._uBaseTemp.value = t
   }
 
   /**
@@ -648,6 +1081,8 @@ export class Planet extends Group {
     this.buildHeightFn(seed)
     this.buildTectonicsDebug(seed)
     this.tectonicsDebug.visible = debugWasVisible
+    // Refresh pole-axis uniform in case the world matrix changed since construction.
+    this._updatePoleAxis()
 
     this.buildRoots()
   }
@@ -719,6 +1154,8 @@ export class Planet extends Group {
     for (const m of this.debugMaterials) m.dispose()
     this.plateColorMaterial.dispose()
     this.heightmapMaterial.dispose()
+    this.climateMaterial.dispose()
+    this.windMaterial.dispose()
     this.wireMaterial.dispose()
     this.pointsMaterial.dispose()
     this.tectonicsDebug.dispose()
@@ -738,31 +1175,139 @@ export class Planet extends Group {
    * this method is a thin caller that assigns the results to Planet fields.
    */
   private buildHeightFn(seed: number): void {
+    // Derive all physics outputs from the interior root params.
+    // In override mode, pin the three mid-layer fields (internalHeat/surfaceTemp/atmosphere)
+    // to the manual knob values so deriveInterior still runs the full pipeline with those
+    // inputs pinned — plate count, regime, etc. are still derived, not hardcoded.
+    const ov = this.overrideInterior
+      ? {
+          internalHeat: this.manualHeat,
+          surfaceTemp:  this.manualSurfaceTemp,
+          atmosphere:   this.manualAtmosphere,
+        }
+      : undefined
+    const d = deriveInterior(this.interior, ov)
+    this._derived = d
+
+    // Sync the legacy knob fields so external getters remain consistent.
+    this.plateCount       = d.plateCount
+    this.arcDensity       = d.arcDensity
+    this.hotspotCount     = d.hotspotCount
+    this.hotspotIntensity = d.hotspotIntensity
+
+    // Keep the live climate uniform in sync with the derived surface temperature.
+    this._uBaseTemp.value = d.surfaceTemp
+
     const tectonics = new Tectonics({
       seed,
-      plateCount: this.plateCount,
-      arcDensity: this.arcDensity,
-      hotspotCount: this.hotspotCount,
-      hotspotIntensity: this.hotspotIntensity,
+      plateCount: d.plateCount,
+      arcDensity: d.arcDensity,
+      hotspotCount: d.hotspotCount,
+      hotspotIntensity: d.hotspotIntensity,
+      driftScale: d.driftScale,
     })
-    const sampler = makeTerrainSampler({
+
+    // Shared sampler options (without tectonics/climate/erosion — added per step below)
+    const samplerOpts = {
       seed,
       radius: this.radius,
       heightScale: this.heightScale,
-      plateCount: this.plateCount,
-      arcDensity: this.arcDensity,
-      baseTemp: this.baseTemp,
-      atmosphere: this.atmosphere,
+      plateCount: d.plateCount,
+      arcDensity: d.arcDensity,
+      baseTemp: d.surfaceTemp,
+      atmosphere: d.atmosphere,
       bandCount: this.deriveBandCount(),
       axialTiltRad: (this.axialTiltDeg * Math.PI) / 180,
+      driftScale: d.driftScale,
       tectonics,
+    }
+
+    // --- Step 1: build base-only sampler (seed for B; omits orogenic stamps) ---
+    const baseSampler0 = makeTerrainSampler({ ...samplerOpts, baseOnly: true })
+    const climate = baseSampler0.climate
+
+    const EROSION_DEFAULT_K0 = 0.35
+    const EROSION_DEFAULT_G  = 3.0
+
+    // --- Step 2: bake upliftForcing field at B's cubemap resolution ------------
+    // upliftForcing[c] = max(0, tectonics.upliftAt(dirC)) * smoothstep(-0.05, 0.15, crustDist)
+    // This concentrates uplift on continental-crust land cells and avoids ocean uplift.
+    const B_RES   = this.erosionRes
+    const bN      = 6 * B_RES * B_RES
+    const upliftForcing = new Float32Array(bN)
+    {
+      const _bDir     = new Vector3()
+      const _bScratch: TectonicQuery = { plateId:0, neighborId:0, boundaryDist:0, convergence:0, shear:0, crustDist:0, paleoDist:0, otherCrustDist:0, baseElevation:0 }
+      for (let face = 0; face < 6; face++) {
+        for (let y = 0; y < B_RES; y++) {
+          for (let x = 0; x < B_RES; x++) {
+            const c = texelIndex(face, x, y, B_RES)
+            texelToDir(face, x, y, B_RES, _bDir)
+            const u = Math.max(0, tectonics.upliftAt(_bDir))
+            tectonics.query(_bDir, _bScratch)
+            const cd = _bScratch.crustDist
+            // smoothstep(-0.05, 0.15, cd): ramp land only (cd > 0 = land/crust)
+            const t = Math.max(0, Math.min(1, (cd - (-0.05)) / (0.15 - (-0.05))))
+            const gate = t * t * (3 - 2 * t)
+            upliftForcing[c] = u * gate
+          }
+        }
+      }
+    }
+
+    // --- Step 3: bake B (iterated uplift+erode loop) ---------------------------
+    const bakeT0 = performance.now()
+    const erosion = new Erosion({
+      seed,
+      heightFn: baseSampler0.heightFn,
+      climate,
+      oceanCoverage: d.oceanCoverage,
+      res: this.erosionRes,
+      K0:           EROSION_DEFAULT_K0 * this.erosionStrength,
+      depositionG:  EROSION_DEFAULT_G  * this.erosionDeposition,
+      upliftForcing,
+      bSteps:       this.bSteps,
+      bUpliftRate:  this.bUpliftRate,
     })
+    if (DEBUG_TIMING) console.log(`B bake ${(performance.now() - bakeT0).toFixed(1)}ms`)
+
+    // --- Step 4: rebuild final sampler WITH erosion AND bActive -----------------
+    // bActive = true: orogenic stamps are gated off so bDelta owns the elevation budget.
+    const sampler = makeTerrainSampler({ ...samplerOpts, tectonics, climate, erosion, bActive: true })
+
     this.tectonics    = sampler.tectonics
     this.climateSim   = sampler.climate
     this.heightFn     = sampler.heightFn
     this._plateColorFn = sampler.plateColorFn
+    this._erosion     = sampler.erosion
     this.climateFn    = (dir: Vector3, height: number): ClimateSample =>
       this.climateSim.sample(dir, height, this._climateScratch)
+
+    // --- Hypsometry: compute seaLevel from oceanCoverage ----------------------
+    // Runs on the ERODED heightFn so the waterline correctly reflects erosion.
+    // Sample heightFn at N Fibonacci-sphere points at a coarse LOD level (5),
+    // sort ascending, then pick the percentile matching oceanCoverage so that
+    // exactly that fraction of the surface sits at or below the waterline.
+    // N=8192 gives ~0.5° angular spacing — adequate for continent/ocean structure.
+    // This runs once per regenerate on the main thread; workers receive the scalar.
+    {
+      const N = 8192
+      const LOD_LEVEL = 5
+      const goldenAngle = Math.PI * (3 - Math.sqrt(5)) // ~2.399963…
+      const heights = new Float32Array(N)
+      const fibDir = new Vector3()
+      for (let i = 0; i < N; i++) {
+        // Fibonacci sphere: uniform point distribution on unit sphere
+        const y = 1 - (2 * i + 1) / N          // [-1, 1], biased toward ±1 endpoints
+        const r = Math.sqrt(Math.max(0, 1 - y * y))
+        const theta = goldenAngle * i
+        fibDir.set(r * Math.cos(theta), y, r * Math.sin(theta))
+        heights[i] = this.heightFn(fibDir, LOD_LEVEL)
+      }
+      heights.sort()
+      const idx = Math.min(N - 1, Math.floor(d.oceanCoverage * N))
+      this._seaLevel = heights[idx]
+    }
 
     // Tear down any existing pool (handles both constructor first-run and regenerate).
     if (this.pool) {
@@ -778,14 +1323,18 @@ export class Planet extends Group {
         radius: this.radius,
         heightScale: this.heightScale,
         resolution: this.resolution,
-        plateCount: this.plateCount,
-        arcDensity: this.arcDensity,
-        baseTemp: this.baseTemp,
-        atmosphere: this.atmosphere,
+        plateCount: d.plateCount,
+        arcDensity: d.arcDensity,
+        baseTemp: d.surfaceTemp,
+        atmosphere: d.atmosphere,
         bandCount: this.deriveBandCount(),
         axialTiltRad: (this.axialTiltDeg * Math.PI) / 180,
+        driftScale: d.driftScale,
         tectonics: this.tectonics.toBaked(),
         climate: this.climateSim.toBaked(),
+        erosion: erosion.toBaked(),
+        seaLevel: this._seaLevel,
+        bActive: true,
       })
       this.pool.onResult = (key: string, arrays: ChunkMeshArrays) =>
         this.onWorkerResult(key, arrays, gen)
@@ -1203,7 +1752,8 @@ export class Planet extends Group {
           heightFn: this.heightFn,
           plateColorFn: this._plateColorFn,
           climateFn: this.climateFn,
-        })
+          erosion: this._erosion,
+        }, this._seaLevel)
 
         this.geoCache.set(item.key, new CachedMeshData(data))
         built++
@@ -1276,14 +1826,342 @@ export class Planet extends Group {
   }
 
   // ---------------------------------------------------------------------------
+  // Internal: climate material
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Compute the planet pole direction in world space from the axial tilt and
+   * current world matrix. The pole is local +Y rotated by the planet's world
+   * quaternion. Stored into `_uPoleAxis` for the climate material.
+   *
+   * Called once at construction and once on regenerate(). If the planet world
+   * matrix changes (e.g. spin), the caller should call this again to keep the
+   * uniform in sync.
+   */
+  private _updatePoleAxis(): void {
+    // Planet local +Y (the pole in local space — axialTiltDeg is applied to the
+    // planet group itself by the caller, so local +Y is always the pole).
+    const pole = new Vector3(0, 1, 0)
+    this.updateMatrixWorld()
+    pole.transformDirection(this.matrixWorld)
+    this._uPoleAxis.value.copy(pole)
+  }
+
+  /**
+   * Recompute the pole-axis world-space uniform after external transforms (e.g.
+   * after the axial tilt is set in main.ts). Forces the planet root's world matrix
+   * to be current before recomputing so the tilt is reflected immediately.
+   *
+   * Call once after planet.rotation is set. No per-frame call needed — spin
+   * rotates about the pole axis and leaves its world direction invariant.
+   */
+  refreshPoleAxis(): void {
+    this._updatePoleAxis()
+  }
+
+  /**
+   * Build the single climate MeshBasicNodeMaterial.
+   *
+   * Field selection uses an integer uniform (uField) so the same material instance
+   * handles all three modes. setClimateField() mutates uField.value and re-swaps.
+   *
+   * All computation is in world space via positionWorld (same pattern as heightmapMaterial).
+   */
+  private _buildClimateMaterial(): MeshBasicNodeMaterial {
+    // Integer uniform selects the active field: 0=temp, 1=moist, 2=insol.
+    // Stored in mat.userData.uField so setClimateField() can mutate .value at runtime.
+    const uField = uniform(0)
+
+    // -------------------------------------------------------------------------
+    // TSL nodes: geometry-derived values
+    // -------------------------------------------------------------------------
+    const RADIUS_VAL      = this.radius
+    const HEIGHT_SCALE_VAL = this.heightScale
+
+    // dir = normalize(positionWorld), r = |positionWorld|
+    const pWorld = positionWorld
+    const dir    = normalize(pWorld)
+    const r      = pWorld.length()
+
+    // heightFactor in [-1, 1]: 0 at sea level, +1 at full peak height
+    const heightFactor = clamp(
+      r.sub(RADIUS_VAL).div(HEIGHT_SCALE_VAL),
+      -1,
+      1,
+    )
+
+    // climInsol: annual-average latitude insolation (sqrt of sin²lat = |cosLat|, but here
+    // the contract says sqrt(max(0, 1 - dot(dir,poleAxis)²)) which is |sinLat| = cosLat_from_equator)
+    const dotPole     = dot(dir, this._uPoleAxis)
+    const sinLatSq    = max(0, dotPole.mul(dotPole).oneMinus())
+    const climInsol   = sqrt(sinLatSq)
+
+    // instant: day-side insolation
+    const instant = max(0, dot(dir, this._uSunDir))
+
+    // blend: mix(instant, climInsol, R)
+    const blend = mix(instant, climInsol, this._uRedistribution)
+
+    // -------------------------------------------------------------------------
+    // Temperature field (field 0)
+    // -------------------------------------------------------------------------
+    // T = baseTemp + greenhouse + tempRange*(blend - 0.5) - lapseRate*heightFactor
+    // Note: this debug view is illustrative — its gradient (uTempRange) is intentionally
+    // decoupled from the baked biome gradient in climate.ts; they serve different purposes.
+    const T = this._uBaseTemp
+      .add(this._uGreenhouse)
+      .add(this._uTempRange.mul(blend.sub(0.5)))
+      .sub(this._uLapseRate.mul(heightFactor))
+
+    // Map T from [-60, 60] → [0, 1] for ramp input
+    const tNorm = saturate(T.add(60).div(120))
+
+    // Blue→cyan→green→yellow→red ramp (5 stops at t=0,0.25,0.5,0.75,1)
+    const blue   = vec3(0.0, 0.0, 1.0)
+    const cyan   = vec3(0.0, 1.0, 1.0)
+    const green  = vec3(0.0, 0.8, 0.0)
+    const yellow = vec3(1.0, 1.0, 0.0)
+    const red    = vec3(1.0, 0.0, 0.0)
+
+    // Blend across the 4 segments [0,0.25] [0.25,0.5] [0.5,0.75] [0.75,1]
+    const t0 = saturate(tNorm.mul(4))                           // 0..1 over [0,0.25]
+    const t1 = saturate(tNorm.sub(0.25).mul(4))                 // 0..1 over [0.25,0.5]
+    const t2 = saturate(tNorm.sub(0.5).mul(4))                  // 0..1 over [0.5,0.75]
+    const t3 = saturate(tNorm.sub(0.75).mul(4))                 // 0..1 over [0.75,1]
+    const tempColor = mix(
+      mix(mix(blue, cyan, t0), mix(cyan, green, t1), saturate(tNorm.mul(4).sub(1))),
+      mix(mix(green, yellow, t2), mix(yellow, red, t3), saturate(tNorm.mul(4).sub(2))),
+      saturate(tNorm.mul(2).sub(0.5)),
+    )
+
+    // -------------------------------------------------------------------------
+    // Moisture field (field 1) — reads baked per-vertex float attribute
+    // -------------------------------------------------------------------------
+    const moist = attribute('climateMoist', 'float')
+    // Brown(dry) → green(moist) → blue(wet) ramp
+    const brown = vec3(0.55, 0.35, 0.10)
+    const mGreen = vec3(0.15, 0.65, 0.15)
+    const mBlue  = vec3(0.10, 0.40, 0.80)
+    const moistColor = mix(
+      mix(brown, mGreen, saturate(moist.mul(2))),
+      mBlue,
+      saturate(moist.sub(0.5).mul(2)),
+    )
+
+    // -------------------------------------------------------------------------
+    // Insolation field (field 2) — grayscale of blend
+    // -------------------------------------------------------------------------
+    const insolColor = vec3(blend, blend, blend)
+
+    // -------------------------------------------------------------------------
+    // Field selection via integer uniform
+    // We use select() chains: if uField==0 → temp, elif 1 → moist, else insol.
+    // TSL select(cond, a, b) = cond ? a : b
+    // -------------------------------------------------------------------------
+    const uFieldNode = uField
+    const colorNode  = uFieldNode.equal(0)
+      .select(tempColor, uFieldNode.equal(1).select(moistColor, insolColor))
+
+    const mat = new MeshBasicNodeMaterial()
+    mat.colorNode = colorNode
+    mat.vertexColors = false
+
+    // Store the uField uniform reference so setClimateField can mutate it.
+    ;(mat.userData as Record<string, unknown>).uField = uField
+
+    return mat
+  }
+
+  // ---------------------------------------------------------------------------
+  // Internal: wind material
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Build the single wind MeshBasicNodeMaterial.
+   *
+   * All computation is purely analytical in WORLD frame via positionWorld — no
+   * per-vertex attributes needed.  Field selection mirrors _buildClimateMaterial:
+   * an integer uniform (uWindField) picks flow(0)/speed(1)/direction(2).
+   *
+   * Math summary (WORLD frame):
+   *   dir       = normalize(positionWorld)
+   *   sinPhi    = dot(dir, poleAxis)                     // sin(latitude)
+   *   cosPhi    = sqrt(1 - sinPhi²)
+   *   cv        = cross(poleAxis, dir)
+   *   east      = cv / max(length(cv), EPS)              // guarded — no NaN at poles
+   *   north     = cross(dir, east)
+   *   phi       = asin(clamp(sinPhi, -1, 1))
+   *   effStr    = uWindStrength * (uTempRange / 55)      // ΔT coupling live in shader
+   *   u = retrograde * (-sin(2N·phi)) * cosPhi * effStr // zonal (E-W)
+   *   v = 0.3 * cos(2N·phi) * sin(2·phi) * effStr       // meridional (N-S)
+   *   W = u*east + v*north;  speed = length(W)
+   *   windDir   = W / max(speed, EPS)                   // guarded unit wind
+   *   flow phase = fract( dot(positionWorld, windDir)*FREQ - uWindTime*speed*K )
+   *               — streaks advect along the wind spatially (not just pulse in time)
+   */
+  private _buildWindMaterial(): MeshBasicNodeMaterial {
+    // Small epsilon for guarded divides — keeps everything finite at singularities.
+    const EPS = 1e-5
+
+    // -------------------------------------------------------------------------
+    // TSL geometry nodes
+    // -------------------------------------------------------------------------
+    const dir = normalize(positionWorld)
+
+    // -------------------------------------------------------------------------
+    // Latitude-derived scalars
+    // -------------------------------------------------------------------------
+    // sinPhi = dot(dir, poleAxis).  Near poles cosPhi→0, which naturally zeroes
+    // the east tangent contribution before it can degenerate.
+    const sinPhi = dot(dir, this._uPoleAxis)
+    // cosPhi = sqrt(max(0, 1 - sinPhi²))
+    const cosPhi = sqrt(max(0, sinPhi.mul(sinPhi).oneMinus()))
+    // phi = asin(clamp(sinPhi, -1, 1))
+    const phi = asin(clamp(sinPhi, -1, 1))
+
+    // -------------------------------------------------------------------------
+    // Tangent basis: east + north vectors on the sphere surface.
+    // W1 — Pole singularity guard: normalize(cross(poleAxis, dir)) is NaN at the
+    // poles (cross → zero vector).  Use a guarded divide instead so we get a
+    // finite (near-zero) tangent everywhere.
+    // -------------------------------------------------------------------------
+    const cv   = cross(this._uPoleAxis, dir)
+    const east  = cv.div(max(cv.length(), EPS))
+    const north = cross(dir, east)
+
+    // -------------------------------------------------------------------------
+    // N1 — In-shader ΔT→strength coupling.
+    // uWindStrength is a plain manual gain (default 1.0); uTempRange/55 scales
+    // with the equator-pole thermal contrast so warmer planets blow harder.
+    // Changing the climate tempRange slider now updates wind strength live.
+    // -------------------------------------------------------------------------
+    const effStrength = this._uWindStrength.mul(this._uTempRange.div(55.0))
+
+    // -------------------------------------------------------------------------
+    // Zonal (E-W) and meridional (N-S) wind components
+    //   N = uWindBands (float)
+    //   u = retrograde * (-sin(2N·phi)) * cosPhi * effStrength
+    //   v = 0.3 * cos(2N·phi) * sin(2·phi) * effStrength
+    // -------------------------------------------------------------------------
+    const twoNPhi  = phi.mul(this._uWindBands).mul(2)
+    const twoPhi   = phi.mul(2)
+
+    const u = this._uRetrograde
+      .mul(sin(twoNPhi).negate())
+      .mul(cosPhi)
+      .mul(effStrength)
+
+    const v = cos(twoNPhi)
+      .mul(sin(twoPhi))
+      .mul(0.3)
+      .mul(effStrength)
+
+    // -------------------------------------------------------------------------
+    // Wind vector and scalar speed
+    // -------------------------------------------------------------------------
+    const Wx = east.x.mul(u).add(north.x.mul(v))
+    const Wy = east.y.mul(u).add(north.y.mul(v))
+    const Wz = east.z.mul(u).add(north.z.mul(v))
+    const W  = vec3(Wx, Wy, Wz)
+    const speed = W.length()
+
+    // -------------------------------------------------------------------------
+    // Wind angle theta in the east/north tangent frame (atan2(v, u))
+    // -------------------------------------------------------------------------
+    const theta = atan2(v, u)
+
+    // -------------------------------------------------------------------------
+    // Hue-wheel helper: maps angle in radians to an RGB colour.
+    // Uses 3 overlapping cosine segments spanning 0-2π so the wheel is smooth
+    // and fully saturated.
+    //   R = sat(cos(theta))
+    //   G = sat(cos(theta - 2π/3))
+    //   B = sat(cos(theta - 4π/3))
+    // -------------------------------------------------------------------------
+    const TWO_PI_OVER_3  = 2.0943951023931953  // 2π/3
+    const FOUR_PI_OVER_3 = 4.1887902047863905  // 4π/3
+    const hR = saturate(cos(theta))
+    const hG = saturate(cos(theta.sub(TWO_PI_OVER_3)))
+    const hB = saturate(cos(theta.sub(FOUR_PI_OVER_3)))
+    const hueWheel = vec3(hR, hG, hB)
+
+    // Neutral color used where there is effectively no wind.
+    const NEUTRAL = vec3(0.1, 0.1, 0.1)
+
+    // -------------------------------------------------------------------------
+    // W2 — Speed-gate the hue to suppress false color at u=v=0 nodes.
+    // At the equator and cell-boundary latitudes u and v can both be zero, so
+    // atan2(0,0) resolves to 0 → hueWheel(0) paints a false red ring.
+    // Gate: blend to NEUTRAL when speed < EPS.
+    // -------------------------------------------------------------------------
+    const hueGated = mix(NEUTRAL, hueWheel, step(EPS, speed))
+
+    // -------------------------------------------------------------------------
+    // Sub-mode 0: 'flow' — direction hue modulated by animated advecting streaks.
+    // W3 — Genuine spatial advection along the wind direction.
+    //   windDir = W / max(speed, EPS)   (guarded unit wind)
+    //   phase   = fract( dot(positionWorld, windDir)*FREQ - uWindTime*speed*SPEEDK )
+    // dot(positionWorld, windDir) is a real spatial coordinate (positionWorld is
+    // the full-length world position, NOT the unit dir), so the pattern translates
+    // along the wind vector over time.  Streaks crawl eastward in trade winds and
+    // westward in westerly belts.
+    // -------------------------------------------------------------------------
+    const FLOW_FREQ  = 4e-4   // spatial frequency relative to world-space coords
+    const ADVECT_K   = 1.2    // time-advection rate multiplier
+    const windDir    = W.div(max(speed, EPS))   // guarded unit wind; W1-style divide
+    const spatialArg = positionWorld.dot(windDir).mul(FLOW_FREQ)
+    const phaseRaw   = spatialArg.sub(this._uWindTime.mul(speed).mul(ADVECT_K))
+    const phase      = fract(phaseRaw)
+    const streak     = saturate(phase.oneMinus().mul(8).sub(4).oneMinus())  // narrow bright band
+    const flowBrightness = saturate(speed.mul(2)).mul(streak.mul(0.7).add(0.3))
+    const flowColor  = hueGated.mul(flowBrightness)
+
+    // -------------------------------------------------------------------------
+    // Sub-mode 1: 'speed' — heatmap calm(blue)→fast(red)
+    // -------------------------------------------------------------------------
+    const speedNorm = saturate(speed.mul(2))
+    const sBlue   = vec3(0.1, 0.2, 0.9)
+    const sCyan   = vec3(0.0, 0.8, 0.8)
+    const sYellow = vec3(1.0, 0.9, 0.0)
+    const sRed    = vec3(1.0, 0.1, 0.0)
+    const speedColor = mix(
+      mix(sBlue, sCyan, saturate(speedNorm.mul(3))),
+      mix(sYellow, sRed, saturate(speedNorm.sub(0.667).mul(3))),
+      saturate(speedNorm.sub(0.333).mul(3)),
+    )
+
+    // -------------------------------------------------------------------------
+    // Sub-mode 2: 'direction' — pure hue wheel, gated to neutral at no-wind nodes
+    // -------------------------------------------------------------------------
+    const dirColor = hueGated
+
+    // -------------------------------------------------------------------------
+    // Field selection (mirrors _buildClimateMaterial pattern)
+    // -------------------------------------------------------------------------
+    const colorNode = this._uWindField.equal(0)
+      .select(flowColor, this._uWindField.equal(1).select(speedColor, dirColor))
+
+    const mat = new MeshBasicNodeMaterial()
+    mat.colorNode = colorNode
+    mat.vertexColors = false
+    return mat
+  }
+
+  // ---------------------------------------------------------------------------
   // Internal: helpers
   // ---------------------------------------------------------------------------
 
   /**
    * Returns the shared material for a chunk at this level.
-   * View mode priority: tectonics → lodColors → normal.
+   * View mode priority: wind → climate → heightmap → tectonics → lodColors → normal.
    */
   private materialFor(level: number): MeshStandardMaterial | MeshBasicMaterial | MeshBasicNodeMaterial {
+    if (this.windViewActive) {
+      return this.windMaterial
+    }
+    if (this.climateViewActive) {
+      return this.climateMaterial
+    }
     if (this.heightmapViewActive) {
       return this.heightmapMaterial
     }

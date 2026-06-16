@@ -4,6 +4,7 @@
 
 import type { TectonicsBaked } from './tectonics'
 import type { ClimateBaked } from './climate'
+import type { ErosionBaked } from './erosion'
 
 /** main → worker, once on startup: everything needed to rebuild the terrain sampler. */
 export interface InitMsg {
@@ -18,10 +19,29 @@ export interface InitMsg {
   atmosphere: number
   bandCount: number
   axialTiltRad: number
+  redistribution?: number
+  greenhouse?: number
+  lapseRate?: number
+  /** Plate angular velocity multiplier from interior vigor (informational; workers use baked omega). */
+  driftScale?: number
   /** Baked tectonic fields (transferred as a clone — worker reconstructs via Tectonics.fromBaked). */
   tectonics: TectonicsBaked
   /** Baked climate field (worker reconstructs via Climate.fromBaked). */
   climate: ClimateBaked
+  /** Baked erosion field (worker reconstructs via Erosion.fromBaked). */
+  erosion?: ErosionBaked
+  /**
+   * Waterline elevation in the same normalized units as heightFn output (~[-1,1]).
+   * Computed once on the main thread via Fibonacci-sphere hypsometry and shipped
+   * to workers so they never recompute it (determinism guarantee).
+   */
+  seaLevel: number
+  /**
+   * When true, orogenic stamps (broadUplift, plateau, broadDeform, relief) are gated
+   * off so the baked bDelta field owns the elevation budget. Must mirror the flag used
+   * to build the main-thread final sampler — omitting it causes seams.
+   */
+  bActive?: boolean
 }
 
 /** main → worker, per chunk to mesh. resolution is fixed at init, so not repeated here. */
@@ -47,7 +67,7 @@ export interface ReadyMsg {
   type: 'ready'
 }
 
-/** worker → main, a finished chunk. The five buffers are transferred (zero-copy). */
+/** worker → main, a finished chunk. The buffers are transferred (zero-copy). */
 export interface DoneMsg {
   type: 'done'
   id: number
@@ -55,6 +75,7 @@ export interface DoneMsg {
   normals: ArrayBuffer
   colors: ArrayBuffer
   plateColors: ArrayBuffer | null
+  climateMoist: ArrayBuffer | null
   indices: ArrayBuffer
   originX: number
   originY: number

@@ -50,6 +50,12 @@ export interface ClimateParams {
   bandCount: number
   /** Axial tilt in radians — drives the > 54° insolation inversion. */
   axialTiltRad: number
+  /** Heat redistribution R ∈ [0,1]: 0 = instant day/night extremes, 1 = fully climatological (uniform). Used only by temperatureLiveAt. Default 1. */
+  redistribution?: number
+  /** Greenhouse offset in °C added to baseTemp across the whole surface. Default 0. */
+  greenhouse?: number
+  /** Lapse rate: °C lost over the full normalized terrain height (replaces LAPSE_PER_HEIGHT). Default 50. */
+  lapseRate?: number
 }
 
 export interface ClimateSample {
@@ -76,6 +82,9 @@ export interface ClimateBaked {
   atmosphere: number
   bandCount: number
   axialTiltRad: number
+  redistribution?: number
+  greenhouse?: number
+  lapseRate?: number
 }
 
 interface ClimateDeps {
@@ -180,6 +189,9 @@ export class Climate {
   private readonly atmosphere: number
   private readonly bandCount: number
   private readonly axialTiltRad: number
+  private readonly redistribution: number
+  private readonly greenhouse: number
+  private readonly lapseRate: number
 
   /** Precomputed tilt-inversion blend (0 = normal gradient, 1 = fully pole-favouring). */
   private readonly invertBlend: number
@@ -208,6 +220,9 @@ export class Climate {
     this.atmosphere = clamp01(opts.atmosphere)
     this.bandCount = Math.max(1, Math.round(opts.bandCount))
     this.axialTiltRad = opts.axialTiltRad
+    this.redistribution = clamp01(opts.redistribution ?? 1)
+    this.greenhouse = opts.greenhouse ?? 0
+    this.lapseRate = opts.lapseRate ?? LAPSE_PER_HEIGHT
 
     // Tilt inversion: above ≈54° poles receive more annual insolation than the
     // equator, flipping the gradient. Blend in smoothly to 75°.
@@ -240,25 +255,56 @@ export class Climate {
   // -------------------------------------------------------------------------
 
   /**
-   * Latitude insolation profile in [0,1] (1 = warmest band, 0 = coldest band).
+   * Climatological (latitude-average) insolation in [0,1] (1 = warmest band, 0 = coldest band).
    * Normal tilt: cosLat (warm equator). Extreme tilt: blends toward |dir.y|
    * (warm poles). `cosLat` is passed in to avoid recomputing the sqrt.
+   * This is the single source of truth for the baked/deterministic temperature path.
    */
-  private latProfile(absY: number, cosLat: number): number {
+  private climatologicalInsolation(absY: number, cosLat: number): number {
     // normal = warm equator (cosLat); inverted = warm pole (|sin lat| = |dir.y|).
     return cosLat * (1 - this.invertBlend) + absY * this.invertBlend
   }
 
   /**
-   * Temperature at a unit dir and normalized terrain height.
+   * Instantaneous insolation at `dir` given a sun direction — simple Lambertian
+   * dot product clamped to [0,1]. Both vectors must be unit length.
+   * Used only by temperatureLiveAt; never reaches the baked/deterministic path.
+   */
+  private instantaneousInsolation(dir: Vector3, sunDir: Vector3): number {
+    const d = dir.x * sunDir.x + dir.y * sunDir.y + dir.z * sunDir.z
+    return d < 0 ? 0 : d
+  }
+
+  /**
+   * Climatological temperature at a unit dir and normalized terrain height.
    * baseTemp is the area-mean; equator ≈ baseTemp + ~half gradient, pole ≈ baseTemp − ~half gradient.
+   * greenhouse shifts the whole surface up; lapseRate replaces the old LAPSE_PER_HEIGHT constant.
+   * Does NOT read redistribution or sunDir — stays deterministic for baked moisture + biomes.
    */
   private temperatureAt(dir: Vector3, height: number): number {
     const absY = Math.abs(dir.y)
     const cosLat = Math.sqrt(Math.max(0, 1 - dir.y * dir.y))
-    const lat = this.latProfile(absY, cosLat)
-    const lapse = LAPSE_PER_HEIGHT * Math.max(0, height) * this.lapseFactor
-    return this.baseTemp + this.gradient * (lat - LAT_MEAN) - lapse
+    const lat = this.climatologicalInsolation(absY, cosLat)
+    const lapse = this.lapseRate * Math.max(0, height) * this.lapseFactor
+    return this.baseTemp + this.greenhouse + this.gradient * (lat - LAT_MEAN) - lapse
+  }
+
+  /**
+   * Live temperature at a unit dir and normalized terrain height, blended toward
+   * the instantaneous (time-of-day) insolation by `redistribution`.
+   * redistribution=1 → pure climatological (same as temperatureAt).
+   * redistribution=0 → pure instantaneous (day/night extremes).
+   * This is the canonical live model for future wind/CPU use. Zero-alloc.
+   */
+  temperatureLiveAt(dir: Vector3, height: number, sunDir: Vector3): number {
+    const absY = Math.abs(dir.y)
+    const cosLat = Math.sqrt(Math.max(0, 1 - dir.y * dir.y))
+    const climatoIns = this.climatologicalInsolation(absY, cosLat)
+    const instantIns = this.instantaneousInsolation(dir, sunDir)
+    const r = this.redistribution
+    const blendedIns = instantIns * (1 - r) + climatoIns * r
+    const lapse = this.lapseRate * Math.max(0, height) * this.lapseFactor
+    return this.baseTemp + this.greenhouse + this.gradient * (blendedIns - LAT_MEAN) - lapse
   }
 
   // -------------------------------------------------------------------------
@@ -441,6 +487,9 @@ export class Climate {
       atmosphere: this.atmosphere,
       bandCount: this.bandCount,
       axialTiltRad: this.axialTiltRad,
+      redistribution: this.redistribution,
+      greenhouse: this.greenhouse,
+      lapseRate: this.lapseRate,
     }
   }
 
@@ -462,6 +511,9 @@ export class Climate {
     ;(c as unknown as Record<string, unknown>)['atmosphere'] = b.atmosphere
     ;(c as unknown as Record<string, unknown>)['bandCount'] = b.bandCount
     ;(c as unknown as Record<string, unknown>)['axialTiltRad'] = b.axialTiltRad
+    ;(c as unknown as Record<string, unknown>)['redistribution'] = b.redistribution ?? 1
+    ;(c as unknown as Record<string, unknown>)['greenhouse'] = b.greenhouse ?? 0
+    ;(c as unknown as Record<string, unknown>)['lapseRate'] = b.lapseRate ?? LAPSE_PER_HEIGHT
 
     // --- sampler derived scalars (same formulas as constructor lines 195-214) ---
     const atm = b.atmosphere

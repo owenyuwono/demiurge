@@ -189,16 +189,19 @@ export class MeshWorkerPool {
     // Reconstruct ChunkMeshArrays from the transferred buffers.
     const { vertCount, indexCount } = msg
     const arrays: ChunkMeshArrays = {
-      positions:   new Float32Array(msg.positions,  0, vertCount * 3),
-      normals:     new Float32Array(msg.normals,     0, vertCount * 3),
-      colors:      new Float32Array(msg.colors,      0, vertCount * 3),
-      plateColors: msg.plateColors !== null
+      positions:    new Float32Array(msg.positions,  0, vertCount * 3),
+      normals:      new Float32Array(msg.normals,     0, vertCount * 3),
+      colors:       new Float32Array(msg.colors,      0, vertCount * 3),
+      plateColors:  msg.plateColors !== null
         ? new Float32Array(msg.plateColors, 0, vertCount * 3)
         : null,
-      indices:     new Uint32Array(msg.indices,      0, indexCount),
-      originX:     msg.originX,
-      originY:     msg.originY,
-      originZ:     msg.originZ,
+      climateMoist: msg.climateMoist !== null
+        ? new Float32Array(msg.climateMoist, 0, vertCount)
+        : null,
+      indices:      new Uint32Array(msg.indices,      0, indexCount),
+      originX:      msg.originX,
+      originY:      msg.originY,
+      originZ:      msg.originZ,
     }
 
     // Deliver result unless the key was cancelled or no handler is set.

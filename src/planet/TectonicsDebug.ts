@@ -167,7 +167,7 @@ export class TectonicsDebug extends Group {
     // Reused scratch for query() — avoids a fresh allocation per arrow.
     // Using the real warped+weighted ownership keeps field-arrow colors
     // consistent with the terrain's painted plate regions near boundaries.
-    const _scratch: TectonicQuery = { plateId: 0, neighborId: 0, boundaryDist: 0, convergence: 0, shear: 0, crustDist: 0, paleoDist: 0, otherCrustDist: 0 }
+    const _scratch: TectonicQuery = { plateId: 0, neighborId: 0, boundaryDist: 0, convergence: 0, shear: 0, crustDist: 0, paleoDist: 0, otherCrustDist: 0, baseElevation: 0 }
 
     let instanceIdx = 0
     for (let i = 0; i < sampleDirs.length; i++) {

@@ -15,6 +15,7 @@ import { Vector3 } from 'three'
 import { createNoise3D, ridged, fbm } from './noise'
 import { Tectonics, TectonicQuery, boundaryRelief } from './tectonics'
 import { Climate, ClimateSample } from './climate'
+import { Erosion } from './erosion'
 
 // ---------------------------------------------------------------------------
 // TECT_* tuning constants (moved here from Planet.ts — single source of truth)
@@ -62,7 +63,7 @@ export const RUGGED_ACTIVE            = 1.0    // weight of active convergence i
 export const RUGGED_PALEO             = 0.7    // weight of fossil-orogen proximity (tectonic regime)
 export const RUGGED_PALEO_STAGNANT    = 1.1    // stagnant-lid: no convergence, paleo carries all ruggedness
 // Broad regional uplift (replaces old TECT_HIGHLANDS_* signed fbm)
-export const HIGHLAND_AMP             = 0.22   // broad regional uplift amplitude [was 0.30 — trimmed to prevent max land H exceeding 0.95 on seed 42 belt peaks]
+export const HIGHLAND_AMP             = 0.18   // broad regional uplift amplitude [was 0.22 — Option C broad uplift takes over active-convergence elevation]
 // CC-collision plateau lift (sums with boundaryRelief BR_PLATEAU on far side)
 export const PLATEAU_AMP              = 0.20   // regional plateau height contribution
 export const PLATEAU_LO               = 0.30   // rugged*ccCollision ramp lo
@@ -87,6 +88,17 @@ export const UNDULATION_VAR_OCT       = 3
 export const CRATON_MASK_STR          = 0.70   // undulation tapers to 30% on full orogens (fills plains, spares orogen clamp headroom)
 // Rolling-hills floor: plains get partial hills even where rugged≈0
 export const HILL_FLOOR               = 0.80   // fraction of HILL_AMP always present on land [raised — plains need visible rolling hills]
+// Erosion-steered fine detail (Phase 4)
+// EROSION_WARP_STR: domain-warp magnitude along downhill flow in noise-space units.
+//   0 = isotropic (no steering), ~0.15 = visible gully elongation, keep ≤ 0.3.
+export const EROSION_WARP_STR         = 0.05
+// EROSION_RIDGED_FLOOR: minimum ridged amplitude fraction on low-discharge interfluves.
+//   1.0 = no discharge deepening (pre-erosion behaviour), 0.0 = fully suppressed.
+export const EROSION_RIDGED_FLOOR     = 0.35
+// EROSION_VINCISION_AMP: peak V-channel depth at full discharge (acc=1, land).
+//   Keep conservative; the macro erosion.deltaAt() already carves the main channel.
+export const EROSION_VINCISION_AMP    = 0.008
+
 // Offshore island / skerry band
 export const TECT_ISLAND_AMP          = 0.12
 export const TECT_ISLAND_FREQ         = 14.0
@@ -109,6 +121,13 @@ export const TECT_VOLC_HEADROOM_HI    = 0.50
 export const TECT_VOLC_SUM_MAX        = 0.64
 
 // ---------------------------------------------------------------------------
+// Wide motion-driven uplift (Option C) — broad deformation zones
+// ---------------------------------------------------------------------------
+export const UPLIFT_AMP           = 0.18   // positive = converging plates → broad mountain belt
+export const SUBSIDENCE_AMP       = 0.06   // negative uplift → broad lowland basin
+export const UPLIFT_ZONE_W        = 0.25   // half-width falloff (radians)
+
+// ---------------------------------------------------------------------------
 // Public interfaces
 // ---------------------------------------------------------------------------
 
@@ -122,6 +141,14 @@ export interface TerrainSamplerOpts {
   atmosphere: number
   bandCount: number
   axialTiltRad: number
+  /** Heat redistribution R ∈ [0,1] forwarded into Climate. Defaults to Climate's own default (1). */
+  redistribution?: number
+  /** Greenhouse offset in °C forwarded into Climate. Defaults to Climate's own default (0). */
+  greenhouse?: number
+  /** Lapse rate in °C over full height forwarded into Climate. Defaults to Climate's own default (50). */
+  lapseRate?: number
+  /** Plate angular velocity multiplier ∈ [0.3, 2.0] from interior vigor. Defaults to 1.0. */
+  driftScale?: number
   /**
    * Inject a pre-built Tectonics instance (e.g. fromBaked() in a Web Worker).
    * If omitted, the factory builds one from seed/plateCount/arcDensity.
@@ -132,6 +159,24 @@ export interface TerrainSamplerOpts {
    * If omitted, the factory builds one after constructing heightFn + tectonics.
    */
   climate?: Climate
+  /**
+   * Inject a pre-built Erosion instance (e.g. fromBaked() in a Web Worker).
+   * If omitted, no erosion delta is applied (byte-identical to pre-erosion output).
+   */
+  erosion?: Erosion
+  /**
+   * When true, omit all orogenic stamps (broadUplift, plateau, broadDeform, relief)
+   * so that heightFn returns only the unclipped lowland base + detail.
+   * Used as the seed heightFn for the B iterated uplift+erode loop.
+   * When false/undefined, behaviour is byte-identical to before (no change in control flow).
+   */
+  baseOnly?: boolean
+  /**
+   * When true, gate off the orogenic stamps (broadUplift, plateau, broadDeform, relief)
+   * so that bDelta (erosion.deltaAt) owns the elevation budget without clipping.
+   * When false/undefined, behaviour is byte-identical to before.
+   */
+  bActive?: boolean
 }
 
 export interface TerrainSampler {
@@ -140,6 +185,8 @@ export interface TerrainSampler {
   climateFn: (dir: Vector3, height: number) => ClimateSample
   tectonics: Tectonics
   climate: Climate
+  /** The Erosion instance passed via opts, or null if none was provided. */
+  erosion: Erosion | null
 }
 
 // ---------------------------------------------------------------------------
@@ -150,12 +197,21 @@ export function makeTerrainSampler(opts: TerrainSamplerOpts): TerrainSampler {
   const {
     seed, plateCount, arcDensity,
     baseTemp, atmosphere, bandCount, axialTiltRad,
+    redistribution, greenhouse, lapseRate,
+    driftScale,
   } = opts
+  // When baseOnly or bActive is true, orogenic stamps are zeroed.
+  // baseOnly: used to generate the seed heightFn for the B loop (no stamps, no relief).
+  // bActive: used in the final sampler when B's bDelta owns the elevation budget.
+  const _gateStamps = opts.baseOnly === true || opts.bActive === true
 
   const noise = createNoise3D(seed)
 
-  const tectonics = opts.tectonics ?? new Tectonics({ seed, plateCount, arcDensity })
+  const tectonics = opts.tectonics ?? new Tectonics({ seed, plateCount, arcDensity, driftScale })
+  const erosion   = opts.erosion ?? null
   const plates = tectonics.plates
+  // Preallocated scratch for erosion.flowAt — zero allocations in the hot path.
+  const _flowScratch = new Vector3()
 
   // Regime selection — hoisted out of the per-vertex closure (branch-free in hot path).
   // plateCount===0 and ===1 both produce plates.length===1 (the non-tectonic stagnant-lid case).
@@ -164,7 +220,7 @@ export function makeTerrainSampler(opts: TerrainSamplerOpts): TerrainSampler {
   const shelfWBase  = isStagnantLid ? TECT_SHELF_W_STAGNANT    : TECT_SHELF_W_PASSIVE
 
   // One scratch TectonicQuery per heightFn call — safe because heightFn is called serially.
-  const scratch: TectonicQuery = { plateId: 0, neighborId: 0, boundaryDist: 0, convergence: 0, shear: 0, crustDist: 0, paleoDist: 0, otherCrustDist: 0 }
+  const scratch: TectonicQuery = { plateId: 0, neighborId: 0, boundaryDist: 0, convergence: 0, shear: 0, crustDist: 0, paleoDist: 0, otherCrustDist: 0, baseElevation: 0 }
 
   // Separate scratch for plateColorFn (both called back-to-back on the same dir — see memo below).
   // 1-entry memoization: if dir.x/y/z identical to the previous heightFn call, reuse the
@@ -172,7 +228,7 @@ export function makeTerrainSampler(opts: TerrainSamplerOpts): TerrainSampler {
   // The memo now stores the full query so plateColorFn can read boundaryDist/convergence/shear.
   let memoX = NaN, memoY = NaN, memoZ = NaN
   let memoBoundaryDist = 0, memoConvergence = 0, memoShear = 0, memoPlateId = 0
-  const scratchColor: TectonicQuery = { plateId: 0, neighborId: 0, boundaryDist: 0, convergence: 0, shear: 0, crustDist: 0, paleoDist: 0, otherCrustDist: 0 }
+  const scratchColor: TectonicQuery = { plateId: 0, neighborId: 0, boundaryDist: 0, convergence: 0, shear: 0, crustDist: 0, paleoDist: 0, otherCrustDist: 0, baseElevation: 0 }
   // Preallocated scratch tuple for plateColorFn — zero allocations in the hot path.
   const _colorScratch: [number, number, number] = [0, 0, 0]
 
@@ -235,7 +291,6 @@ export function makeTerrainSampler(opts: TerrainSamplerOpts): TerrainSampler {
     const x = dir.x, y = dir.y, z = dir.z
 
     tectonics.query(dir, scratch)
-    const own = plates[scratch.plateId]
     const c = scratch.crustDist  // signed SDF: + = crust/land, - = ocean
 
     // Memoize last queried dir for plateColorFn re-use (full query state)
@@ -246,14 +301,17 @@ export function makeTerrainSampler(opts: TerrainSamplerOpts): TerrainSampler {
     memoShear = scratch.shear
 
     // --- Ocean base (unchanged) ---
+    // scratch.baseElevation is the blurred per-plate base elevation (smooth across Voronoi
+    // boundaries) — replaces the nearest-neighbor plates[scratch.plateId].baseElevation lookup
+    // that caused a hard ~30 m cliff at plate boundaries.
     const oceanBase = TECT_OCEAN_BASE_0
                     - TECT_OCEAN_DEPTH_AMP * Math.min(1, Math.sqrt(Math.max(0, -c) / TECT_OCEAN_DEPTH_SAT))
-                    + own.baseElevation * TECT_OCEAN_PLATE_MOD
+                    + scratch.baseElevation * TECT_OCEAN_PLATE_MOD
 
     // --- Land base: interiors climb to ~0.19+ ---
     const landBase = TECT_LAND_BASE_0
                    + TECT_LAND_BASE_SS * _ss3(0, 0.30, c)
-                   + own.baseElevation * TECT_LAND_PLATE_MOD
+                   + scratch.baseElevation * TECT_LAND_PLATE_MOD
 
     // --- Tectonically-derived ruggedness (master relief modulator; no new noise field) ---
     // activeUplift: convergent-boundary uplift decaying behind the front
@@ -265,8 +323,24 @@ export function makeTerrainSampler(opts: TerrainSamplerOpts): TerrainSampler {
     const ruggedRaw    = RUGGED_ACTIVE * activeUplift
                        + (isStagnantLid ? RUGGED_PALEO_STAGNANT : RUGGED_PALEO) * paleoUplift
     const rugged       = Math.max(0, Math.min(1, ruggedRaw))
+    // ruggedElevation: drives broad regional elevation — paleo arm only.
+    // Active convergence elevation is now supplied by broadDeform (Option C).
+    const ruggedElevation = Math.max(0, Math.min(1,
+      (isStagnantLid ? RUGGED_PALEO_STAGNANT : RUGGED_PALEO) * paleoUplift
+    ))
     // Relief suppressed on ocean; only lands get highlands/hills
     const landGate     = _ss3(0, 0.02, c)
+
+    // --- Wide motion-driven deformation (Option C) ---
+    // Zeroed when baseOnly or bActive — orogenic stamps are not needed for the seed
+    // heightFn and must be absent when bDelta owns the elevation budget.
+    let broadDeform = 0
+    if (!_gateStamps) {
+      const u = tectonics.upliftAt(dir)
+      const upliftTerm     = Math.max(0,  u) * UPLIFT_AMP * landGate
+      const subsidenceTerm = Math.max(0, -u) * SUBSIDENCE_AMP * landGate
+      broadDeform = (upliftTerm - subsidenceTerm) * Math.exp(-scratch.boundaryDist / UPLIFT_ZONE_W)
+    }
 
     // --- Broad undulation: gentle swells/basins on ALL land (not rugged-gated) ---
     // Signed fbm so it raises AND lowers (topographic variety, not just bumps).
@@ -285,14 +359,16 @@ export function makeTerrainSampler(opts: TerrainSamplerOpts): TerrainSampler {
     const ccCollision = wMine * wOther
 
     // --- Broad uplift (replaces old TECT_HIGHLANDS signed fbm — tectonically gated) ---
-    // Cratons (rugged≈0) → no broad uplift; orogens → full uplift
-    const broadUplift = HIGHLAND_AMP * rugged * landGate
+    // Cratons (ruggedElevation≈0) → no broad uplift; paleo orogens → full uplift
+    // Zeroed when baseOnly or bActive — B's bDelta supplies orogenic elevation instead.
+    const broadUplift = _gateStamps ? 0 : HIGHLAND_AMP * ruggedElevation * landGate
 
     // --- CC-collision plateau: regional smooth lift on both sides of continent–continent zones ---
     // Sums with boundaryRelief BR_PLATEAU on near-boundary side — that's fine, they occupy
     // different spatial extent (boundaryRelief is narrow-front; this is far-field interior)
-    const plateauFrac = _ss3(PLATEAU_LO, PLATEAU_HI, rugged * ccCollision)
-    const plateau     = PLATEAU_AMP * plateauFrac * landGate
+    // Zeroed when baseOnly or bActive.
+    const plateauFrac = _gateStamps ? 0 : _ss3(PLATEAU_LO, PLATEAU_HI, rugged * ccCollision)
+    const plateau     = _gateStamps ? 0 : PLATEAU_AMP * plateauFrac * landGate
 
     // --- Shelf width narrows at active margins ---
     const activeness = (1 - _ss3(0.02, 0.06, scratch.boundaryDist))
@@ -305,39 +381,92 @@ export function makeTerrainSampler(opts: TerrainSamplerOpts): TerrainSampler {
     const base = combinedLand + (oceanBase - combinedLand) * (1 - _ss3(-shelfW, TECT_COAST_LERP_HI, c))
 
     // --- Boundary relief profile (asymmetric, all regimes) ---
-    const relief = boundaryRelief(scratch, plates, dir, ridgedFn)
+    // Zeroed when baseOnly or bActive — B's bDelta replaces all orogenic structure.
+    const relief = _gateStamps ? 0 : boundaryRelief(scratch, plates, dir, ridgedFn, base)
 
     // LOD-adaptive octave counts (clamped to [base, max])
-    const fbmOctaves    = Math.min(Math.max(level + 2, FBM_BASE_OCTAVES),    14)
-    const ridgedOctaves = Math.min(Math.max(level - 2, RIDGED_BASE_OCTAVES), 6)
+    const fbmOctaves    = Math.min(Math.max(level + 2, FBM_BASE_OCTAVES),    18)
+    const ridgedOctaves = Math.min(Math.max(level - 2, RIDGED_BASE_OCTAVES), 10)
 
     // ---- Detail FBM: additive-octave formulation for LOD consistency --------
     // Outer amplitude scales by ruggedness: cratons get a small floor (CRATON_FLOOR),
     // rugged areas get full detail. Additive-octave loop and MAX_AMP_FBM6 UNCHANGED.
     const detailAmp = TECT_DETAIL_FBM_BASE * (CRATON_FLOOR + (1 - CRATON_FLOOR) * rugged)
+
+    // ---- Phase-4 Steered fine detail (erosion present only) ----------------
+    // When an Erosion instance is available we warp the FBM input along the
+    // downhill flow direction so ridges/gullies elongate into valleys, and we
+    // deepen the incision proportionally to the drainage discharge (accAt).
+    //
+    // LOD-consistency argument:
+    //   Both `acc` and `_flowScratch` are pure functions of `dir` only — they
+    //   query fixed-resolution erosion fields that carry no level information.
+    //   The warp offset added to (fx,fy,fz) and the V-incision scale are therefore
+    //   constant across all LOD levels for the same `dir`. Because the additive-
+    //   octave structure is preserved (same loop, same MAX_AMP_FBM6 normalizer),
+    //   octaves 1-6 are byte-identical between level 3 and level 12; only the
+    //   additive higher octaves grow — exactly the same guarantee as before.
+    //   No steering quantity touches `level`. Popping-free.
+    //
+    // erosion=null → warpX/Y/Z = x/y/z, acc = 0, vIncision = 0: byte-identical
+    //   to the pre-erosion path.
+    let warpX = x * TECT_DETAIL_FBM_SCALE
+    let warpY = y * TECT_DETAIL_FBM_SCALE
+    let warpZ = z * TECT_DETAIL_FBM_SCALE
+    let acc = 0
+    if (erosion) {
+      // Downhill flow tangent in world-space (unit vector, always perpendicular to dir).
+      erosion.flowAt(dir, _flowScratch)
+      // Anisotropic domain warp: shift the FBM sample point along the flow direction
+      // by a small fraction of a noise-space unit. Ridges/gullies will elongate
+      // downhill. Warp strength tuned conservative — dial EROSION_WARP_STR to taste.
+      const warp = EROSION_WARP_STR * TECT_DETAIL_FBM_SCALE
+      warpX += _flowScratch.x * warp
+      warpY += _flowScratch.y * warp
+      warpZ += _flowScratch.z * warp
+      acc = erosion.accAt(dir)   // 0..1 discharge (pure fn of dir)
+    }
+
     let fbmValue = 0; let fbmAmp = 1;
-    const fx = x * TECT_DETAIL_FBM_SCALE, fy = y * TECT_DETAIL_FBM_SCALE, fz = z * TECT_DETAIL_FBM_SCALE;
     let fbmFreq = 1;
     for (let o = 0; o < fbmOctaves; o++) {
-      fbmValue += fbmAmp * noise(fx * fbmFreq, fy * fbmFreq, fz * fbmFreq);
+      fbmValue += fbmAmp * noise(warpX * fbmFreq, warpY * fbmFreq, warpZ * fbmFreq);
       fbmAmp   *= FBM_GAIN;
       fbmFreq  *= FBM_LAC;
     }
     const detailFbm = detailAmp * (fbmValue / MAX_AMP_FBM6)
 
     // ---- Detail ridged: near coasts only ----
+    // `chan`: smoothstepped discharge gate — suppresses the concentric iso-contour
+    // terrace banding that raw acc*acc produced. Declared here so both ridgedScale
+    // and vIncision can reference it without a forward-reference error.
+    const chan = _ss3(0.30, 0.85, acc)
+
     let ridgedValue = 0; let ridgedAmp = 1; let ridgedFreq = 1;
     const rx = x * TECT_DETAIL_RIDGE_SCALE, ry = y * TECT_DETAIL_RIDGE_SCALE, rz = z * TECT_DETAIL_RIDGE_SCALE;
+    // Discharge-gated ridged amplitude: high-acc cells get full sharp ridges in
+    // gullies; low-acc interfluves get reduced amplitude for gentler detail.
+    // ridgedScale is a pure fn of `acc` which is a pure fn of `dir` — no `level`.
+    // Use the same smoothstepped discharge (chan) as vIncision to avoid axis-aligned banding.
+    const ridgedScale = erosion ? (EROSION_RIDGED_FLOOR + (1 - EROSION_RIDGED_FLOOR) * chan) : 1.0
     for (let o = 0; o < ridgedOctaves; o++) {
       const n = noise(rx * ridgedFreq, ry * ridgedFreq, rz * ridgedFreq);
       ridgedValue += ridgedAmp * (1.0 - Math.abs(n)) ** 2;
       ridgedAmp   *= FBM_GAIN;
       ridgedFreq  *= FBM_LAC;
     }
-    const detailRidged = TECT_DETAIL_RIDGE * (ridgedValue / MAX_AMP_RIDGED4) * _ss3(0, 0.08, c)
+    const detailRidged = TECT_DETAIL_RIDGE * ridgedScale * (ridgedValue / MAX_AMP_RIDGED4) * _ss3(0, 0.08, c)
                        * (0.7 + 0.3 * Math.exp(-scratch.boundaryDist / 0.18))
 
-    const detail = detailFbm + detailRidged
+    // ---- V-shaped incision deepened by discharge ----------------------------
+    // A small negative term that carves a sharp channel floor proportional to
+    // drainage discharge. Only active where acc > 0 and land (landGate).
+    // Pure fn of `dir` (acc is fixed-resolution, level-independent).
+    const vIncision = erosion
+      ? -EROSION_VINCISION_AMP * chan * landGate
+      : 0
+
+    const detail = detailFbm + detailRidged + vIncision
 
     // --- Offshore skerries / archipelagos ---
     const islandBand = _ss3(TECT_ISLAND_COAST_LO, TECT_ISLAND_COAST_LO * 0.5 + TECT_ISLAND_COAST_HI * 0.5, c)
@@ -363,10 +492,11 @@ export function makeTerrainSampler(opts: TerrainSamplerOpts): TerrainSampler {
     // clamp (~0.88–0.97) so the crater stays visible and no crease forms.
     // broadUplift+plateau already inside base via combinedLand+shelf blend;
     // hills+detail added on top of the tectonic base.
-    const terrainH = base + relief + detail + islandH + undulation  // pre-clamp terrain
+    const surfaceH = base + relief + detail + islandH + undulation + broadDeform  // pre-erosion surface
     const volcano  = Math.min(TECT_VOLC_SUM_MAX, tectonics.volcanoElevation(dir))
-    const headroom = 1 - _ss3(TECT_VOLC_HEADROOM_LO, TECT_VOLC_HEADROOM_HI, terrainH)
-    return Math.max(-1, Math.min(1, terrainH + volcano * headroom))
+    const headroom = 1 - _ss3(TECT_VOLC_HEADROOM_LO, TECT_VOLC_HEADROOM_HI, surfaceH) // volcano keyed to PRE-erosion surface
+    const erosionH = erosion ? erosion.deltaAt(dir) : 0                                // <=0 carves valleys, >=0 deposits
+    return Math.max(-1, Math.min(1, surfaceH + erosionH + volcano * headroom))
   }
 
   // plateColorFn: uses the 1-entry memo to avoid a redundant Voronoi query when
@@ -419,13 +549,16 @@ export function makeTerrainSampler(opts: TerrainSamplerOpts): TerrainSampler {
   // bandCount comes from rotation; axial tilt feeds the > 54° inversion.
   // crustDistAt reuses a dedicated scratch query so it never clobbers the
   // heightFn / plateColorFn scratch above.
-  const climateQueryScratch: TectonicQuery = { plateId: 0, neighborId: 0, boundaryDist: 0, convergence: 0, shear: 0, crustDist: 0, paleoDist: 0, otherCrustDist: 0 }
+  const climateQueryScratch: TectonicQuery = { plateId: 0, neighborId: 0, boundaryDist: 0, convergence: 0, shear: 0, crustDist: 0, paleoDist: 0, otherCrustDist: 0, baseElevation: 0 }
   const climate = opts.climate ?? new Climate({
     seed,
     baseTemp,
     atmosphere,
     bandCount,
     axialTiltRad,
+    redistribution,
+    greenhouse,
+    lapseRate,
     heightFn,
     crustDistAt: (dir: Vector3): number => tectonics.query(dir, climateQueryScratch).crustDist,
   })
@@ -434,5 +567,5 @@ export function makeTerrainSampler(opts: TerrainSamplerOpts): TerrainSampler {
   const climateFn = (dir: Vector3, height: number): ClimateSample =>
     climate.sample(dir, height, climateScratch)
 
-  return { heightFn, plateColorFn, climateFn, tectonics, climate }
+  return { heightFn, plateColorFn, climateFn, tectonics, climate, erosion }
 }

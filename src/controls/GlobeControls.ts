@@ -1,4 +1,4 @@
-import { PerspectiveCamera, Vector3 } from 'three'
+import { PerspectiveCamera, Quaternion, Vector3 } from 'three'
 
 // ---------------------------------------------------------------------------
 // Zero-allocation scratch — one set of Vector3s preallocated at module level,
@@ -15,6 +15,12 @@ const _s = {
   tmp:  new Vector3(), // generic scratch
 }
 
+// Scratch for right-drag free-look — allocated once, reused every frame.
+const _fl = {
+  q:    new Quaternion(), // scratch quaternion for free-look rotation
+  axis: new Vector3(),    // camera right-axis for pitch
+}
+
 const _WORLD_X = new Vector3(1, 0, 0)
 const _WORLD_Z = new Vector3(0, 0, 1)
 const _DEFAULT_AXIS = new Vector3(0, 1, 0)
@@ -26,6 +32,8 @@ const DEFAULT_MIN_ALT   = 500
 const DEFAULT_MAX_ALT   = 160_000  // 8 × default radius
 
 const DRAG_RAD_PER_PX  = 0.0035  // base angular sensitivity
+const FREELOOK_RAD_PER_PX = 0.003  // right-drag free-look sensitivity
+const FREELOOK_PITCH_MAX  = Math.PI * 0.45  // ~81° clamp — keeps world upright
 const DIST_FACTOR_MIN  = 0.004
 const DIST_FACTOR_MAX  = 1.2
 
@@ -67,7 +75,7 @@ export class GlobeControls {
   private _velTheta = 0
   private _velPhi   = 0
 
-  // Drag tracking
+  // Drag tracking (left button — orbit)
   private _isDragging = false
   private _prevDragX  = 0
   private _prevDragY  = 0
@@ -78,6 +86,15 @@ export class GlobeControls {
   private _rawVelTheta = 0
   private _rawVelPhi   = 0
 
+  // Right-drag free-look state
+  private _isRightDragging = false
+  private _prevRightDragX  = 0
+  private _prevRightDragY  = 0
+  // Accumulated yaw (around camera's local up) and pitch (around camera's right axis)
+  // offsets applied on top of the base lookAt(_ORIGIN) each frame.
+  private _freelookYaw   = 0
+  private _freelookPitch = 0
+
   // Speed smoothing
   private _smoothedSpeed = 0
 
@@ -86,12 +103,13 @@ export class GlobeControls {
   private _shiftHeld = false
 
   // Bound listener refs
-  private readonly _onMouseDown:   (e: MouseEvent) => void
-  private readonly _onMouseMove:   (e: MouseEvent) => void
-  private readonly _onMouseUp:     (e: MouseEvent) => void
-  private readonly _onWheel:       (e: WheelEvent) => void
-  private readonly _onKeyDown:     (e: KeyboardEvent) => void
-  private readonly _onKeyUp:       (e: KeyboardEvent) => void
+  private readonly _onMouseDown:    (e: MouseEvent) => void
+  private readonly _onMouseMove:    (e: MouseEvent) => void
+  private readonly _onMouseUp:      (e: MouseEvent) => void
+  private readonly _onWheel:        (e: WheelEvent) => void
+  private readonly _onKeyDown:      (e: KeyboardEvent) => void
+  private readonly _onKeyUp:        (e: KeyboardEvent) => void
+  private readonly _onContextMenu:  (e: MouseEvent) => void
 
   constructor(
     camera: PerspectiveCamera,
@@ -123,15 +141,17 @@ export class GlobeControls {
     this._targetR = r
 
     // ---- Bind listeners -------------------------------------------------------
-    this._onMouseDown = this._handleMouseDown.bind(this)
-    this._onMouseMove = this._handleMouseMove.bind(this)
-    this._onMouseUp   = this._handleMouseUp.bind(this)
-    this._onWheel     = this._handleWheel.bind(this)
-    this._onKeyDown   = this._handleKeyDown.bind(this)
-    this._onKeyUp     = this._handleKeyUp.bind(this)
+    this._onMouseDown   = this._handleMouseDown.bind(this)
+    this._onMouseMove   = this._handleMouseMove.bind(this)
+    this._onMouseUp     = this._handleMouseUp.bind(this)
+    this._onWheel       = this._handleWheel.bind(this)
+    this._onKeyDown     = this._handleKeyDown.bind(this)
+    this._onKeyUp       = this._handleKeyUp.bind(this)
+    this._onContextMenu = this._handleContextMenu.bind(this)
 
-    dom.addEventListener('mousedown', this._onMouseDown)
-    dom.addEventListener('wheel',     this._onWheel, { passive: false })
+    dom.addEventListener('mousedown',   this._onMouseDown)
+    dom.addEventListener('wheel',       this._onWheel, { passive: false })
+    dom.addEventListener('contextmenu', this._onContextMenu)
     document.addEventListener('mousemove', this._onMouseMove)
     document.addEventListener('mouseup',   this._onMouseUp)
     window.addEventListener('keydown', this._onKeyDown)
@@ -231,6 +251,20 @@ export class GlobeControls {
     cam.up.copy(_s.a)
     cam.lookAt(_ORIGIN)
 
+    // ---- Free-look: apply right-drag yaw/pitch offset on top of base orientation --
+    // Yaw rotates around the camera's local up (which is the polar axis after lookAt).
+    // Pitch rotates around the camera's local right axis.
+    if (this._freelookYaw !== 0 || this._freelookPitch !== 0) {
+      // Build yaw quaternion around the polar axis (camera up after lookAt = _s.a)
+      _fl.q.setFromAxisAngle(_s.a, this._freelookYaw)
+      cam.quaternion.premultiply(_fl.q)
+
+      // Derive the camera's right axis after the yaw, then apply pitch
+      _fl.axis.set(1, 0, 0).applyQuaternion(cam.quaternion)
+      _fl.q.setFromAxisAngle(_fl.axis, this._freelookPitch)
+      cam.quaternion.premultiply(_fl.q)
+    }
+
     // ---- currentSpeed (surface-tangential, smoothed for HUD) ---------------
     const rawSpeed = safeDt > 0 ? _s.prev.distanceTo(cam.position) / safeDt : 0
     const sDecay   = Math.exp(-SPEED_SMOOTH_K * safeDt)
@@ -241,8 +275,9 @@ export class GlobeControls {
   }
 
   dispose(): void {
-    this._dom.removeEventListener('mousedown', this._onMouseDown)
-    this._dom.removeEventListener('wheel',     this._onWheel)
+    this._dom.removeEventListener('mousedown',   this._onMouseDown)
+    this._dom.removeEventListener('wheel',       this._onWheel)
+    this._dom.removeEventListener('contextmenu', this._onContextMenu)
     document.removeEventListener('mousemove', this._onMouseMove)
     document.removeEventListener('mouseup',   this._onMouseUp)
     window.removeEventListener('keydown', this._onKeyDown)
@@ -284,66 +319,91 @@ export class GlobeControls {
   // ---------------------------------------------------------------------------
 
   private _handleMouseDown(e: MouseEvent): void {
-    if (e.button !== 0) return
-    this._isDragging  = true
-    this._prevDragX   = e.clientX
-    this._prevDragY   = e.clientY
-    this._lastDragTime = performance.now()
-    // Kill inertia when grabbing the globe
-    this._velTheta = 0
-    this._velPhi   = 0
-    this._rawVelTheta = 0
-    this._rawVelPhi   = 0
+    if (e.button === 0) {
+      this._isDragging  = true
+      this._prevDragX   = e.clientX
+      this._prevDragY   = e.clientY
+      this._lastDragTime = performance.now()
+      // Kill inertia when grabbing the globe
+      this._velTheta = 0
+      this._velPhi   = 0
+      this._rawVelTheta = 0
+      this._rawVelPhi   = 0
+    } else if (e.button === 2) {
+      this._isRightDragging = true
+      this._prevRightDragX  = e.clientX
+      this._prevRightDragY  = e.clientY
+    }
   }
 
   private _handleMouseMove(e: MouseEvent): void {
-    if (!this._isDragging) return
+    if (this._isDragging) {
+      const now = performance.now()
+      const dtMs = now - this._lastDragTime
+      const safeDtMs = dtMs > 0 ? dtMs : 1  // avoid /0
 
-    const now = performance.now()
-    const dtMs = now - this._lastDragTime
-    const safeDtMs = dtMs > 0 ? dtMs : 1  // avoid /0
+      const dxPx = e.clientX - this._prevDragX
+      const dyPx = e.clientY - this._prevDragY
+      this._prevDragX   = e.clientX
+      this._prevDragY   = e.clientY
+      this._lastDragTime = now
 
-    const dxPx = e.clientX - this._prevDragX
-    const dyPx = e.clientY - this._prevDragY
-    this._prevDragX   = e.clientX
-    this._prevDragY   = e.clientY
-    this._lastDragTime = now
+      // Altitude for distFactor — use current r; getAltitude may use cam.position
+      // which was last set in update(). Approximate is fine here.
+      const approxAlt  = this._opts.getAltitude
+        ? this._opts.getAltitude(this._camera.position)
+        : (this._r - this._opts.radius)
+      const distFactor = Math.min(
+        Math.max(Math.max(approxAlt, 1) / this._opts.radius, DIST_FACTOR_MIN),
+        DIST_FACTOR_MAX,
+      )
 
-    // Altitude for distFactor — use current r; getAltitude may use cam.position
-    // which was last set in update(). Approximate is fine here.
-    const approxAlt  = this._opts.getAltitude
-      ? this._opts.getAltitude(this._camera.position)
-      : (this._r - this._opts.radius)
-    const distFactor = Math.min(
-      Math.max(Math.max(approxAlt, 1) / this._opts.radius, DIST_FACTOR_MIN),
-      DIST_FACTOR_MAX,
-    )
+      // Dragging RIGHT → viewed surface moves right → azimuth DECREASES (Google Earth grab)
+      const dTheta = -dxPx * DRAG_RAD_PER_PX * distFactor
+      const dPhi   = -dyPx * DRAG_RAD_PER_PX * distFactor
 
-    // Dragging RIGHT → viewed surface moves right → azimuth DECREASES (Google Earth grab)
-    const dTheta = -dxPx * DRAG_RAD_PER_PX * distFactor
-    const dPhi   = -dyPx * DRAG_RAD_PER_PX * distFactor
+      this._theta += dTheta
+      this._phi   += dPhi
+      this._phi    = Math.min(Math.max(this._phi, PHI_MIN), PHI_MAX)
 
-    this._theta += dTheta
-    this._phi   += dPhi
-    this._phi    = Math.min(Math.max(this._phi, PHI_MIN), PHI_MAX)
+      // Track instantaneous angular velocity for inertia hand-off on release
+      const dtSec = safeDtMs / 1000
+      // Smooth with a short exponential so a single jerky pointer event doesn't
+      // dominate; k=12 converges in ~0.1 s, which is shorter than a typical flick.
+      const smooth = Math.exp(-12 * dtSec)
+      this._rawVelTheta = this._rawVelTheta * smooth + (dTheta / dtSec) * (1 - smooth)
+      this._rawVelPhi   = this._rawVelPhi   * smooth + (dPhi   / dtSec) * (1 - smooth)
+    }
 
-    // Track instantaneous angular velocity for inertia hand-off on release
-    const dtSec = safeDtMs / 1000
-    // Smooth with a short exponential so a single jerky pointer event doesn't
-    // dominate; k=12 converges in ~0.1 s, which is shorter than a typical flick.
-    const smooth = Math.exp(-12 * dtSec)
-    this._rawVelTheta = this._rawVelTheta * smooth + (dTheta / dtSec) * (1 - smooth)
-    this._rawVelPhi   = this._rawVelPhi   * smooth + (dPhi   / dtSec) * (1 - smooth)
+    if (this._isRightDragging) {
+      const dxPx = e.clientX - this._prevRightDragX
+      const dyPx = e.clientY - this._prevRightDragY
+      this._prevRightDragX = e.clientX
+      this._prevRightDragY = e.clientY
+
+      // Right = yaw left; down = pitch down. Negate X for natural look-around feel.
+      this._freelookYaw   -= dxPx * FREELOOK_RAD_PER_PX
+      this._freelookPitch -= dyPx * FREELOOK_RAD_PER_PX
+      this._freelookPitch  = Math.min(Math.max(this._freelookPitch, -FREELOOK_PITCH_MAX), FREELOOK_PITCH_MAX)
+    }
   }
 
   private _handleMouseUp(e: MouseEvent): void {
-    if (e.button !== 0 || !this._isDragging) return
-    this._isDragging = false
-    // Hand instantaneous velocity off to the inertia coasting system
-    this._velTheta = this._rawVelTheta
-    this._velPhi   = this._rawVelPhi
-    this._rawVelTheta = 0
-    this._rawVelPhi   = 0
+    if (e.button === 0 && this._isDragging) {
+      this._isDragging = false
+      // Hand instantaneous velocity off to the inertia coasting system
+      this._velTheta = this._rawVelTheta
+      this._velPhi   = this._rawVelPhi
+      this._rawVelTheta = 0
+      this._rawVelPhi   = 0
+    } else if (e.button === 2) {
+      this._isRightDragging = false
+    }
+  }
+
+  private _handleContextMenu(e: MouseEvent): void {
+    // Suppress the browser context menu so right-drag free-look works uninterrupted.
+    e.preventDefault()
   }
 
   private _handleWheel(e: WheelEvent): void {

@@ -4,8 +4,11 @@ const KEYMAP_HELP = `
 2  LOD colors
 3  tectonics
 4  spin
+5  climate
+6  wind
 f  freeze LOD
 g  new seed
+regime: dead-lid stagnant-lid plated heat-pipe magma-ocean
 view 3: red=collision blue=rift yellow=shear
 view 3: orange pins = arc volcanoes
 

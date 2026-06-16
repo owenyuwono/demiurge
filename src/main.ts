@@ -1,5 +1,4 @@
 import * as THREE from 'three/webgpu'
-import GUI from 'lil-gui'
 import { Planet } from './planet/Planet.js'
 import { GlobeControls } from './controls/GlobeControls.js'
 import { FirstPersonController } from './controls/FirstPersonController.js'
@@ -7,6 +6,8 @@ import { SurfacePicker } from './controls/SurfacePicker.js'
 import { NavMode, type SurfaceSampler } from './controls/NavMode.js'
 import { NavControlsBar } from './debug/NavControlsBar.js'
 import { Hud } from './debug/Hud.js'
+import { DEFAULT_INTERIOR } from './planet/interior.js'
+import { TabbedGui } from './debug/TabbedGui.js'
 
 const RADIUS = 50_000
 const HEIGHT_SCALE = 1_200
@@ -67,10 +68,9 @@ async function main(): Promise<void> {
   const planet = new Planet({ seed, radius: RADIUS, heightScale: HEIGHT_SCALE, maxDepth: 18, targetTriPx: 2.0 })
   scene.add(planet)
 
-  // Axial tilt: local Y is the spin axis; tilting Z by 23.4° makes the orbit Earth-like.
-  planet.rotation.z = THREE.MathUtils.degToRad(23.4)
-
-  // Polar axis in world space, computed once after the tilt is applied.
+  // Polar axis in world space — computed after setAxialTilt(ui.obliquity) is called during
+  // startup init below, which sets rotation.z and calls refreshPoleAxis(). We capture it here
+  // as a placeholder; it is overwritten before the first frame by the startup init block.
   // rotateY() post-multiplies about local Y, so this world axis never changes during spin.
   const POLAR_AXIS = new THREE.Vector3(0, 1, 0).applyQuaternion(planet.quaternion)
 
@@ -214,9 +214,19 @@ async function main(): Promise<void> {
   // --- HUD ---
   const hud = new Hud()
 
+  // refreshDerived — reads planet.getDerivedInterior() and pushes values into the derived
+  // readout controllers. Declared as a let so it can be assigned after the GUI is built
+  // (the controllers don't exist yet when ui is constructed) but called at runtime by
+  // ui.randomizeSeed / ui.regenerate which run after full initialisation.
+  // eslint-disable-next-line prefer-const
+  let refreshDerived: () => void = () => { /* assigned after GUI build */ }
+
+  // tabbed declared before ui so randomizeSeed can reference tabbed.controllersRecursive()
+  let tabbed: TabbedGui
+
   // --- UI state (single source of truth for GUI + hotkeys) ---
   const ui = {
-    view: 'normal' as 'normal' | 'lod' | 'tectonics' | 'heightmap',
+    view: 'normal' as 'normal' | 'lod' | 'tectonics' | 'heightmap' | 'climate' | 'wind',
     wireframe: false,
     vertices: false,
     freezeLod: false,
@@ -224,37 +234,94 @@ async function main(): Promise<void> {
     lodDiag: false,
     spin: false,
     spinPeriodS: 600,
-    plateCount: 16,
-    arcDensity: 1,
-    hotspotCount: 6,
-    hotspotIntensity: 1,
     targetTriPx: 2.0,
     maxDepth: 18,
     water: true,
-    waterLevel: 0.5,
-    baseTemp: 15,
-    atmosphere: 0.6,
+    // Interior parameters (primary tectonic roots)
+    mass: DEFAULT_INTERIOR.mass,
+    composition: DEFAULT_INTERIOR.composition,
+    age: DEFAULT_INTERIOR.age,
+    insolation: DEFAULT_INTERIOR.insolation,
+    waterBudget: DEFAULT_INTERIOR.waterBudget,
+    obliquity: 23.4,
+    // Interior-derived readouts (read-only, updated by refreshDerived)
+    derivedRegime: '—',
+    derivedGravity: 0,
+    derivedInternalHeat: 0,
+    derivedSurfaceTemp: 0,
+    derivedAtmosphere: 0,
+    derivedEquilibriumTemp: 0,
+    derivedVigor: 0,
+    derivedMobility: 0,
+    derivedPlateCount: 0,
+    derivedOceanCoverage: '0%',
+    derivedSeaLevel: 0,
+    // Override (advanced) controls
+    overrideInterior: false,
+    manualHeat: 0.5,
+    manualSurfaceTemp: 15,
+    manualAtmosphere: 0.6,
+    // Climate parameters
+    climateField: 'temperature' as 'temperature' | 'moisture' | 'insolation',
+    redistribution: 1,
+    greenhouse: 0,
+    lapseRate: 50,
+    tempRange: 70,
+    // Sun direction (azimuth 0..360°, elevation −90..90°)
+    sunAzimuth: 45,
+    sunElevation: 30,
+    // Wind parameters
+    windField: 'flow' as 'flow' | 'speed' | 'direction',
+    windStrength: 1,
+    windBands: 3,
+    turbulence: 0.2,
+    retrograde: false,
+    // Erosion bake parameters — onFinishChange triggers rebake on release.
+    erosionRes: 256 as 128 | 256 | 512,
+    erosionStrength: 1.0,
+    erosionDeposition: 1.0,
+    bSteps: 30,
+    bUpliftRate: 60,
     seed: String(seed),
     randomizeSeed: () => {
       const newSeed = (Math.random() * 2 ** 31) | 0
       seed = newSeed
       ui.seed = String(newSeed)
       planet.regenerate(newSeed)
+      refreshDerived()
       const url = new URL(window.location.href)
       url.searchParams.set('seed', String(newSeed))
       history.replaceState(null, '', url.toString())
-      gui.controllersRecursive().forEach((c) => c.updateDisplay())
+      tabbed.controllersRecursive().forEach((c) => c.updateDisplay())
     },
     regenerate: () => {
       planet.regenerate(seed)
+      refreshDerived()
     },
   }
 
   // --- Apply functions (state → scene/loop) ---
+
+  // Sun direction derived from azimuth/elevation sliders (world space, unit vector).
+  const sunDir = new THREE.Vector3()
+
+  function applySunDir(): void {
+    const azRad = THREE.MathUtils.degToRad(ui.sunAzimuth)
+    const elRad = THREE.MathUtils.degToRad(ui.sunElevation)
+    sunDir.set(
+      Math.cos(elRad) * Math.sin(azRad),
+      Math.sin(elRad),
+      Math.cos(elRad) * Math.cos(azRad),
+    )
+    planet.setSunDir(sunDir)
+  }
+
   function applyView(): void {
     planet.setDebugColors(ui.view === 'lod')
     planet.setTectonicsView(ui.view === 'tectonics')
     planet.setHeightmapView(ui.view === 'heightmap')
+    planet.setClimateView(ui.view === 'climate')
+    planet.setWindView(ui.view === 'wind')
   }
 
   function applyWireframe(): void {
@@ -274,47 +341,164 @@ async function main(): Promise<void> {
   }
 
   function applyWater(): void {
-    // waterLevel ∈ [0,1]: 0 = shell below the deepest terrain (dry), 1 = above the highest
-    // peak (fully submerged), 0.5 = sea level at terrain height 0 (coastlines). The ±1.05
-    // margin clears any clamped trench/peak so the extremes are truly dry / fully ocean.
-    water.visible = ui.water && ui.waterLevel > 0
-    const norm = (2 * ui.waterLevel - 1) * 1.05
-    water.scale.setScalar((RADIUS + norm * HEIGHT_SCALE) / RADIUS)
+    // Sea level is derived from waterBudget via planet.getSeaLevel() (normalized elevation).
+    // Radius = RADIUS + seaLevel * HEIGHT_SCALE. Hide shell entirely when water is toggled off
+    // or when the planet has no meaningful water (seaLevel < 0, i.e. below lowest terrain).
+    const seaLevel = planet.getSeaLevel()
+    water.visible = ui.water && seaLevel > -1
+    water.scale.setScalar((RADIUS + seaLevel * HEIGHT_SCALE) / RADIUS)
   }
 
-  // --- lil-gui panel (top-right, default placement) ---
-  const gui = new GUI({ title: 'Demiurge' })
+  // --- Tabbed debug panel ---
+  tabbed = new TabbedGui(['Planet', 'Atmosphere', 'View'])
 
-  const viewFolder = gui.addFolder('View')
-  viewFolder.add(ui, 'view', ['normal', 'lod', 'tectonics', 'heightmap']).name('mode').onChange(() => applyView())
-  viewFolder.add(ui, 'wireframe').name('wireframe').onChange(() => applyWireframe())
-  viewFolder.add(ui, 'vertices').name('vertices').onChange(() => applyVertices())
-  viewFolder.add(ui, 'freezeLod').name('freeze LOD').onChange(() => applyFreeze())
-  viewFolder.add(ui, 'gizmos').name('gizmos').onChange(() => applyGizmos())
+  // === Tab 1: Planet — Presets folder (must be added first to appear at top) ===
 
-  const planetFolder = gui.addFolder('Planet')
+  // Single source-of-truth preset table. Each entry maps to one button in the Presets folder.
+  const PLANET_PRESETS = [
+    { name: 'Earth',            mass: 1.0,  composition: 0.5, age: 0.5, insolation: 1.0,  waterBudget: 0.5,  obliquity: 23  },
+    { name: 'Mars',             mass: 0.5,  composition: 0.5, age: 0.7, insolation: 0.43, waterBudget: 0.15, obliquity: 25  },
+    { name: 'Venus',            mass: 0.85, composition: 0.5, age: 0.5, insolation: 1.9,  waterBudget: 0.2,  obliquity: 3   },
+    { name: 'Mercury',          mass: 0.4,  composition: 0.6, age: 0.85,insolation: 6.7,  waterBudget: 0.05, obliquity: 0   },
+    { name: 'Ocean World',      mass: 1.2,  composition: 0.4, age: 0.4, insolation: 0.9,  waterBudget: 0.95, obliquity: 23  },
+    { name: 'Heat-pipe (Io)',   mass: 1.5,  composition: 0.7, age: 0.1, insolation: 1.0,  waterBudget: 0.1,  obliquity: 0   },
+    { name: 'Lava World',       mass: 1.0,  composition: 0.5, age: 0.3, insolation: 15.0, waterBudget: 0.3,  obliquity: 10  },
+  ] as const
+
+  // Wrap button functions in an object so lil-gui's add(obj, fn) pattern works.
+  const presetButtons: Record<string, () => void> = {}
+  for (const preset of PLANET_PRESETS) {
+    presetButtons[preset.name] = () => {
+      // Step 1: update ui fields so Interior sliders reflect the preset immediately.
+      ui.mass        = preset.mass
+      ui.composition = preset.composition
+      ui.age         = preset.age
+      ui.insolation  = preset.insolation
+      ui.waterBudget = preset.waterBudget
+      ui.obliquity   = preset.obliquity
+
+      // Step 2: apply obliquity first — sets rotation.z + pole-axis uniform, then
+      // triggers an interim regenerate with the OLD interior values (invisible: both
+      // calls are synchronous and the renderer hasn't painted yet).
+      planet.setAxialTilt(preset.obliquity)
+
+      // Step 3: apply the 5 interior roots — merges and triggers the final regenerate
+      // with everything in its correct state. This is the rebuild that matters.
+      planet.setInteriorParams({
+        mass:        preset.mass,
+        composition: preset.composition,
+        age:         preset.age,
+        insolation:  preset.insolation,
+        waterBudget: preset.waterBudget,
+      })
+
+      // Step 4: sync all GUI displays (Interior sliders + derived readouts).
+      refreshDerived()
+      tabbed.controllersRecursive().forEach((c) => c.updateDisplay())
+    }
+  }
+
+  const presetsFolder = tabbed.planetGui.addFolder('Presets')
+  for (const preset of PLANET_PRESETS) {
+    presetsFolder.add(presetButtons, preset.name).name(preset.name)
+  }
+
+  // === Tab 1: Planet ===
+  const planetFolder = tabbed.planetGui.addFolder('Planet')
   planetFolder.add(ui, 'seed').name('seed').listen().disable()
   planetFolder.add(ui, 'randomizeSeed').name('new seed')
   planetFolder.add(ui, 'regenerate').name('regenerate (same seed)')
 
-  // plateCount + regenerate grouped together: changing plateCount takes effect on next regenerate
-  const tectonicsFolder = gui.addFolder('Tectonics')
-  tectonicsFolder.add(ui, 'plateCount', 0, 48, 1).name('plate count (0/1 = no tectonics)').onChange((n: number) => {
-    planet.setPlateCount(n)
+  // Interior folder — five fundamental root inputs that drive Stage A → regime derivation.
+  // mass and insolation replace the old planetSize/internalHeat/surfaceTemp sliders.
+  const interiorFolder = tabbed.planetGui.addFolder('Interior')
+  interiorFolder.add(ui, 'mass', 0.05, 10, 0.01).name('mass (Earth=1)').onChange((v: number) => {
+    planet.setInteriorParams({ mass: v })
+    refreshDerived()
   })
-  tectonicsFolder.add(ui, 'arcDensity', 0.2, 3, 0.05).name('arc density').onChange((v: number) => {
-    planet.setArcDensity(v)
+  interiorFolder.add(ui, 'insolation', 0.1, 20, 0.01).name('insolation (Earth=1)').onChange((v: number) => {
+    planet.setInteriorParams({ insolation: v })
+    refreshDerived()
   })
-  // Hotspots = intraplate mantle-plume volcanoes (chains on moving plates, giant shields on
-  // slow/stagnant ones). Per-hotspot intensity varies; this is a global multiplier. On regenerate.
-  tectonicsFolder.add(ui, 'hotspotCount', 0, 20, 1).name('hotspot count').onChange((n: number) => {
-    planet.setHotspotCount(n)
+  interiorFolder.add(ui, 'waterBudget', 0, 1, 0.01).name('water budget').onChange((v: number) => {
+    planet.setInteriorParams({ waterBudget: v })
+    refreshDerived()
   })
-  tectonicsFolder.add(ui, 'hotspotIntensity', 0, 3, 0.05).name('hotspot intensity').onChange((v: number) => {
-    planet.setHotspotIntensity(v)
+  interiorFolder.add(ui, 'age', 0, 1, 0.01).name('age').onChange((v: number) => {
+    planet.setInteriorParams({ age: v })
+    refreshDerived()
+  })
+  interiorFolder.add(ui, 'composition', 0, 1, 0.01).name('composition').onChange((v: number) => {
+    planet.setInteriorParams({ composition: v })
+    refreshDerived()
+  })
+  interiorFolder.add(ui, 'obliquity', 0, 90, 0.1).name('obliquity °').onChange((v: number) => {
+    planet.setAxialTilt(v)
+    refreshDerived()
   })
 
-  const motionFolder = gui.addFolder('Motion')
+  // Derived readouts — disabled (read-only) controllers updated by refreshDerived().
+  const derivedRegimeCtrl = interiorFolder.add(ui, 'derivedRegime').name('regime').disable()
+  const derivedGravityCtrl = interiorFolder.add(ui, 'derivedGravity').name('gravity (g)').disable()
+  const derivedInternalHeatCtrl = interiorFolder.add(ui, 'derivedInternalHeat').name('internal heat').disable()
+  const derivedSurfaceTempCtrl = interiorFolder.add(ui, 'derivedSurfaceTemp').name('surface temp °C').disable()
+  const derivedAtmosphereCtrl = interiorFolder.add(ui, 'derivedAtmosphere').name('atmosphere').disable()
+  const derivedEquilibriumTempCtrl = interiorFolder.add(ui, 'derivedEquilibriumTemp').name('eq. temp °C').disable()
+  const derivedVigorCtrl = interiorFolder.add(ui, 'derivedVigor').name('vigor').disable()
+  const derivedMobilityCtrl = interiorFolder.add(ui, 'derivedMobility').name('mobility').disable()
+  const derivedPlateCountCtrl = interiorFolder.add(ui, 'derivedPlateCount').name('plate count').disable()
+  const derivedOceanCoverageCtrl = interiorFolder.add(ui, 'derivedOceanCoverage').name('ocean coverage').disable()
+  const derivedSeaLevelCtrl = interiorFolder.add(ui, 'derivedSeaLevel').name('sea level').disable()
+
+  // Assign the real refreshDerived now that the controllers exist.
+  refreshDerived = () => {
+    const d = planet.getDerivedInterior()
+    ui.derivedRegime = d.regime
+    ui.derivedGravity = parseFloat(d.gravity.toFixed(3))
+    ui.derivedInternalHeat = parseFloat(d.internalHeat.toFixed(3))
+    ui.derivedSurfaceTemp = parseFloat(d.surfaceTemp.toFixed(1))
+    ui.derivedAtmosphere = parseFloat(d.atmosphere.toFixed(3))
+    ui.derivedEquilibriumTemp = parseFloat(d.equilibriumTemp.toFixed(1))
+    ui.derivedVigor = parseFloat(d.vigor.toFixed(3))
+    ui.derivedMobility = parseFloat(d.mobility.toFixed(3))
+    ui.derivedPlateCount = d.plateCount
+    ui.derivedOceanCoverage = (d.oceanCoverage * 100).toFixed(1) + '%'
+    ui.derivedSeaLevel = parseFloat(planet.getSeaLevel().toFixed(4))
+    derivedRegimeCtrl.updateDisplay()
+    derivedGravityCtrl.updateDisplay()
+    derivedInternalHeatCtrl.updateDisplay()
+    derivedSurfaceTempCtrl.updateDisplay()
+    derivedAtmosphereCtrl.updateDisplay()
+    derivedEquilibriumTempCtrl.updateDisplay()
+    derivedVigorCtrl.updateDisplay()
+    derivedMobilityCtrl.updateDisplay()
+    derivedPlateCountCtrl.updateDisplay()
+    derivedOceanCoverageCtrl.updateDisplay()
+    derivedSeaLevelCtrl.updateDisplay()
+    applyWater()
+  }
+
+  // Advanced (override) folder — pins the mid-layer physical state, bypassing the root→physical
+  // derivation. Only active when overrideInterior is checked.
+  const advancedFolder = tabbed.planetGui.addFolder('Advanced')
+  advancedFolder.add(ui, 'overrideInterior').name('override interior').onChange((v: boolean) => {
+    planet.setOverrideInterior(v)
+    refreshDerived()
+  })
+  advancedFolder.add(ui, 'manualHeat', 0, 1, 0.01).name('manual heat (0–1)').onChange((v: number) => {
+    planet.setManualHeat(v)
+    refreshDerived()
+  })
+  advancedFolder.add(ui, 'manualSurfaceTemp', -90, 1500, 1).name('manual surface temp °C').onChange((v: number) => {
+    planet.setManualSurfaceTemp(v)
+    refreshDerived()
+  })
+  advancedFolder.add(ui, 'manualAtmosphere', 0, 1, 0.01).name('manual atmosphere (0–1)').onChange((v: number) => {
+    planet.setManualAtmosphere(v)
+    refreshDerived()
+  })
+
+  const motionFolder = tabbed.planetGui.addFolder('Motion')
   motionFolder.add(ui, 'spin').name('spin')
   // Rotation period drives both the visual spin (live) and the climate band count
   // (faster spin → more circulation cells); the band-count change applies on regenerate.
@@ -322,19 +506,89 @@ async function main(): Promise<void> {
     planet.setRotationPeriod(v)
   })
 
-  // Climate: base temp = planet class (frozen↔temperate↔desert), atmosphere = how
-  // uniform vs extreme the gradients are. Both apply on regenerate (they rebuild the
-  // temperature/moisture fields and rebake biome colors).
-  const climateFolder = gui.addFolder('Climate')
-  climateFolder.add(ui, 'baseTemp', -40, 60, 1).name('base temp °C').onChange((v: number) => {
-    planet.setBaseTemp(v)
+  // Erosion folder — triggers a synchronous bake (cost scales as res²·iters;
+  // 512 ≈ 4× heavier than 256), so both controls use onFinishChange (apply on
+  // release) rather than onChange (apply every tick).
+  const erosionFolder = tabbed.planetGui.addFolder('Erosion')
+  erosionFolder.add(ui, 'erosionRes', [128, 256, 512]).name('bake res').onFinishChange((v: number) => {
+    planet.setErosionRes(v as 128 | 256 | 512)
   })
-  climateFolder.add(ui, 'atmosphere', 0, 1, 0.01).name('atmosphere').onChange((v: number) => {
-    planet.setAtmosphere(v)
+  erosionFolder.add(ui, 'erosionStrength', 0, 3, 0.01).name('strength (K0 ×)').onFinishChange((v: number) => {
+    planet.setErosionStrength(v)
+  })
+  erosionFolder.add(ui, 'erosionDeposition', 0, 3, 0.01).name('deposition (G ×)').onFinishChange((v: number) => {
+    planet.setErosionDeposition(v)
+  })
+  erosionFolder.add(ui, 'bSteps', 1, 100, 1).name('B steps').onFinishChange((v: number) => {
+    planet.setBSteps(v)
+  })
+  erosionFolder.add(ui, 'bUpliftRate', 0, 300, 1).name('B uplift rate (m/step)').onFinishChange((v: number) => {
+    planet.setBUpliftRate(v)
   })
 
+  // === Tab 2: Atmosphere ===
+
+  // Climate: atmosphere = how uniform vs extreme the gradients are. baseTemp has moved to
+  // Interior (surfaceTemp). Remaining sliders are all climate-specific.
+  const climateFolder = tabbed.atmosphereGui.addFolder('Climate')
+  climateFolder.add(ui, 'climateField', ['temperature', 'moisture', 'insolation']).name('field').onChange((v: 'temperature' | 'moisture' | 'insolation') => {
+    planet.setClimateField(v)
+  })
+  climateFolder.add(ui, 'redistribution', 0, 1, 0.01).name('redistribution (day/night↔latitude)').onChange((v: number) => {
+    planet.setRedistribution(v)
+  })
+  climateFolder.add(ui, 'greenhouse', 0, 100, 1).name('greenhouse °C')
+    .onChange((v: number) => {
+      planet.setGreenhouse(v)          // live: updates uniform immediately
+    })
+    .onFinishChange(() => {
+      planet.regenerate(seed)          // rebake: biome temperature uses greenhouse offset
+    })
+  climateFolder.add(ui, 'lapseRate', 0, 80, 1).name('lapse rate °C')
+    .onChange((v: number) => {
+      planet.setLapseRate(v)           // live: updates uniform immediately
+    })
+    .onFinishChange(() => {
+      planet.regenerate(seed)          // rebake: biome temperature uses lapse rate
+    })
+  climateFolder.add(ui, 'tempRange', 0, 120, 1).name('temp range °C (equator→pole)').onChange((v: number) => {
+    planet.setTempRange(v)
+  })
+
+  // Wind: all parameters are live uniform writes (no rebake).
+  const windFolder = tabbed.atmosphereGui.addFolder('Wind')
+  windFolder.add(ui, 'windField', ['flow', 'speed', 'direction']).name('field').onChange((v: 'flow' | 'speed' | 'direction') => {
+    planet.setWindField(v)
+  })
+  windFolder.add(ui, 'windStrength', 0, 3, 0.01).name('wind strength').onChange((v: number) => {
+    planet.setWindStrength(v)
+  })
+  windFolder.add(ui, 'windBands', 1, 8, 1).name('bands (N)').onChange((v: number) => {
+    planet.setWindBands(v)
+  })
+  windFolder.add(ui, 'turbulence', 0, 1, 0.01).name('turbulence').onChange((v: number) => {
+    planet.setTurbulence(v)
+  })
+  windFolder.add(ui, 'retrograde').name('retrograde').onChange((v: boolean) => {
+    planet.setRetrograde(v)
+  })
+
+  // Sun direction controls — world-space azimuth + elevation converted to a unit vector.
+  // The sun is used for climate (insolation/terminator), not scene lighting.
+  const sunFolder = tabbed.atmosphereGui.addFolder('Sun')
+  sunFolder.add(ui, 'sunAzimuth', 0, 360, 1).name('azimuth °').onChange(() => applySunDir())
+  sunFolder.add(ui, 'sunElevation', -90, 90, 1).name('elevation °').onChange(() => applySunDir())
+
+  // === Tab 3: View ===
+  const viewFolder = tabbed.viewGui.addFolder('View')
+  viewFolder.add(ui, 'view', ['normal', 'lod', 'tectonics', 'heightmap', 'climate', 'wind']).name('mode').onChange(() => applyView())
+  viewFolder.add(ui, 'wireframe').name('wireframe').onChange(() => applyWireframe())
+  viewFolder.add(ui, 'vertices').name('vertices').onChange(() => applyVertices())
+  viewFolder.add(ui, 'freezeLod').name('freeze LOD').onChange(() => applyFreeze())
+  viewFolder.add(ui, 'gizmos').name('gizmos').onChange(() => applyGizmos())
+
   // LOD tuning: targetTriPx and maxDepth are live — no rebuild needed.
-  const lodFolder = gui.addFolder('LOD')
+  const lodFolder = tabbed.viewGui.addFolder('LOD')
   lodFolder.add(ui, 'targetTriPx', 0.5, 8, 0.1).name('tri px target').onChange((v: number) => {
     planet.setTargetTriPx(v)
   })
@@ -345,13 +599,42 @@ async function main(): Promise<void> {
     planet.setDiagEnabled(v)
   })
 
-  const waterFolder = gui.addFolder('Water')
+  const waterFolder = tabbed.viewGui.addFolder('Water')
   waterFolder.add(ui, 'water').name('visible').onChange(() => applyWater())
-  waterFolder.add(ui, 'waterLevel', 0, 1, 0.01).name('level (0=dry, 1=ocean)').onChange(() => applyWater())
 
   // Apply initial gizmos + water state
   applyGizmos()
   applyWater()
+
+  // Initialise interior params + axial tilt to defaults — sets them on the planet and
+  // populates derived readouts. setAxialTilt also applies rotation.z and refreshes the
+  // pole-axis uniform, replacing the manual rotation.z assignment that used to live here.
+  planet.setInteriorParams({
+    mass: ui.mass,
+    composition: ui.composition,
+    age: ui.age,
+    insolation: ui.insolation,
+    waterBudget: ui.waterBudget,
+  })
+  planet.setAxialTilt(ui.obliquity)
+  refreshDerived()
+
+  // Initialise climate/sun uniforms to match slider defaults.
+  // These calls only update uniforms/fields; no regenerate() is triggered here.
+  // The constructor's buildHeightFn already baked with these default values.
+  planet.setRedistribution(ui.redistribution)
+  planet.setGreenhouse(ui.greenhouse)
+  planet.setLapseRate(ui.lapseRate)
+  planet.setTempRange(ui.tempRange)
+  planet.setClimateField(ui.climateField)
+  applySunDir()
+
+  // Initialise wind uniforms to match slider defaults (uniform-only, no rebake).
+  planet.setWindField(ui.windField)
+  planet.setWindStrength(ui.windStrength)
+  planet.setWindBands(ui.windBands)
+  planet.setTurbulence(ui.turbulence)
+  planet.setRetrograde(ui.retrograde)
 
   // --- Hotkeys (route through ui state then sync GUI displays) ---
   window.addEventListener('keydown', (e) => {
@@ -373,6 +656,14 @@ async function main(): Promise<void> {
       case '4':
         ui.spin = !ui.spin
         break
+      case '5':
+        ui.view = ui.view === 'climate' ? 'normal' : 'climate'
+        applyView()
+        break
+      case '6':
+        ui.view = ui.view === 'wind' ? 'normal' : 'wind'
+        applyView()
+        break
       case 'f':
         ui.freezeLod = !ui.freezeLod
         applyFreeze()
@@ -381,7 +672,7 @@ async function main(): Promise<void> {
         ui.randomizeSeed()
         return // randomizeSeed already calls controllersRecursive().updateDisplay()
     }
-    gui.controllersRecursive().forEach((c) => c.updateDisplay())
+    tabbed.controllersRecursive().forEach((c) => c.updateDisplay())
   })
 
   // --- Resize ---
@@ -393,6 +684,7 @@ async function main(): Promise<void> {
 
   // --- Loop ---
   const clock = new THREE.Clock()
+  let elapsedS = 0
   let frameCount = 0
   let fpsAccum = 0
   let smoothFps = 0
@@ -403,6 +695,8 @@ async function main(): Promise<void> {
 
   renderer.setAnimationLoop(() => {
     const dt = Math.min(clock.getDelta(), 0.1)
+    elapsedS += dt
+    planet.setWindTime(elapsedS)
 
     // Dispatch input update to whichever controller owns this frame.
     // Only ONE controller's update runs per frame — no double input on the camera.
@@ -454,6 +748,7 @@ async function main(): Promise<void> {
         alt: altStr,
         speed: navMode === NavMode.Globe ? `${globeControls.currentSpeed.toFixed(0)} u/s` : '—',
         seed: String(seed),
+        regime: planet.getDerivedInterior().regime,
         plates: String(stats.plates),
         volcanoes: String(stats.volcanoes),
         hotspots: String(stats.hotspots),
