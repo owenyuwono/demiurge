@@ -2,6 +2,8 @@ import {
   ClampToEdgeWrapping,
   DataTexture,
   DoubleSide,
+  FrontSide,
+  HalfFloatType,
   LinearFilter,
   Matrix3,
   Mesh,
@@ -9,39 +11,50 @@ import {
   Object3D,
   Quaternion,
   RGBAFormat,
+  RedFormat,
   RepeatWrapping,
   SphereGeometry,
   UnsignedByteType,
   Vector3,
 } from 'three'
-import { MeshBasicNodeMaterial } from 'three/webgpu'
+import { MeshBasicNodeMaterial, Storage3DTexture } from 'three/webgpu'
 import {
   Break,
   Fn,
   If,
   Loop,
   asin,
-  atan2,
+  atan,
   cameraPosition,
   clamp,
+  cos,
   dot,
   exp,
   float,
+  fwidth,
+  instanceIndex,
+  interleavedGradientNoise,
   length,
   max,
   min,
   mix,
   mx_fractal_noise_float,
   mx_noise_float,
+  mx_worley_noise_float,
   normalize,
   positionWorld,
   pow,
   saturate,
+  screenCoordinate,
   select,
+  sin,
   smoothstep,
   sqrt,
   texture,
+  texture3D,
+  textureStore,
   uniform,
+  uvec3,
   vec2,
   vec3,
   vec4,
@@ -105,6 +118,13 @@ interface _FavScratch {
   wN_neg: WindSample
 }
 
+// 3D density-cache resolution: (longitude × latitude × altitude) over the cloud shell.
+// Anisotropic — the annulus is thin, so altitude needs fewer slices than the lon/lat
+// directions. r16float, so memory = LON·LAT·ALT·2 bytes (256·128·48 ≈ 3 MB).
+const CACHE_LON = 256
+const CACHE_LAT = 128
+const CACHE_ALT = 48
+
 export class VolumetricClouds {
   private readonly _scene: { add: (...o: Object3D[]) => unknown; remove: (...o: Object3D[]) => unknown }
   private readonly _climate: Climate
@@ -119,24 +139,46 @@ export class VolumetricClouds {
   // ---------------------------------------------------------------------------
   // Kept uniforms (identical to CloudShell)
   // ---------------------------------------------------------------------------
-  private readonly _uCoverage    = uniform(0.22)
-  private readonly _uScrollSpeed = uniform(0.08)
+  // NB: this is a THRESHOLD, not a fill fraction — HIGHER = LESS cloud. ~0.65 leaves big
+  // CLEAR regions (deserts, subtropical oceans) so the organizing fields can concentrate
+  // clouds into coherent systems — Earth has large cloud-free areas, not uniform cover.
+  private readonly _uCoverage    = uniform(0.65)
+  // Angular flow rate (rad/s ·windspeed) for great-circle advection — small = slow drift.
+  private readonly _uScrollSpeed = uniform(0.001)
   private readonly _uScale       = uniform(6)
-  private readonly _uWarp        = uniform(0.0)
-  private readonly _uOpacity     = uniform(0.9)
+  // Wind-aligned domain warp — shears cloud shapes ALONG the wind flow for cyclonic swirls.
+  // 0.2: visible swirl/flow; much above ~0.25 it smears clouds into thin streak filaments.
+  private readonly _uWarp        = uniform(0.2)
+  // Max cloud opacity — kept below 1 so even the densest clouds stay slightly translucent
+  // (nothing reads as a flat opaque-white cutout).
+  private readonly _uOpacity     = uniform(0.6)
   private readonly _uTime        = uniform(0)
 
-  private readonly _uBillow      = uniform(0.8)
-  private readonly _uDetail      = uniform(0.2)
+  private readonly _uBillow      = uniform(0.45)
+  private readonly _uDetail      = uniform(0.3)
   private readonly _uSoftness    = uniform(0.3)
   /** Kept for API compatibility. At 0: fully transparent; at 1: full raymarch. */
   private readonly _uVolume      = uniform(0.6)
 
-  private readonly _uFavWeight   = uniform(0.3)
+  // Regional favorability strength (moisture + wind convergence) — secondary modulator now;
+  // the warped weather map (uWeatherWeight) is the dominant organizer.
+  private readonly _uFavWeight   = uniform(0.28)
   private readonly _uMoistWeight = uniform(0.6)
-  private readonly _uConvWeight  = uniform(0.5)
+  // Convergence weight inside fav — raised so clouds gather strongly in the converging
+  // (low-pressure / cyclone) zones → the swirling cloud systems.
+  private readonly _uConvWeight  = uniform(0.8)
   private readonly _uConvGain    = uniform(2.0)
-  private readonly _uItczWeight  = uniform(0.05)
+  // Latitude-band strength — Earth-like circulation (cloudy ITCZ + storm tracks, CLEAR
+  // subtropical desert belt + poles). Carves the clear desert belts at ~30°.
+  private readonly _uItczWeight  = uniform(0.12)
+  // Weather-map strength — domain-warped low-freq organizer (big clear regions + flowing
+  // systems). Moderate (0.3): enough organization without clumping everything into solid
+  // grouped masses (higher read as "too grouped").
+  private readonly _uWeatherWeight = uniform(0.3)
+  // Voronoi "weather-cell" layer strength — tessellates cloudy regions into convection-cell
+  // sized cells (cloudy near centres, clear lanes at boundaries). 0 = off (blobby weather
+  // map), 1 = fully cellular. The structured-but-organic look (open/closed convection cells).
+  private readonly _uCellWeight  = uniform(0.5)
 
   // ---------------------------------------------------------------------------
   // New volumetric uniforms
@@ -148,8 +190,15 @@ export class VolumetricClouds {
   private readonly _uCloudThick   = uniform(0.6)
   /** Extinction / density coefficient σ_T. */
   private readonly _uSigmaT       = uniform(4.0)
-  /** Primary ray step count (dynamic Loop — live slider). */
-  private readonly _uStepCount    = uniform(40, 'int')
+  /** Primary ray step count — set per-frame by distance LOD (max = _baseStepCount). */
+  private readonly _uStepCount    = uniform(48, 'int')
+  /** Fine-step cap as a fraction of annulus thickness — LOD raises it when far (coarse,
+   *  cheap, complete) and lowers it when near (fine detail). */
+  private readonly _uStepCap      = uniform(0.11)
+  /** Distance-LOD scalars (CPU-side, applied in update()): the slider's step count is the
+   *  CLOSE-UP max; far views drop to _minSteps so distant clouds barely raymarch. */
+  private _baseStepCount = 48
+  private readonly _minSteps = 8
   /** Light-march step count per primary sample. */
   private readonly _uLightSteps   = uniform(5, 'int')
   /** Henyey-Greenstein anisotropy (0=isotropic, 0.9=strong forward). */
@@ -162,8 +211,29 @@ export class VolumetricClouds {
   private readonly _uRoundBase    = uniform(0.2)
   /** Vertical profile: smoothstep erosion start from billow top [0,1]. */
   private readonly _uBillowTop    = uniform(0.5)
-  /** Ambient light contribution weight. */
-  private readonly _uAmbient      = uniform(0.25)
+  /** Ambient light contribution weight. Low (0.08) so the SUN drives light/dark colour
+   *  contrast (3D shading) rather than a flat ambient fill that makes clouds read as
+   *  uniform white whose only variation is opacity. */
+  private readonly _uAmbient      = uniform(0.08)
+  /** Convective cloud-TYPE strength [0,1]. 0 = uniform morphology everywhere (the exact
+   *  pre-type behaviour — the slider's escape hatch); 1 = full stratus↔cumulonimbus variety
+   *  driven by the baked convergence/moisture/latitude fields (towering, denser, anvil-topped
+   *  cloud over ITCZ/convergence; flat thin stratus over calm dry subtropics). */
+  private readonly _uTypeStrength = uniform(0.6)
+
+  /**
+   * 3D density cache toggle (0 = procedural per-step noise; 1 = sample the compute-baked
+   * 3D density texture). Live uniform — the fragment branches on it (uniform control flow,
+   * so the unused path costs nothing at runtime). Default 0 (off) for safety.
+   */
+  private readonly _uUseCache = uniform(0.0)
+
+  /**
+   * Debug "cloud map" mode (0 = volumetric raymarch; 1 = flat coverage heatmap + contour
+   * outlines). Used by the 'cloud' view to study cloud formation/topology cheaply (one
+   * density sample per pixel, no march).
+   */
+  private readonly _uDebugMode = uniform(0.0)
 
   /**
    * Per-frame inverse-rotation mat3 uniform.
@@ -180,6 +250,16 @@ export class VolumetricClouds {
   private _mat:     MeshBasicNodeMaterial | null = null
   private _windTex: DataTexture | null = null
   private _favTex:  DataTexture | null = null
+
+  // 3D density cache (compute-baked). Off by default; toggled via setUseCache().
+  private _cacheTex:    Storage3DTexture | null = null
+  /** Compute node that fills _cacheTex; re-dispatched every _bakeInterval frames. */
+  private _bakeNode:    unknown = null
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private _renderer:    { compute: (n: any) => unknown } | null = null
+  private _useCache     = false
+  private _bakeCounter  = 0
+  private readonly _bakeInterval = 20   // re-bake every N frames (clouds drift slowly)
 
   private _visible = false
 
@@ -245,6 +325,44 @@ export class VolumetricClouds {
     if (this._mesh !== null) this._mesh.visible = v
   }
 
+  // ---------------------------------------------------------------------------
+  // 3D density cache control
+  // ---------------------------------------------------------------------------
+
+  /** Provide the WebGPURenderer so the cloud layer can dispatch its bake compute pass. */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  setRenderer(r: { compute: (n: any) => unknown }): void { this._renderer = r }
+
+  /**
+   * Toggle the compute-baked 3D density cache. ON → cheap trilinear lookups, dither off,
+   * no grain. Live (a uniform branch) — no rebuild. Resets the bake counter so the next
+   * maybeBake() re-fills the cache immediately (it's stale/empty when first switched on).
+   */
+  setUseCache(v: boolean): void {
+    this._useCache = v
+    this._uUseCache.value = v ? 1 : 0
+    this._bakeCounter = 0
+  }
+
+  /**
+   * Re-dispatch the density bake every _bakeInterval frames (and immediately when first
+   * enabled). Call once per frame from the render loop AFTER update() (so uTime/advection
+   * are current). No-op when the cache is off, hidden, or the renderer isn't set.
+   */
+  maybeBake(): void {
+    if (!this._useCache || !this._visible || this._bakeNode === null || this._renderer === null) return
+    if (this._bakeCounter % this._bakeInterval === 0) {
+      try {
+        this._renderer.compute(this._bakeNode)
+      } catch (e) {
+        // A bad bake must never take down the render loop — fall back to procedural.
+        console.warn('[clouds] density-cache bake failed; disabling cache', e)
+        this.setUseCache(false)
+      }
+    }
+    this._bakeCounter++
+  }
+
   /** Live — mutates uniform, no rebuild. */
   setCoverage(v: number):    void { this._uCoverage.value    = v }
   setScrollSpeed(v: number): void { this._uScrollSpeed.value = v }
@@ -262,6 +380,23 @@ export class VolumetricClouds {
   setConvWeight(v: number):  void { this._uConvWeight.value  = v }
   setConvGain(v: number):    void { this._uConvGain.value    = v }
   setItczWeight(v: number):  void { this._uItczWeight.value  = v }
+  setWeatherWeight(v: number): void { this._uWeatherWeight.value = v }
+  setCellWeight(v: number): void { this._uCellWeight.value = v }
+
+  /**
+   * Debug "cloud map" mode. ON → flat coverage heatmap + contour outlines (study formation);
+   * OFF → normal volumetric clouds. Also flips the material to opaque single-side depth-write
+   * so the map renders cleanly (vs the translucent double-side volumetric shell).
+   */
+  setDebugMode(on: boolean): void {
+    this._uDebugMode.value = on ? 1 : 0
+    if (this._mat !== null) {
+      this._mat.transparent = !on
+      this._mat.depthWrite  = on
+      this._mat.side        = on ? FrontSide : DoubleSide
+      this._mat.needsUpdate = true
+    }
+  }
 
   // ---------------------------------------------------------------------------
   // New volumetric setters
@@ -274,7 +409,7 @@ export class VolumetricClouds {
   /** Extinction coefficient σ_T (density strength). */
   setDensity(v: number):      void { this._uSigmaT.value      = v }
   /** Primary ray step count (int). */
-  setStepCount(v: number):    void { this._uStepCount.value    = Math.max(1, Math.round(v)) }
+  setStepCount(v: number):    void { this._baseStepCount = Math.max(1, Math.round(v)) }
   /** Light-march step count per sample (int). */
   setLightSteps(v: number):   void { this._uLightSteps.value   = Math.max(1, Math.round(v)) }
   /** Henyey-Greenstein anisotropy g. Clamped [0, 0.95] to prevent infinite HG denominator. */
@@ -289,6 +424,8 @@ export class VolumetricClouds {
   setBillowTop(v: number):    void { this._uBillowTop.value    = v }
   /** Ambient light weight. */
   setAmbient(v: number):      void { this._uAmbient.value      = v }
+  /** Convective cloud-type strength (0 = uniform; 1 = full stratus↔cumulonimbus variety). */
+  setTypeStrength(v: number): void { this._uTypeStrength.value = v }
 
   /**
    * Thin alias for setCloudBase — kept for Planet API compatibility.
@@ -331,8 +468,27 @@ export class VolumetricClouds {
       }
     }
 
-    // camWorldPos is intentionally unused — cameraPosition built-in is preferred.
-    void camWorldPos
+    // --- Distance LOD ---------------------------------------------------------
+    // Raymarching is the expensive part, and from far away the volumetric depth isn't
+    // perceptible — so scale the march down with distance: full steps + fine cap up close
+    // (volumetric detail), few steps + coarse cap from orbit (cheap, still covers the thin
+    // shell). The planet is at the world origin, so |camWorldPos| − radius = altitude.
+    if (camWorldPos !== undefined) {
+      const alt = camWorldPos.length() - this._radius
+      // closeness: 1 below ~2·heightScale (near/in the cloud layer) → 0 above ~0.4·radius.
+      const closeAlt = this._heightScale * 2
+      const farAlt   = this._radius * 0.4
+      const tRaw     = (alt - closeAlt) / (farAlt - closeAlt)
+      const t        = tRaw < 0 ? 0 : tRaw > 1 ? 1 : tRaw
+      const closeness = 1 - (t * t * (3 - 2 * t))   // smoothstep, inverted: 1 near, 0 far
+      this._uStepCount.value = Math.max(
+        this._minSteps,
+        Math.round(this._minSteps + (this._baseStepCount - this._minSteps) * closeness),
+      )
+      // Cap: 0.11 (fine) up close → ~1.0 (coarse, whole-path) far, so the few far steps
+      // still span the long grazing paths instead of being capped to tiny chunks.
+      this._uStepCap.value = 0.11 + (1.0 - 0.11) * (1 - closeness)
+    }
   }
 
   /**
@@ -550,16 +706,22 @@ export class VolumetricClouds {
     const uConvWeight   = this._uConvWeight
     const uConvGain     = this._uConvGain
     const uItczWeight   = this._uItczWeight
+    const uWeatherWeight = this._uWeatherWeight
+    const uCellWeight   = this._uCellWeight
     const uSunDir       = this._uSunDir
     const uSigmaT       = this._uSigmaT
     const uLightSteps   = this._uLightSteps
     const uStepCount    = this._uStepCount
+    const uStepCap      = this._uStepCap
     const uHgAnisotropy = this._uHgAnisotropy
     const uPowder       = this._uPowder
     const uAmbient      = this._uAmbient
+    const uTypeStrength = this._uTypeStrength
     const uOpacity      = this._uOpacity
     const uCloudBase    = this._uCloudBase
     const uCloudThick   = this._uCloudThick
+    const uUseCache     = this._uUseCache
+    const uDebugMode    = this._uDebugMode
     const windTex       = this._windTex!
     const favTex        = this._favTex!
 
@@ -570,22 +732,32 @@ export class VolumetricClouds {
     const INV_PI         = float(1 / Math.PI)
     const EPS            = float(1e-4)
     const PI_4           = float(Math.PI * 4)   // 4π for HG denominator
-    const NORM_BILLOW    = float(1 / 1.875)     // normalization for 4-octave billow
+    // Vertical span (in noise units) the annulus covers — gives the clouds 3D thickness
+    // instead of an extruded slab. Kept LOW (1.2): higher makes the density vary in regular
+    // vertical SHELLS that, viewed edge-on from the surface horizon, read as stacked
+    // lenticular "plates"/contour-lines (the stratified artifact).
+    const VERT_NOISE     = float(1.2)
+
+    // three's .d.ts under-types mx_worley_noise_float (caps args at 2), but its runtime
+    // overload dispatches by EXACT arg count and the 3D form needs (p, jitter, metric).
+    // Wrap with a cast so we can pass all three: jitter=1 (organic), metric=0 (euclidean).
+    const worley = mx_worley_noise_float as unknown as
+      (p: unknown, jitter: number, metric: number) => ReturnType<typeof float>
 
     // ---------------------------------------------------------------------------
     // density(p: vec3) -> float [0,1]
     // Returns the cloud fraction at world-frame point p.
     // ---------------------------------------------------------------------------
     type NodeLike = ReturnType<typeof vec3>
-    const densityFn = Fn<readonly [NodeLike]>(([p]) => {
-
-      // Transform to planet-local for direction UV (planet spins with _uInvRot)
-      const pLocal = uInvRot.mul(p)
-      const dLocal = normalize(pLocal)
+    type NodeF    = ReturnType<typeof float>
+    // densityCore takes the planet-LOCAL unit direction and the radius |p| directly (no
+    // uInvRot), so the compute bake can call it over reconstructed (lon, lat, altitude)
+    // grid coordinates. World-space callers wrap it (see `density` below).
+    const densityCore = Fn<readonly [NodeLike, NodeF]>(([dLocal, pLen]) => {
 
       // Equirect UV — must match bake convention exactly
       // u = atan2(d.x, d.z)/(2π)+0.5   v = asin(clamp(d.y,-1,1))/π+0.5
-      const u = atan2(dLocal.x, dLocal.z).mul(INV_2PI).add(0.5)
+      const u = atan(dLocal.x, dLocal.z).mul(INV_2PI).add(0.5)
       const v = asin(clamp(dLocal.y, -1, 1)).mul(INV_PI).add(0.5)
       const uvCoord = vec2(u, v)
 
@@ -597,63 +769,245 @@ export class VolumetricClouds {
       // Fav texture: g = moisture, b = tanh-packed convergence
       const favSample = texture(favTex, uvCoord)
 
+      // --- Cloud TYPE (convective morphology) -----------------------------------------
+      // Continuous stratus↔cumulonimbus scalar from the already-baked climate fields: wind
+      // convergence (low-pressure / ITCZ updraft) + moisture + the cloudy latitude bands →
+      // towering, denser, anvil-topped convective cloud; calm dry subtropics → flat thin
+      // stratus. Drives DENSITY + an anvil bump only (placement still comes from the weather
+      // map below). uTypeStrength=0 → cloudType=0 everywhere = EXACTLY the pre-type behaviour.
+      const convRawT  = favSample.b.mul(2).sub(1)
+      const absYT     = dLocal.y.abs()
+      const itczT     = smoothstep(0.0, 0.22, absYT).oneMinus()
+      const stormT    = saturate(smoothstep(0.55, 0.74, absYT).sub(smoothstep(0.86, 0.96, absYT)))
+      const cloudType = saturate(
+        saturate(convRawT.mul(uConvGain)).mul(0.55)
+          .add(favSample.g.mul(0.2))
+          .add(max(itczT, stormT).mul(0.35)),
+      ).mul(uTypeStrength)
+
       // Vertical profile: heightFrac = (|p| - innerR) / (outerR - innerR)
       // Clamp multipliers so the cloud shell always stays below the atmosphere (2.5×heightScale).
       const innerMul_v = min(uCloudBase, float(2.4))
       const outerMul_v = min(uCloudBase.add(uCloudThick), float(2.45))
       const innerR_v   = RADIUS_C.add(HEIGHT_SCALE_C.mul(innerMul_v))
       const outerR_v   = RADIUS_C.add(HEIGHT_SCALE_C.mul(outerMul_v))
-      const pLen       = length(p)
       const heightFrac = clamp(pLen.sub(innerR_v).div(outerR_v.sub(innerR_v)), 0, 1)
       // profile = smoothstep(0, roundBase, hf) * (1 - smoothstep(1-billowTop, 1, hf))
       const profile = smoothstep(float(0), uRoundBase, heightFrac)
         .mul(smoothstep(float(1), float(1).sub(uBillowTop), heightFrac).oneMinus())
 
-      // Wind-advected noise point
-      const p0       = dLocal.mul(uScale)
-      const drift    = windVec.mul(speed).mul(uScrollSpeed.mul(uTime))
+      // Great-circle advection of the sampling DIRECTION along the local wind.
+      // The whole cloud field flows coherently over the sphere — masses drift and
+      // visibly MERGE, rather than the noise morphing in place and blinking clouds
+      // in/out against a static gate ("appearing out of thin air"). Because this is
+      // a bounded rotation it never collapses over long sessions (unlike unbounded
+      // linear drift in noise space). windDir is guarded against normalize(0) at calm
+      // eyes/doldrums — there speed→0 so arc→0 and dAdv = dLocal (no motion), as wanted.
+      // NB: coverage/favorability below stays sampled at the STATIC dLocal, so clouds
+      // still cluster in climate-fixed humid zones and thin out as they drift into dry
+      // air (natural formation/dissipation) instead of being rigidly painted on.
+      const windDir = windVec.div(max(length(windVec), float(1e-4)))
+      const arc     = uScrollSpeed.mul(uTime).mul(speed)
+      const dAdv    = normalize(dLocal.mul(cos(arc)).add(windDir.mul(sin(arc))))
+
+      // Noise sample point. The sample RADIUS grows with altitude through the annulus
+      // (`uScale + heightFrac·VERT_NOISE`), so the noise is sampled across the shell's
+      // thickness as a true 3D volume — clouds gain top-to-bottom structure instead of
+      // being a 2D direction map extruded into flat-topped/flat-bottomed slabs (the
+      // "blocky/cartoon" look). A small wind-aligned domain warp keeps the flow soft.
+      const rNoise   = uScale.add(heightFrac.mul(VERT_NOISE))
+      const p0       = dAdv.mul(rNoise)
       const poleFade = saturate(smoothstep(0.85, 1.0, dLocal.y.abs()).oneMinus())
       const warpN    = mx_noise_float(p0.mul(0.5))
-      const warp     = windVec.mul(speed).mul(uWarp).mul(poleFade).mul(warpN)
-      const pAdv     = p0.add(drift).add(warp)
+      const warp     = windDir.mul(speed).mul(uWarp).mul(poleFade).mul(warpN)
+      const pAdv     = p0.add(warp)
 
-      // Billow: 4-octave sum of |mx_noise_float| — puffy cauliflower
-      const billow = mx_noise_float(pAdv).abs()
-        .add(mx_noise_float(pAdv.mul(2)).abs().mul(0.5))
-        .add(mx_noise_float(pAdv.mul(4)).abs().mul(0.25))
-        .add(mx_noise_float(pAdv.mul(8)).abs().mul(0.125))
-        .mul(NORM_BILLOW)
+      // Worley (cellular) FBM — inverted so cell CENTRES are lumps. This is the real
+      // "cauliflower" cloud structure (the Perlin-Worley basis used by Nubis / Blender
+      // cloud materials), a big step up from the old sum-of-|gradient-noise| billow which
+      // read as uniform popcorn. jitter=1 (organic placement), metric=0 (euclidean → round
+      // blobs, not boxy). Worley is EXPENSIVE (27-cell loop/sample) and runs at every march
+      // + light-march step, so only 2 octaves until the 3D density cache lands (which is
+      // exactly how the reference affords rich Worley). Weights sum to 1 → output ~[0,1].
+      const worleyFBM = worley(pAdv, 1.0, 0).oneMinus().mul(0.65)
+        .add(worley(pAdv.mul(2.0), 1.0, 0).oneMinus().mul(0.35))
 
-      // FBM base
+      // FBM base (Perlin-like connected structure)
       const fbmD = mx_fractal_noise_float(pAdv, 4, 2, 0.5).mul(0.5).add(0.5)
 
-      // Blend billow vs FBM, then apply detail erosion
-      const baseShape = mix(fbmD, billow, uBillow)
-      const detailN   = mx_noise_float(pAdv.mul(uDetailScale)).abs()
-      const eroded    = saturate(baseShape.sub(detailN.mul(uDetail)))
+      // Perlin↔Worley blend — uBillow is now the Worley weight: the Worley term gives the
+      // puffy cellular lumps, the FBM gives the connected wispy backbone.
+      const baseShape = mix(fbmD, worleyFBM, uBillow)
+
+      // Detail erosion — Nubis remap-from-edge instead of a flat subtract. This
+      // DILATES dense cores (a fully-dense sample stays dense) and carves only the
+      // low-density fringe, giving fluffy cauliflower bases and torn, wispy tops
+      // rather than uniformly greying the whole field.
+      // 2-octave high-frequency detail in ~[0,1].
+      const hiFBM = mx_noise_float(pAdv.mul(uDetailScale)).abs().mul(0.625)
+        .add(mx_noise_float(pAdv.mul(uDetailScale).mul(2)).abs().mul(0.375))
+      // Height-graded: erode with hiFBM near the base (round billowy bottoms),
+      // with its inverse near the top (wispy, sheared tops).
+      const modifier = mix(hiFBM, hiFBM.oneMinus(), saturate(heightFrac.mul(5)))
+      const erodeAmt = saturate(modifier.mul(uDetail))
+      // remapClamp(baseShape, erodeAmt, 1) = saturate((baseShape - erodeAmt)/(1 - erodeAmt)).
+      const shape = baseShape.remapClamp(erodeAmt, float(1))
 
       // ---------------------------------------------------------------------------
       // Coverage gate using favorability (verbatim from CloudShell)
       // ---------------------------------------------------------------------------
+      // Regional favorability: moisture + wind convergence (negative divergence). Humid /
+      // converging air → cloud; dry / DIVERGING (sinking) air → clear. The sinking branch is
+      // what dries continental interiors → deserts like the Sahara are cloud-free.
       const moistTerm = favSample.g
       const conv      = favSample.b.mul(2).sub(1)
       const convTerm  = saturate(conv.mul(uConvGain))
+      const fav = saturate(uMoistWeight.mul(moistTerm).add(uConvWeight.mul(convTerm)))
 
+      // Earth-like LATITUDE circulation bands — the DOMINANT large-scale pattern (this is
+      // why real cloud cover is banded, not random). |dLocal.y| = |sin(lat)|: 0=equator,
+      // 0.5≈30°, 0.82≈55°, 1=pole. Cloudy ITCZ (equator) + cloudy mid-latitude storm tracks
+      // (~45-60°); CLEAR subtropical highs (~30°, descending/drying air → the desert belt)
+      // and clear poles. latSigned ∈ [-1,+1]: +1 in the cloud bands, -1 in the clear belts.
       const absY      = dLocal.y.abs()
-      const itczPart  = smoothstep(0.0, 0.25, absY).oneMinus().mul(0.6)
-      const stormPart = smoothstep(0.45, 0.6, absY).sub(smoothstep(0.7, 0.85, absY)).mul(0.4)
-      const itczTerm  = itczPart.add(stormPart)
+      const itcz      = smoothstep(0.0, 0.22, absY).oneMinus()
+      const storm     = saturate(smoothstep(0.55, 0.74, absY).sub(smoothstep(0.86, 0.96, absY)))
+      const latBand   = max(itcz, storm)
+      const latSigned = latBand.sub(0.5).mul(2.0)
 
-      const fav = saturate(
-        uMoistWeight.mul(moistTerm)
-          .add(uConvWeight.mul(convTerm))
-          .add(uItczWeight.mul(itczTerm))
-      )
-      const t0       = uCoverage.sub(uFavWeight.mul(fav.sub(0.5)))
-      const coverage = saturate(smoothstep(t0, t0.add(uSoftness), eroded))
+      // === Domain-warped LOW-FREQUENCY weather map — THE large-scale organizer ===
+      // The fix for "random scatter → continuous weather systems" (per Nubis / iq warping):
+      // cloud PLACEMENT comes from a LOW-frequency field that is DOMAIN-WARPED — folded by a
+      // noise vector (iq domain warping → flowing organic masses) and dragged by the wind (the
+      // vortex wind is curl-like → coverage spirals into fronts/cyclones). The high-freq
+      // `shape` above no longer decides placement; it only carves silhouette detail INSIDE the
+      // covered zones. uWeatherWeight is the weather-map strength (now the dominant term).
+      const W_SCALE = float(1.8)   // low freq → a few weather systems per hemisphere
+      const warpVec = vec3(
+        mx_noise_float(dLocal.mul(W_SCALE)),
+        mx_noise_float(dLocal.mul(W_SCALE).add(19.1)),
+        mx_noise_float(dLocal.mul(W_SCALE).add(43.7)),
+      ).mul(0.28).add(windDir.mul(speed).mul(0.12))   // noise folding kept; directional wind
+      const dWeather      = normalize(dLocal.add(warpVec))   // stretch cut hard (it smeared clouds into streaks)
+      // Low-freq fbm at the warped direction → smooth flowing organized systems; sharpened
+      // into big cloudy/clear REGIONS (clear deserts vs cloudy storm zones).
+      const weatherRaw    = mx_fractal_noise_float(dWeather.mul(W_SCALE), 4, 2.0, 0.55).mul(0.5).add(0.5)
+      const weatherShaped = smoothstep(float(0.42), float(0.58), weatherRaw)
 
-      // Final density = coverage gate × vertical profile
-      return coverage.mul(profile)
+      // Large-scale Voronoi WEATHER CELLS — tessellate the cloudy regions into convection-
+      // cell-sized cells (cloudy near the cell CENTRE, clear lanes at the BOUNDARIES = fronts)
+      // → the open/closed-convection-cell look. Sampled at a LIGHTLY-warped direction so the
+      // cells flow with the wind but stay recognizably cellular (the strong dWeather warp
+      // would scramble them). jitter=1 → irregular organic cells, not a visible grid.
+      const dCell  = normalize(dLocal.add(warpVec.mul(0.3)))
+      const cellF1 = worley(dCell.mul(1.5), 1.0, 0)                       // 0 at centres → high at edges (~25 cells)
+      const cells  = smoothstep(float(0.3), float(0.55), cellF1).oneMinus()   // 1 over cell body, 0 in boundary lanes
+      // Blend cells INTO the weather map (so cells only appear where the map is cloudy → variety
+      // comes from the map, cellular structure from Voronoi). uCellWeight: 0 = blobby, 1 = cellular.
+      const weatherCells = mix(weatherShaped, weatherShaped.mul(cells), uCellWeight)
+
+      // Coverage threshold (lower = more cloud). The warped weather map DOMINATES (big clear
+      // regions + continuous flowing systems); latitude bands add the desert belts; moisture /
+      // convergence add regional detail.
+      const t0raw    = uCoverage
+        .sub(uWeatherWeight.mul(weatherCells.sub(0.5)).mul(2.0))
+        .sub(uItczWeight.mul(latSigned))
+        .sub(uFavWeight.mul(fav.sub(0.5)))
+      // Cap the threshold so even the CLEAREST regions still let the highest shape peaks
+      // poke through as small scattered SPECKS — fair-weather clouds dotting an otherwise
+      // clear sky (Earth has these everywhere, not only in the big organized systems).
+      const t0       = min(t0raw, float(0.93))
+      const coverage = saturate(smoothstep(t0, t0.add(uSoftness), shape))
+
+      // Fine density MOTTLE — 2-octave high-freq noise sampled at the advected point pAdv
+      // (so it drifts WITH the cloud), strongly varying density within clouds → the
+      // colour/opacity cycles between bright white (dense), grey (thinner) and translucent
+      // (thinnest holes) so NOTHING is flat pure-white-opaque. Pairs with the density-tied
+      // `texVar` colour term. Wide range (0.3–1.0) = lots of internal variation.
+      const mottle = mx_noise_float(pAdv.mul(13.0)).mul(0.5).add(0.5).mul(0.65)
+        .add(mx_noise_float(pAdv.mul(31.0)).mul(0.5).add(0.5).mul(0.35))   // [0,1]
+
+      // Convective shaping (cloud TYPE): cumulonimbus pile higher (an anvil bump in the upper
+      // band, ADDED proportional to the existing profile so it never paints cloud into clear
+      // sky) and read optically thicker; stratus stays thin. Both terms vanish at cloudType=0.
+      const anvil       = smoothstep(float(0.72), float(0.98), heightFrac).mul(cloudType).mul(0.4)
+      const profileT    = saturate(profile.add(profile.mul(anvil)))
+      const typeDensity = mix(float(1.0), float(1.5), cloudType)
+
+      // Final density = coverage gate × vertical profile × mottle × convective thickness.
+      return coverage.mul(profileT).mul(mix(float(0.3), float(1.0), mottle)).mul(typeDensity)
+    })
+
+    // ---------------------------------------------------------------------------
+    // 3D density cache (compute-baked). densityCore is expensive (2× Worley/sample);
+    // baking it into a 3D texture lets the march read cheap trilinear lookups, so we can
+    // drop the dither (the cache is smooth) and afford many steps → no grain.
+    // Parameterized as (longitude × latitude × altitude) over the shell, in planet-LOCAL
+    // frame (so it rides the planet spin via uInvRot at sample time — no re-bake for spin).
+    // ---------------------------------------------------------------------------
+    const cacheTex = new Storage3DTexture(CACHE_LON, CACHE_LAT, CACHE_ALT)
+    cacheTex.format    = RedFormat       // single channel
+    cacheTex.type      = HalfFloatType   // → r16float (guaranteed trilinear-filterable)
+    cacheTex.wrapS     = RepeatWrapping        // longitude wraps
+    cacheTex.wrapT     = ClampToEdgeWrapping   // latitude clamps at the poles
+    cacheTex.wrapR     = ClampToEdgeWrapping   // altitude clamps
+    cacheTex.minFilter = LinearFilter
+    cacheTex.magFilter = LinearFilter
+    this._cacheTex = cacheTex
+
+    const TWO_PI_C = float(2 * Math.PI)
+    const PI_C     = float(Math.PI)
+
+    // Bake kernel — one invocation per texel. Decode the 1-D dispatch index into
+    // (lon, lat, alt), reconstruct the planet-local direction + radius (inverting the
+    // densityCore equirect UV convention exactly), evaluate densityCore, store to .r.
+    // Texture sampling inside compute is handled automatically by TSL (textureSampleLevel 0).
+    const bakeFn = Fn(() => {
+      const xi = instanceIndex.mod(CACHE_LON)
+      const yi = instanceIndex.div(CACHE_LON).mod(CACHE_LAT)
+      const zi = instanceIndex.div(CACHE_LON * CACHE_LAT)
+
+      const uu = float(xi).add(0.5).div(CACHE_LON)
+      const vv = float(yi).add(0.5).div(CACHE_LAT)
+      const ww = float(zi).add(0.5).div(CACHE_ALT)
+
+      const lon    = uu.sub(0.5).mul(TWO_PI_C)
+      const lat    = vv.sub(0.5).mul(PI_C)
+      const cosLat = cos(lat)
+      const dLocal = vec3(cosLat.mul(sin(lon)), sin(lat), cosLat.mul(cos(lon)))
+
+      const innerMul_b = min(uCloudBase, float(2.4))
+      const outerMul_b = min(uCloudBase.add(uCloudThick), float(2.45))
+      const innerR_b   = RADIUS_C.add(HEIGHT_SCALE_C.mul(innerMul_b))
+      const outerR_b   = RADIUS_C.add(HEIGHT_SCALE_C.mul(outerMul_b))
+      const pLen       = innerR_b.add(ww.mul(outerR_b.sub(innerR_b)))
+
+      const d = densityCore(dLocal, pLen)
+      textureStore(cacheTex, uvec3(xi, yi, zi), vec4(d, 0, 0, 1))
+    })
+    this._bakeNode = bakeFn().compute(CACHE_LON * CACHE_LAT * CACHE_ALT)
+
+    // Cheap cache lookup at a world point: world → local dir + altitude → trilinear tap.
+    const sampleCache = (p: NodeLike): NodeF => {
+      const dLocal = normalize(uInvRot.mul(p))
+      const u = atan(dLocal.x, dLocal.z).mul(INV_2PI).add(0.5)
+      const v = asin(clamp(dLocal.y, -1, 1)).mul(INV_PI).add(0.5)
+      const innerR_c = RADIUS_C.add(HEIGHT_SCALE_C.mul(min(uCloudBase, float(2.4))))
+      const outerR_c = RADIUS_C.add(HEIGHT_SCALE_C.mul(min(uCloudBase.add(uCloudThick), float(2.45))))
+      const w = clamp(length(p).sub(innerR_c).div(outerR_c.sub(innerR_c)), 0, 1)
+      return texture3D(cacheTex, vec3(u, v, w)).r
+    }
+
+    // World-space density used by the march. Branches on the cache toggle (uniform control
+    // flow → the unused branch costs nothing at runtime). Cache off → procedural densityCore.
+    const density = Fn<readonly [NodeLike]>(([p]) => {
+      const out = float(0.0).toVar()
+      If(uUseCache.greaterThan(0.5), () => {
+        out.assign(sampleCache(p))
+      }).Else(() => {
+        out.assign(densityCore(normalize(uInvRot.mul(p)), length(p)))
+      })
+      return out
     })
 
     // ---------------------------------------------------------------------------
@@ -677,6 +1031,26 @@ export class VolumetricClouds {
       const b = dot(ro, rd)
       const c = dot(ro, ro).sub(R.mul(R))
       return b.mul(b).sub(c)
+    })
+
+    // Henyey-Greenstein phase, factored so the raymarch can blend two lobes
+    // (forward for the silver lining, weak backward so anti-sun faces aren't black).
+    // p(μ,g) = (1 - g²) / (4π · (1 + g² - 2g·μ)^1.5)
+    const hgFn = Fn<readonly [NodeLikeF, NodeLikeF]>(([mu, g]) => {
+      const g2    = g.mul(g)
+      const denom = pow(float(1).add(g2).sub(g.mul(2).mul(mu)), float(1.5)).mul(PI_4)
+      return float(1).sub(g2).div(denom)
+    })
+
+    // Cornette-Shanks phase — energy-conserving Mie-like forward lobe. Sharper, more physical
+    // silver lining than plain HG (it adds the (1+μ²) Rayleigh-style factor). Used for the
+    // forward lobe; the weak back lobe stays HG. 3/(8π) = 1.5/(4π) so it reuses PI_4.
+    // p(μ,g) = 3/(8π) · (1-g²)/(2+g²) · (1+μ²) / (1+g²-2gμ)^1.5
+    const csFn = Fn<readonly [NodeLikeF, NodeLikeF]>(([mu, g]) => {
+      const g2    = g.mul(g)
+      const numer = float(1).sub(g2).mul(float(1).add(mu.mul(mu)))
+      const denom = pow(float(1).add(g2).sub(g.mul(2).mul(mu)), float(1.5)).mul(float(2).add(g2))
+      return float(1.5).div(PI_4).mul(numer).div(denom)
     })
 
     // ---------------------------------------------------------------------------
@@ -764,63 +1138,135 @@ export class VolumetricClouds {
       const scatteredB    = float(0.0).toVar()
 
       If(noHit.not(), () => {
-        const stepLen = tExit.sub(tEnter).div(float(uStepCount))
+        // Fine (in-cloud) step: path/count, CAPPED to ~10% of the annulus THICKNESS so
+        // horizon-grazing rays (long near-tangent path through the thin shell) stay finely
+        // sampled instead of divided into coarse chunks (that coarse sampling, dithered,
+        // was the heavy grain). Grazing rays may not reach tExit within the budget; the
+        // early-out covers dense cases and any far clip is graceful (distant clouds fade).
+        const pathLen  = tExit.sub(tEnter)
+        const fineStep = min(pathLen.div(float(uStepCount)), outerR_f.sub(innerR_f).mul(uStepCap))
+        // Empty-space scout step. Skipping empty air is the MAIN perf lever — most of a ray
+        // through a ~22%-coverage shell is empty; a full march of every step is far too
+        // expensive (it overloads the GPU and hangs the page). Scout big-steps until it
+        // finds cloud, then refines.
+        const bigStep  = fineStep.mul(2.0)
 
         // Sun color: warm white
         const SUN_R = float(1.00)
         const SUN_G = float(0.95)
         const SUN_B = float(0.85)
-        // Sky ambient: cool blue-grey
+        // Ambient sky colour, altitude-graded: cool blue-grey skylight up high (SKY_*) →
+        // darker, earthier ground-bounce down low (GND_*), mixed by the sample's heightFrac
+        // in the annulus. Cloud undersides read darker/warmer, tops bluer — tying the cloud
+        // into the sky instead of a flat constant fill.
         const SKY_R = float(0.45)
         const SKY_G = float(0.52)
         const SKY_B = float(0.72)
+        const GND_R = float(0.30)
+        const GND_G = float(0.32)
+        const GND_B = float(0.36)
 
-        // Henyey-Greenstein phase: (1 - g²) / (4π · (1 + g² - 2g·cosθ)^1.5)
+        // Dual-lobe Henyey-Greenstein: a forward lobe (uHgAnisotropy) gives the
+        // silver lining toward the sun; a fixed weak back lobe (g=-0.3) keeps faces
+        // turned away from the sun gently lit instead of crushing to black.
         const cosTheta = dot(rd, uSunDir)
-        const g        = uHgAnisotropy
-        const g2       = g.mul(g)
-        const hgBase   = float(1).add(g2).sub(g.mul(2).mul(cosTheta))
-        const hgDenom  = pow(hgBase, float(1.5)).mul(PI_4)
-        const hgPhase  = float(1).sub(g2).div(hgDenom)
+        const hgPhase  = mix(
+          csFn(cosTheta, uHgAnisotropy),     // forward: energy-conserving Cornette-Shanks
+          hgFn(cosTheta, float(-0.3)),       // weak back lobe (HG) so anti-sun faces aren't black
+          float(0.5),
+        )
+        // Powder view-gate: 1 on the anti-sun hemisphere, 0 toward the sun, so the
+        // dark-edge term stops fighting the silver lining (uPowder = its strength).
+        const powderGate = saturate(cosTheta.mul(-0.5).add(0.5))
 
         // Light-march step: half annulus / nLightSteps
         const annulusHalf = outerR_f.sub(innerR_f).mul(0.5)
         const lightStep   = annulusHalf.div(float(uLightSteps))
 
-        Loop(uStepCount, ({ i }: { i: ReturnType<typeof float> }) => {
-          const t = tEnter.add(float(i).add(0.5).mul(stepLen))
-          const p = ro.add(rd.mul(t))
+        // Blue-noise (interleaved gradient noise) ray-start dither — breaks step banding.
+        // Amplitude 0.3 normally; ZERO when the cache is on (its trilinear-smooth density
+        // has no high-frequency banding to hide, so the dither would only add grain).
+        // NB: screen-locked/static — it redistributes undersampling error but cannot reduce
+        // it, so a faint stable grain remains. The categorical fix is temporal accumulation
+        // (offscreen history + reproject), which is NOT implemented yet.
+        const jitter  = interleavedGradientNoise(screenCoordinate.xy)
+        const tCur    = tEnter.add(jitter.mul(float(0.3).sub(uUseCache.mul(0.3))).mul(fineStep)).toVar()
+        const refined = float(0.0).toVar()   // 0 = scouting (big steps), 1 = fine march
 
-          const d = densityFn(p)
+        Loop(uStepCount, () => {
+          If(tCur.greaterThanEqual(tExit), () => { Break() })
 
-          If(d.greaterThan(EPS), () => {
-            // Light march toward sun — accumulate optical depth
-            const sumL = float(0.0).toVar()
-            Loop(uLightSteps, ({ i: j }: { i: ReturnType<typeof float> }) => {
-              const lp = p.add(uSunDir.mul(lightStep.mul(float(j).add(0.5))))
-              sumL.addAssign(densityFn(lp))
+          const p = ro.add(rd.mul(tCur))
+
+          If(refined.lessThan(0.5), () => {
+            // Scouting: big-step through empty air. On the FIRST hit, back up one big step
+            // (clamped to tEnter) and switch to fine steps so the near face isn't quantized
+            // to the coarse scout grid (that read blocky).
+            const dScout = density(p)
+            If(dScout.greaterThan(EPS), () => {
+              tCur.assign(max(tCur.sub(bigStep), tEnter))
+              refined.assign(1)
+            }).Else(() => {
+              tCur.addAssign(bigStep)
+            })
+          }).Else(() => {
+            // Fine march: full density; the expensive light-march only fires inside cloud.
+            const d = density(p)
+
+            If(d.greaterThan(EPS), () => {
+              // Light march toward sun — accumulate optical depth
+              const sumL = float(0.0).toVar()
+              Loop(uLightSteps, ({ i: j }: { i: ReturnType<typeof float> }) => {
+                const lp = p.add(uSunDir.mul(lightStep.mul(float(j).add(0.5))))
+                sumL.addAssign(density(lp))
+              })
+
+              // Beer-powder dark-edge term, view-gated toward the anti-sun hemisphere.
+              const powderRaw = float(1).sub(exp(d.negate().mul(2)))
+              const powder    = mix(float(1), powderRaw, powderGate.mul(uPowder))
+
+              // Multi-octave "multiscatter" Beer (Wrenninge/Hillaire): approximate multiple
+              // scattering by summing the single-scatter term over a few octaves, each dimmer
+              // (bⁿ), penetrating deeper (aⁿ softens extinction) and more isotropic (cⁿ
+              // flattens the phase). Thick cloud interiors GLOW softly instead of crushing to
+              // a flat value — the key to a voluminous, non-flat look — while thin edges stay
+              // dark (powder). Costs 3 cheap iters (no extra density samples → no perf risk).
+              const lum = float(0.0).toVar()
+              Loop(3, ({ i: n }: { i: ReturnType<typeof float> }) => {
+                const kN   = pow(float(0.5), float(n))                              // aⁿ = bⁿ = cⁿ
+                const extN = exp(sumL.negate().mul(uSigmaT).mul(lightStep).mul(kN)) // aⁿ on extinction
+                const phN  = mix(float(1).div(PI_4), hgPhase, kN)                   // cⁿ: phase → isotropic
+                lum.addAssign(kN.mul(extN).mul(phN))                                // bⁿ contribution
+              })
+              const lit = lum.mul(powder)
+
+              // Cloud TEXTURE — tie brightness to the local density so the noisy Worley
+              // structure shows in the colour: thin/wispy samples render greyer/dimmer,
+              // dense cores stay bright white. This breaks up the flat "opaque white" look
+              // and reads as a textured volume. (Density varies with the cloud's own noise
+              // and drifts with it, so the texture sticks to the cloud; works with the cache.)
+              const texVar = mix(float(0.5), float(1.0), saturate(d.mul(2.2)))
+
+              // Altitude-graded ambient colour: ground-tint below → sky-tint above.
+              const hfA  = saturate(length(p).sub(innerR_f).div(outerR_f.sub(innerR_f)))
+              const ambR = mix(GND_R, SKY_R, hfA)
+              const ambG = mix(GND_G, SKY_G, hfA)
+              const ambB = mix(GND_B, SKY_B, hfA)
+
+              // Composite: lit sun + ambient sky, scaled by density × texture.
+              const sR = lit.mul(SUN_R).add(uAmbient.mul(ambR)).mul(d).mul(texVar)
+              const sG = lit.mul(SUN_G).add(uAmbient.mul(ambG)).mul(d).mul(texVar)
+              const sB = lit.mul(SUN_B).add(uAmbient.mul(ambB)).mul(d).mul(texVar)
+
+              scatteredR.addAssign(transmittance.mul(sR).mul(fineStep).mul(uSigmaT))
+              scatteredG.addAssign(transmittance.mul(sG).mul(fineStep).mul(uSigmaT))
+              scatteredB.addAssign(transmittance.mul(sB).mul(fineStep).mul(uSigmaT))
+
+              // Beer extinction along view ray
+              transmittance.mulAssign(exp(d.negate().mul(fineStep).mul(uSigmaT)))
             })
 
-            // Beer extinction along light path
-            const lightT = exp(sumL.negate().mul(uSigmaT).mul(lightStep))
-
-            // Beer-powder dual lobe: powder = 1 - exp(-d * 2 * uPowder)
-            const powder = float(1).sub(exp(d.negate().mul(2).mul(uPowder)))
-
-            // Lit sample contribution = lightTransmittance × HG × powder
-            const lit = lightT.mul(hgPhase).mul(powder)
-
-            // Composite: lit sun + ambient sky, scaled by density
-            const sR = lit.mul(SUN_R).add(uAmbient.mul(SKY_R)).mul(d)
-            const sG = lit.mul(SUN_G).add(uAmbient.mul(SKY_G)).mul(d)
-            const sB = lit.mul(SUN_B).add(uAmbient.mul(SKY_B)).mul(d)
-
-            scatteredR.addAssign(transmittance.mul(sR).mul(stepLen).mul(uSigmaT))
-            scatteredG.addAssign(transmittance.mul(sG).mul(stepLen).mul(uSigmaT))
-            scatteredB.addAssign(transmittance.mul(sB).mul(stepLen).mul(uSigmaT))
-
-            // Beer extinction along view ray
-            transmittance.mulAssign(exp(d.negate().mul(stepLen).mul(uSigmaT)))
+            tCur.addAssign(fineStep)
           })
 
           // Early-out when transmittance is effectively zero
@@ -834,8 +1280,45 @@ export class VolumetricClouds {
       return vec4(scatteredR, scatteredG, scatteredB, opacity)
     })
 
-    // Split the vec4 output into colorNode + opacityNode
-    const fragResult  = raymarchFn()
+    // ---------------------------------------------------------------------------
+    // Debug "cloud map" — flat coverage heatmap + contour outlines (the 'cloud' view).
+    // One density sample at the annulus midpoint in the fragment's direction (no march).
+    // Filled heatmap (clear = dark navy → cloudy = bright) + yellow iso-contour outlines
+    // (cloud silhouette at 0.5 + faint 0.2/0.8 levels), so the formation/topology is legible.
+    // ---------------------------------------------------------------------------
+    const debugMapFn = Fn(() => {
+      const dir      = normalize(vec3(positionWorld))
+      const innerMul = min(uCloudBase, float(2.4))
+      const outerMul = min(uCloudBase.add(uCloudThick), float(2.45))
+      const innerR_d = RADIUS_C.add(HEIGHT_SCALE_C.mul(innerMul))
+      const outerR_d = RADIUS_C.add(HEIGHT_SCALE_C.mul(outerMul))
+      const rMid     = innerR_d.add(outerR_d).mul(0.5)
+      const cov      = density(dir.mul(rMid))
+
+      // Filled heatmap.
+      const fill = mix(vec3(0.04, 0.07, 0.16), vec3(0.85, 0.90, 1.0), saturate(cov.mul(1.4)))
+
+      // Iso-contour outlines — constant screen-space width via fwidth(cov).
+      const g    = max(fwidth(cov), float(1e-5))
+      const edge = smoothstep(float(0), g.mul(2.0), cov.sub(0.5).abs()).oneMinus()
+      const lo   = smoothstep(float(0), g.mul(1.3), cov.sub(0.2).abs()).oneMinus().mul(0.45)
+      const hi   = smoothstep(float(0), g.mul(1.3), cov.sub(0.8).abs()).oneMinus().mul(0.45)
+      const contour = max(edge, max(lo, hi))
+
+      return vec4(mix(fill, vec3(1.0, 0.88, 0.25), contour), float(1.0))
+    })
+
+    // Branch the fragment between the volumetric raymarch and the flat debug map (uniform
+    // control flow → only one path runs at runtime).
+    const fragResult = Fn(() => {
+      const out = vec4(0.0, 0.0, 0.0, 0.0).toVar()
+      If(uDebugMode.greaterThan(0.5), () => {
+        out.assign(debugMapFn())
+      }).Else(() => {
+        out.assign(raymarchFn())
+      })
+      return out
+    })()
     const colorNode   = fragResult.xyz
     const opacityNode = fragResult.w
 
@@ -882,6 +1365,11 @@ export class VolumetricClouds {
       this._favTex.dispose()
       this._favTex = null
     }
+    if (this._cacheTex !== null) {
+      this._cacheTex.dispose()
+      this._cacheTex = null
+    }
+    this._bakeNode = null
     this._visible = false
   }
 }

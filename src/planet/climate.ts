@@ -335,13 +335,16 @@ export class Climate {
   /** Curl-noise function for windAtTime eddies (stream 202). */
   private _eddyNoise!: (x: number, y: number, z: number) => number
   /** Live transient knobs — merge-updated via setWindTransient(). */
+  // Calmed defaults — the previous rates/amplitudes read as nervous jitter on the wind
+  // arrows. Lower pulseRate/eddyTimeScale = slower animation; lower pulseDepth/eddyStrength
+  // = gentler swings. (All live sliders, so they can be pushed back up.)
   private _windTransient: WindTransientParams = {
-    driftSpeed:    0.015,
-    pulseRate:     0.25,
-    pulseDepth:    0.35,
-    eddyStrength:  0.35,
+    driftSpeed:    0.010,
+    pulseRate:     0.10,
+    pulseDepth:    0.18,
+    eddyStrength:  0.20,
     eddyScale:     6,
-    eddyTimeScale: 0.3,
+    eddyTimeScale: 0.12,
   }
 
   // Scratch fields for windAtTime — zero-alloc in the hot path.
@@ -848,7 +851,12 @@ export class Climate {
           let wy = zonY + swirlStrength * eqMask * vortY
           let wz = zonZ + swirlStrength * eqMask * vortZ
 
-          // 6. Coriolis cross-isobar tilt: rotate about dir by ξ (Rodrigues).
+          // 6. Coriolis/friction cross-isobar tilt: rotate about dir by ξ (Rodrigues).
+          //    INTENTIONALLY max at the equator, →0 at the poles — this is the cross-isobar
+          //    *deflection angle*, not the Coriolis force magnitude. Per the Guldberg-Mohn /
+          //    Ekman surface balance tan(α)=friction/Coriolis, so α grows where Coriolis (∝sinφ)
+          //    is WEAKEST (the tropics) and →0 where geostrophic balance dominates (the poles).
+          //    So ξ=0 at the poles = stays geostrophic there. (Not a bug — don't "fix" the sign.)
           const latSign = lat >= 0 ? 1 : -1
           const xi = crossIsobarMax * (1 - Math.abs(Math.sin(lat))) * latSign
           const cosXi = Math.cos(xi)

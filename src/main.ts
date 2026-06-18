@@ -22,6 +22,20 @@ function getSeedFromUrl(): number {
 }
 
 async function main(): Promise<void> {
+  // --- Loading overlay (so boot is never a black screen) ---
+  const loadingEl     = document.getElementById('loading')
+  const loadingBar    = document.getElementById('loading-bar')
+  const loadingTextEl = document.getElementById('loading-text')
+  const setProgress = (pct: number, text?: string): void => {
+    if (loadingBar !== null) loadingBar.style.width = `${pct}%`
+    if (text !== undefined && loadingTextEl !== null) loadingTextEl.textContent = text
+  }
+  // Yield so the overlay/bar repaints before the next main-thread-blocking stage.
+  const nextFrame = (): Promise<void> => new Promise<void>(r => requestAnimationFrame(() => r()))
+
+  setProgress(8, 'Starting renderer…')
+  await nextFrame()
+
   // --- Renderer ---
   // logarithmicDepthBuffer: true ensures good depth precision across the large
   // near=2 / far=RADIUS*15 range on both WebGPU and the WebGL2 fallback backend.
@@ -30,6 +44,8 @@ async function main(): Promise<void> {
     logarithmicDepthBuffer: true,
   })
   await renderer.init()
+  setProgress(25, 'Generating planet…')
+  await nextFrame()
 
   renderer.setPixelRatio(Math.min(devicePixelRatio, 2))
   renderer.setSize(window.innerWidth, window.innerHeight)
@@ -84,6 +100,8 @@ async function main(): Promise<void> {
     axialTiltDeg: 23.4,   // matches ui.obliquity default
   })
   scene.add(planet)
+  setProgress(75, 'Compiling shaders…')
+  await nextFrame()
 
   // Polar axis in world space — computed after setAxialTilt(ui.obliquity) is called during
   // startup init below, which sets rotation.z and calls refreshPoleAxis(). We capture it here
@@ -247,7 +265,7 @@ async function main(): Promise<void> {
 
   // --- UI state (single source of truth for GUI + hotkeys) ---
   const ui = {
-    view: 'normal' as 'normal' | 'lod' | 'tectonics' | 'heightmap' | 'climate' | 'wind' | 'materials',
+    view: 'normal' as 'normal' | 'lod' | 'tectonics' | 'heightmap' | 'climate' | 'wind' | 'cloud' | 'materials',
     wireframe: false,
     vertices: false,
     freezeLod: false,
@@ -299,13 +317,13 @@ async function main(): Promise<void> {
     windVortexSize:     0.18,  // radians (sigmaBase)
     windLatSpread:      0.17,  // radians
     windEquatorTaper:   0.20,  // radians — equatorial vortex-taper half-width
-    // Wind transient parameters (live, no rebake)
-    windDriftSpeed:     0.015,
-    windPulseRate:      0.25,
-    windPulseDepth:     0.35,
-    windEddyStrength:   0.35,
+    // Wind transient parameters (live, no rebake) — calmed so the arrows don't jitter.
+    windDriftSpeed:     0.010,
+    windPulseRate:      0.10,
+    windPulseDepth:     0.18,
+    windEddyStrength:   0.20,
     windEddyScale:      6,
-    windEddyTimeScale:  0.3,
+    windEddyTimeScale:  0.12,
     // Wind render parameters (live, no rebake)
     windArrowDensity:   1500,
     windArrowScale:     1.0,
@@ -317,32 +335,37 @@ async function main(): Promise<void> {
     windFlowTrail:      8,
     windFlowLifetime:   4.0,
     // Cloud shell parameters (all live via setters — no rebake)
-    cloudCoverage:     0.22,
-    cloudScrollSpeed:  0.08,
+    cloudCoverage:     0.65,
+    cloudScrollSpeed:  0.001,
     cloudScale:        6,
-    cloudWarp:         0.0,
-    cloudBillow:       0.8,
-    cloudDetail:       0.2,
+    cloudWarp:         0.2,
+    cloudBillow:       0.45,
+    cloudDetail:       0.3,
     cloudSoftness:     0.3,
     cloudVolume:       0.6,
-    cloudOpacity:      0.9,
-    cloudFavWeight:    0.3,
+    cloudOpacity:      0.6,
+    cloudFavWeight:    0.28,
     cloudMoistWeight:  0.6,
-    cloudConvWeight:   0.5,
+    cloudConvWeight:   0.8,
     cloudConvGain:     2.0,
-    cloudItczWeight:   0.05,
+    cloudItczWeight:   0.12,
+    cloudWeatherWeight: 0.3,
+    cloudCellWeight:    0.5,
     // Volumetric cloud parameters (new raymarched layer)
     cloudBase:         1.2,
     cloudThick:        0.6,
     cloudDensity:      4.0,
-    cloudStepCount:    40,
+    cloudStepCount:    48,
     cloudLightSteps:   5,
     cloudHg:           0.35,
     cloudPowder:       1.0,
     cloudDetailScale:  4.0,
     cloudRoundBase:    0.2,
     cloudBillowTop:    0.5,
-    cloudAmbient:      0.25,
+    cloudAmbient:      0.08,
+    cloudType:         0.6,
+    // 3D density cache (compute-baked). Off by default (experimental); toggle on to remove grain.
+    cloudCache:        false,
     // Erosion bake parameters — onFinishChange triggers rebake on release.
     // Default matches deriveErosionRes(RADIUS) = 256 so slider and first bake agree.
     erosionRes: deriveErosionRes(RADIUS) as 128 | 256 | 512,
@@ -354,10 +377,11 @@ async function main(): Promise<void> {
     bUpliftRate: Math.round(60 * (HEIGHT_SCALE / HEIGHT_SCALE_REF)),
     // Atmosphere shell parameters (all live via setters — no rebake)
     atmosphereOn:           true,
-    atmosphereDensity:      1.0,
+    atmosphereDensity:      1.3,
     atmosphereTint:         '#2e6bff',
     atmosphereSunIntensity: 1.3,
-    atmosphereScaleHeight:  4.0,
+    atmosphereScaleHeight:  3.0,
+    atmosphereSkyFloor:     0.35,
     atmosphereHeight:       2.5,
     seed: String(seed),
     randomizeSeed: () => {
@@ -403,7 +427,9 @@ async function main(): Promise<void> {
     planet.setWindView(ui.view === 'wind')
     planet.setMaterialsView(ui.view === 'materials')
     planet.setWindOverlaysVisible(ui.view === 'wind')
-    planet.setCloudShellVisible(ui.view === 'normal')
+    // Cloud shell shows in 'normal' (volumetric) and 'cloud' (flat coverage map + contours).
+    planet.setCloudShellVisible(ui.view === 'normal' || ui.view === 'cloud')
+    planet.setCloudDebugMode(ui.view === 'cloud')
   }
 
   function applyWireframe(): void {
@@ -711,7 +737,7 @@ async function main(): Promise<void> {
   cloudFolder.add(ui, 'cloudCoverage', 0, 1, 0.01).name('coverage').onChange((v: number) => {
     planet.setCloudCoverage(v)
   })
-  cloudFolder.add(ui, 'cloudScrollSpeed', 0, 0.5, 0.005).name('scroll speed').onChange((v: number) => {
+  cloudFolder.add(ui, 'cloudScrollSpeed', 0, 0.02, 0.0005).name('drift speed').onChange((v: number) => {
     planet.setCloudScrollSpeed(v)
   })
   cloudFolder.add(ui, 'cloudScale', 1, 16, 0.1).name('cloud scale').onChange((v: number) => {
@@ -747,8 +773,14 @@ async function main(): Promise<void> {
   cloudFolder.add(ui, 'cloudConvGain', 0, 20, 0.5).name('conv gain').onChange((v: number) => {
     planet.setCloudConvGain(v)
   })
-  cloudFolder.add(ui, 'cloudItczWeight', 0, 0.5, 0.01).name('ITCZ wt').onChange((v: number) => {
+  cloudFolder.add(ui, 'cloudItczWeight', 0, 0.5, 0.01).name('latitude bands').onChange((v: number) => {
     planet.setCloudItczWeight(v)
+  })
+  cloudFolder.add(ui, 'cloudWeatherWeight', 0, 0.8, 0.01).name('weather systems').onChange((v: number) => {
+    planet.setCloudWeatherWeight(v)
+  })
+  cloudFolder.add(ui, 'cloudCellWeight', 0, 1, 0.01).name('weather cells').onChange((v: number) => {
+    planet.setCloudCellWeight(v)
   })
   cloudFolder.add(ui, 'cloudBase', 1.0, 2.0, 0.05).name('cloud base').onChange((v: number) => {
     planet.setCloudBase(v)
@@ -783,6 +815,12 @@ async function main(): Promise<void> {
   cloudFolder.add(ui, 'cloudAmbient', 0, 0.6, 0.01).name('ambient').onChange((v: number) => {
     planet.setCloudAmbient(v)
   })
+  cloudFolder.add(ui, 'cloudType', 0, 1, 0.01).name('cloud type').onChange((v: number) => {
+    planet.setCloudType(v)
+  })
+  cloudFolder.add(ui, 'cloudCache').name('density cache (experimental — blocky)').onChange((v: boolean) => {
+    planet.setCloudUseCache(v)
+  })
 
   // Atmosphere shell — always-on appearance (not a view mode); all sliders are live (no rebake).
   const atmosphereFolder = tabbed.atmosphereGui.addFolder('Atmosphere shell')
@@ -799,6 +837,9 @@ async function main(): Promise<void> {
   atmosphereFolder.add(ui, 'atmosphereScaleHeight', 0, 8, 0.1).name('horizon thickness').onChange((v: number) => {
     planet.setAtmosphereScaleHeight(v)
   })
+  atmosphereFolder.add(ui, 'atmosphereSkyFloor', 0, 1, 0.01).name('sky floor').onChange((v: number) => {
+    planet.setAtmosphereSkyFloor(v)
+  })
   atmosphereFolder.add(ui, 'atmosphereHeight', 1.0, 6.0, 0.05).name('shell height').onChange((v: number) => {
     planet.setAtmosphereHeight(v)
   })
@@ -814,7 +855,7 @@ async function main(): Promise<void> {
 
   // === Tab 3: View ===
   const viewFolder = tabbed.viewGui.addFolder('View')
-  viewFolder.add(ui, 'view', ['normal', 'lod', 'tectonics', 'heightmap', 'climate', 'wind', 'materials']).name('mode').onChange(() => applyView())
+  viewFolder.add(ui, 'view', ['normal', 'lod', 'tectonics', 'heightmap', 'climate', 'wind', 'cloud', 'materials']).name('mode').onChange(() => applyView())
   viewFolder.add(ui, 'wireframe').name('wireframe').onChange(() => applyWireframe())
   viewFolder.add(ui, 'vertices').name('vertices').onChange(() => applyVertices())
   viewFolder.add(ui, 'freezeLod').name('freeze LOD').onChange(() => applyFreeze())
@@ -882,6 +923,7 @@ async function main(): Promise<void> {
   planet.setAtmosphereTint(new THREE.Color(ui.atmosphereTint))
   planet.setAtmosphereSunIntensity(ui.atmosphereSunIntensity)
   planet.setAtmosphereScaleHeight(ui.atmosphereScaleHeight)
+  planet.setAtmosphereSkyFloor(ui.atmosphereSkyFloor)
   planet.setAtmosphereHeight(ui.atmosphereHeight)
   planet.setAtmosphereVisible(ui.atmosphereOn)
 
@@ -899,6 +941,15 @@ async function main(): Promise<void> {
   planet.setCloudRoundBase(ui.cloudRoundBase)
   planet.setCloudBillowTop(ui.cloudBillowTop)
   planet.setCloudAmbient(ui.cloudAmbient)
+  planet.setCloudType(ui.cloudType)
+  // Give the cloud layer the renderer (for its compute bake pass) and apply the cache toggle.
+  planet.setCloudRenderer(renderer)
+  planet.setCloudUseCache(ui.cloudCache)
+
+  // Initialise view-gated visibility at startup (cloud shell, wind overlays, debug views).
+  // Without this the cloud shell stays hidden on load until the view is changed, because
+  // its visibility is only set inside applyView() / hotkey handlers.
+  applyView()
 
   // Wind bake params are already at their defaults (Climate constructor defaults match ui defaults).
   // Arrow density + scale match Planet field defaults — no explicit init needed.
@@ -985,6 +1036,7 @@ async function main(): Promise<void> {
   const clock = new THREE.Clock()
   let elapsedS = 0
   let frameCount = 0
+  let _loadingHidden = false
   let fpsAccum = 0
   let smoothFps = 0
   // Scratch for reading drawing-buffer size (zero-alloc per frame).
@@ -997,6 +1049,9 @@ async function main(): Promise<void> {
     elapsedS += dt
     planet.setWindTime(elapsedS)
     planet.animateWind(elapsedS, dt)
+    // Re-dispatch the cloud density-cache bake (no-op unless the cache is on). After
+    // animateWind so the advection time uniform the bake reads is current.
+    planet.maybeBakeCloudCache()
 
     // Dispatch input update to whichever controller owns this frame.
     // Only ONE controller's update runs per frame — no double input on the camera.
@@ -1079,6 +1134,15 @@ async function main(): Promise<void> {
     }
 
     renderer.render(scene, camera)
+
+    // Fade out the loading overlay once a few frames have rendered (by then the WebGPU
+    // shader pipelines are compiled and the planet is actually on screen, not black).
+    if (!_loadingHidden && frameCount > 4) {
+      _loadingHidden = true
+      setProgress(100, 'Ready')
+      loadingEl?.classList.add('hidden')
+      window.setTimeout(() => loadingEl?.remove(), 700)
+    }
   })
 }
 

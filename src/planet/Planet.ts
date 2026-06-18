@@ -1026,6 +1026,15 @@ export class Planet extends Group {
   setCloudConvGain(v: number): void    { this.cloudShell.setConvGain(v) }
   /** Live — mutates cloud ITCZ weight uniform, no rebuild. */
   setCloudItczWeight(v: number): void  { this.cloudShell.setItczWeight(v) }
+  setCloudWeatherWeight(v: number): void { this.cloudShell.setWeatherWeight(v) }
+  setCloudCellWeight(v: number): void  { this.cloudShell.setCellWeight(v) }
+  /** Debug "cloud map" mode (flat coverage heatmap + contours) for the 'cloud' view. */
+  setCloudDebugMode(on: boolean): void { this.cloudShell.setDebugMode(on) }
+  /** 3D density cache: provide the renderer, toggle on/off, and dispatch the periodic bake. */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  setCloudRenderer(r: { compute: (n: any) => unknown }): void { this.cloudShell.setRenderer(r) }
+  setCloudUseCache(v: boolean): void   { this.cloudShell.setUseCache(v) }
+  maybeBakeCloudCache(): void          { this.cloudShell.maybeBake() }
   /** Live — mutates cloud billow uniform, no rebuild. */
   setCloudBillow(v: number): void      { this.cloudShell.setBillow(v) }
   /** Live — mutates cloud detail uniform, no rebuild. */
@@ -1056,6 +1065,8 @@ export class Planet extends Group {
   setCloudBillowTop(v: number): void   { this.cloudShell.setBillowTop(v) }
   /** Live — mutates ambient sky-light contribution uniform, no rebuild. */
   setCloudAmbient(v: number): void     { this.cloudShell.setAmbient(v) }
+  /** Live — mutates convective cloud-type strength uniform, no rebuild. */
+  setCloudType(v: number): void        { this.cloudShell.setTypeStrength(v) }
 
   // ---------------------------------------------------------------------------
   // Atmosphere public API
@@ -1071,6 +1082,8 @@ export class Planet extends Group {
   setAtmosphereSunIntensity(v: number): void { this.atmosphereShell.setSunIntensity(v) }
   /** Live — mutates atmosphere horizon pow exponent uniform, no rebuild. */
   setAtmosphereScaleHeight(v: number): void  { this.atmosphereShell.setScaleHeight(v) }
+  /** Live — mutates atmosphere zenith in-scatter floor uniform, no rebuild. */
+  setAtmosphereSkyFloor(v: number): void     { this.atmosphereShell.setSkyFloor(v) }
   /** Scale atmosphere shell radius. Scales mesh without rebuild. */
   setAtmosphereHeight(mul: number): void     { this.atmosphereShell.setAtmHeight(mul) }
   /** Show or hide the atmosphere shell. */

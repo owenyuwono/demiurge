@@ -12,13 +12,17 @@ import {
   abs,
   cameraPosition,
   dot,
+  exp,
   float,
   max,
+  min,
+  mix,
   normalize,
   positionWorld,
   pow,
   saturate,
   uniform,
+  vec3,
 } from 'three/tsl'
 
 // ---------------------------------------------------------------------------
@@ -56,7 +60,12 @@ export class Atmosphere {
   // Overwritten at startup from the GUI hex (#2e6bff → linear ~0.027, 0.147, 1.0)
   private readonly _uTint          = uniform(new Vector3(0.027, 0.147, 1.0))
   private readonly _uSunIntensity  = uniform(1.3)
-  private readonly _uScaleHeight   = uniform(4.0)
+  private readonly _uScaleHeight   = uniform(3.0)
+  // Zenith in-scatter floor. The base limb-glow term (pow(grazing, scaleHeight))
+  // goes to EXACTLY zero at the zenith, so from the surface the sky overhead is
+  // black and only a thin horizon band glows. This floor lifts the whole sunlit
+  // dome so the sky reads blue overhead. 0 = old limb-only behaviour exactly.
+  private readonly _uSkyFloor      = uniform(0.35)
   // _uSunDir is the PASSED reference from Planet — never create a new one
   private readonly _uSunDir: ReturnType<typeof uniform>
 
@@ -112,6 +121,9 @@ export class Atmosphere {
 
   /** Live — mutates scale height (horizon pow exponent) uniform, no rebuild. */
   setScaleHeight(v: number): void { this._uScaleHeight.value = v }
+
+  /** Live — mutates zenith in-scatter floor uniform, no rebuild. 0 = limb-only. */
+  setSkyFloor(v: number): void { this._uSkyFloor.value = v }
 
   /**
    * Scale the atmosphere shell radius. Mirrors CloudShell.setAltitude:
@@ -185,11 +197,29 @@ export class Atmosphere {
     // abs() makes it symmetric: works from both inside (surface) and outside (orbit).
     const grazing = saturate(float(1).sub(abs(dot(viewDir, nFrag))))
 
-    // density: pow sharpens toward the limb; higher _uScaleHeight → thinner atmosphere.
-    // At scaleHeight=4 the limb glows strongly while zenith stays dark.
+    // horizonGlow: pow sharpens toward the limb; higher _uScaleHeight → thinner band.
     // Guard the exponent: pow(0,0) is indeterminate in WGSL (NaN/speckle).
-    // max(..., 0.1) ensures pow(0, >=0.1)=0 so space stays black at slider min.
-    const density = pow(grazing, max(this._uScaleHeight, float(0.1)))
+    // max(..., 0.1) ensures pow(0, >=0.1)=0 at the zenith.
+    const horizonGlow = pow(grazing, max(this._uScaleHeight, float(0.1)))
+
+    // airMassGlow: a physical air-mass curve that BROADENS the brightening across
+    // the whole dome (not just a thin limb band). muUp = cos(view-zenith angle) =
+    // dot(viewDir, surface normal): 1 looking straight up, 0 at the horizon. The
+    // relative air mass 1/cos − 1 is 0 overhead and grows toward the horizon, and
+    // brightness ~ 1 − exp(−k·airMass) rises gradually from the zenith — the real
+    // Rayleigh shape — instead of the sharp pow() ramp. Combined (max) with the
+    // pow() term so the _uScaleHeight slider still sharpens the very limb.
+    const muUp        = saturate(dot(viewDir, nFrag))
+    const relAirMass  = float(1).div(max(muUp, float(0.05))).sub(1)
+    const airMassGlow = float(1).sub(exp(relAirMass.negate().mul(0.6)))
+    const glow        = max(horizonGlow, airMassGlow)
+
+    // density: lift the whole sunlit dome by the zenith floor so the sky reads blue
+    // overhead from the surface instead of going black. Maps glow 0→skyFloor, 1→1.
+    // skyFloor=0 reproduces a black zenith (so space stays black at the slider min).
+    // This constant isotropic lift IS the cheap multiple-scattering ambient (a la Hillaire's
+    // 1/(1-f) closed form): the dome away from the sun isn't pure single-scatter black.
+    const density = mix(this._uSkyFloor, float(1), glow)
 
     // phase: Rayleigh phase function — brightens the side facing the sun.
     // mu = cos(angle between view and sun): +1 = looking toward sun, -1 = away.
@@ -198,16 +228,28 @@ export class Atmosphere {
     const phase   = float(0.75).mul(float(1).add(mu.mul(mu)))
 
     // sunUp: day/night fade — keeps the night-side limb black.
-    // dot(nFrag, sunDir) > 0 = day side, < 0 = night side.
+    // muSun = dot(nFrag, sunDir) > 0 = day side, < 0 = night side.
     // mul(2).add(0.3) gives a soft terminator: hits 1 at ~35° past noon,
     // fades to 0 ~9° into the night side. Tuned for a soft blue twilight arc.
-    const sunUp   = saturate(dot(nFrag, this._uSunDir).mul(2).add(0.3))
+    const muSun   = dot(nFrag, this._uSunDir)
+    const sunUp   = saturate(muSun.mul(2).add(0.3))
 
     // amount: combined scalar driving both color and opacity.
     const amount  = density.mul(phase).mul(sunUp).mul(this._uDensity)
 
-    // scatterColor → colorNode: tint × sunIntensity × amount
-    const scatterColor = this._uTint.mul(this._uSunIntensity).mul(amount)
+    // Per-channel Rayleigh reddening (β ∝ 1/λ⁴). The SUN's slant air mass (long when the sun
+    // is low on that point's horizon) plus the VIEW's slant air mass remove blue first from
+    // the in-scattered light, shifting the terminator limb and the sky toward a low sun
+    // blue→orange→red (sunrise/sunset, horizon reddening). At high sun / overhead the slant
+    // is ~0 so redden ≈ (1,1,1) and the tuned blue `tint` is preserved EXACTLY.
+    const amView  = float(1).div(max(abs(dot(viewDir, nFrag)), float(0.05)))
+    const amSun   = float(1).div(max(muSun, float(0.05)))
+    const slant   = min(max(amView.add(amSun).sub(2), float(0)), float(40))
+    const betaR   = vec3(0.175, 0.408, 1.0)   // red:green:blue ∝ 1/λ⁴, normalised to blue=1
+    const redden  = exp(betaR.mul(this._uDensity).mul(0.06).mul(slant).negate())
+
+    // scatterColor → colorNode: tint × sunIntensity × amount × wavelength reddening
+    const scatterColor = this._uTint.mul(this._uSunIntensity).mul(amount).mul(redden)
 
     // scatterEnvelope → opacityNode: 0 at space / zenith / night, 1 at peak limb.
     // saturate clamps to [0,1] so additive blending never over-brightens.
