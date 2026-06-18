@@ -17,6 +17,7 @@ import { makeTerrainSampler } from './terrainSampler'
 import { Tectonics } from './tectonics'
 import { Climate } from './climate'
 import { Erosion } from './erosion'
+import { Subsurface } from './subsurface'
 import type { WorkerInMsg, WorkerOutMsg, ReadyMsg, DoneMsg } from './meshProtocol'
 
 // ---------------------------------------------------------------------------
@@ -50,9 +51,10 @@ ctx.onmessage = (e: MessageEvent<WorkerInMsg>): void => {
   const msg = e.data
 
   if (msg.type === 'init') {
-    const tectonics = Tectonics.fromBaked(msg.tectonics)
-    const climate   = Climate.fromBaked(msg.climate)
-    const erosion   = msg.erosion != null ? Erosion.fromBaked(msg.erosion) : undefined
+    const tectonics  = Tectonics.fromBaked(msg.tectonics)
+    const climate    = Climate.fromBaked(msg.climate)
+    const erosion    = msg.erosion    != null ? Erosion.fromBaked(msg.erosion)                          : undefined
+    const subsurface = msg.subsurface != null ? Subsurface.fromBaked(msg.subsurface, tectonics) : undefined
 
     sampler = makeTerrainSampler({
       seed:           msg.seed,
@@ -70,6 +72,7 @@ ctx.onmessage = (e: MessageEvent<WorkerInMsg>): void => {
       tectonics,
       climate,
       erosion,
+      subsurface,
       bActive:        msg.bActive,
     })
 
@@ -94,6 +97,8 @@ ctx.onmessage = (e: MessageEvent<WorkerInMsg>): void => {
       plateColorFn: sampler!.plateColorFn,
       climateFn:    sampler!.climateFn,
       erosion:      sampler!.erosion,
+      subsurface:   sampler!.subsurface,
+      hardnessFn:   (dir) => sampler!.tectonics.hardnessAt(dir),
     }, SEA_LEVEL)
 
     const done: DoneMsg = {
@@ -103,8 +108,10 @@ ctx.onmessage = (e: MessageEvent<WorkerInMsg>): void => {
       normals:      a.normals.buffer as ArrayBuffer,
       colors:       a.colors.buffer as ArrayBuffer,
       plateColors:  a.plateColors   ? (a.plateColors.buffer   as ArrayBuffer) : null,
-      climateMoist: a.climateMoist  ? (a.climateMoist.buffer  as ArrayBuffer) : null,
-      indices:      a.indices.buffer as ArrayBuffer,
+      climateMoist:   a.climateMoist   ? (a.climateMoist.buffer   as ArrayBuffer) : null,
+      subsurfaceWet:  a.subsurfaceWet  ? (a.subsurfaceWet.buffer  as ArrayBuffer) : null,
+      rockHardness:   a.rockHardness   ? (a.rockHardness.buffer   as ArrayBuffer) : null,
+      indices:        a.indices.buffer as ArrayBuffer,
       originX:      a.originX,
       originY:      a.originY,
       originZ:      a.originZ,
@@ -123,6 +130,12 @@ ctx.onmessage = (e: MessageEvent<WorkerInMsg>): void => {
     }
     if (a.climateMoist) {
       transferList.push(a.climateMoist.buffer)
+    }
+    if (a.subsurfaceWet) {
+      transferList.push(a.subsurfaceWet.buffer)
+    }
+    if (a.rockHardness) {
+      transferList.push(a.rockHardness.buffer)
     }
 
     ctx.postMessage(done, transferList)

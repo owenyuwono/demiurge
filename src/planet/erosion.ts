@@ -30,17 +30,19 @@ import {
   sampleSmooth,
 } from './cubemap'
 import { Climate, ClimateSample } from './climate'
+import { Tectonics } from './tectonics'
 import { createNoise3D } from './noise'
+import { HEIGHT_SCALE, HEIGHT_SCALE_REF, RADIUS, RADIUS_REF, RES_REF, deriveSlopeThresh, deriveErosionRes } from './worldConstants'
 
 // ---------------------------------------------------------------------------
 // Tuning constants
 // ---------------------------------------------------------------------------
 
-// Height scale matching Planet.ts HEIGHT_SCALE — baked as a constant here so
-// the erosion module stays self-contained (no import from Planet.ts/ChunkMesher).
-const B_HEIGHT_SCALE        = 1200
+// B_HEIGHT_SCALE: re-exported alias for HEIGHT_SCALE from worldConstants.
+// Kept for back-compat; drives 4 metre-space ops in the B-path — must equal HEIGHT_SCALE.
+export const B_HEIGHT_SCALE = HEIGHT_SCALE
 
-const EROSION_RES           = 256
+const EROSION_RES           = deriveErosionRes(RADIUS)
 const EROSION_BAKE_LEVEL    = 5
 const LAKE_SENTINEL         = -999
 
@@ -59,6 +61,112 @@ const MFD_P         = 6     // MFD slope exponent; higher = sharper channel conc
 
 const EROSION_MAX   = 0.15
 const SEDIMENT_MAX  = 0.15
+
+// ---------------------------------------------------------------------------
+// Temperature-gated process constants (Part B)
+// ---------------------------------------------------------------------------
+// Climate base temperature (°C, deterministic path — no sun term) modulates:
+//   1. Thermal-diffusion talus angle: cold → lower talus (freeze-thaw shatters debris
+//      faster, slopes fail at shallower angles); warm → higher talus (chemical cementation).
+//   2. Chemical-weathering factor on stream-power incision: warm+wet → stronger chemical
+//      dissolution (gentler rounded relief); cold → reduced chemical action (mechanical only).
+//
+// Both modulations are CONTINUOUS functions of temperature (smoothstep blend between
+// cold and warm poles) — never a hard threshold — so they cannot crack seams.
+// They affect ONLY the bake; they never enter heightFn geometry.
+//
+// Transition zone: linearly interpolate between cold and warm behaviour from
+//   TEMP_COLD_THRESH (below = fully cold) to TEMP_WARM_THRESH (above = fully warm).
+//   Earth ~15°C sits in the warm half; high-elevation / polar cells fall cold.
+const TEMP_COLD_THRESH = -10   // °C — fully cold process regime below this
+const TEMP_WARM_THRESH =  20   // °C — fully warm process regime above this
+
+// Talus multiplier: cold cells get TEMP_TALUS_COLD_MUL × talusScale; warm cells get 1.0.
+// Freeze-thaw shatters material quickly, driving talus below the purely-hardness baseline.
+// Range (0,1]: 1 = no modulation; 0.6 = 40% lower talus angle at pole/altitude.
+const TEMP_TALUS_COLD_MUL = 0.65   // −35% talus in fully-cold regime
+const TEMP_TALUS_WARM_MUL = 1.10   // +10% talus in fully-warm regime (cementation)
+
+// Chemical weathering boost on incision: warm+wet cells have additional dissolution.
+// Implemented as a multiplicative factor on effective K0 (only the wet + warm term).
+// TEMP_CHEM_WARM_EXTRA: additional K0 fraction at max temperature AND max moisture (1).
+// TEMP_CHEM_COLD_FACTOR: K0 scale at fully-cold regime (< 1 → mechanical weathering only).
+const TEMP_CHEM_WARM_EXTRA  = 0.30   // +30% incision when warm and saturated
+const TEMP_CHEM_COLD_FACTOR = 0.80   // −20% incision in fully-cold (chemical action suppressed)
+
+// ---------------------------------------------------------------------------
+// Rock-hardness erodibility constants
+// ---------------------------------------------------------------------------
+// HARD_ERODIBILITY_STR: how strongly hardness modulates the stream-power incision rate K0.
+//   erodibility = 1 + HARD_ERODIBILITY_STR * (0.5 - hardness)
+//   → hard rock (hardness=1) → erodibility = 1 - 0.5*STR  (erodes slower, ridges/escarpments)
+//   → soft rock (hardness=0) → erodibility = 1 + 0.5*STR  (erodes faster, smooth basins)
+//   Range [0, 2]: 0 = no modulation (pre-T2 behaviour), 1.0 = ±50% K0 contrast.
+const HARD_ERODIBILITY_STR = 1.2   // ±60% K0 contrast between hard/soft substrates
+
+// HARD_TALUS_STR: fraction by which hardness scales the thermal-talus angle.
+//   talusLocal = talus * (1 + HARD_TALUS_STR * (hardness - 0.5))
+//   → hard rock holds steeper slopes (cliffier); soft rock collapses to gentler angles.
+//   Range [0, 1]: 0 = no modulation, 1.0 = ±50% talus contrast.
+const HARD_TALUS_STR       = 0.6   // ±30% talus contrast between hard/soft substrates
+
+// ---------------------------------------------------------------------------
+// Depositional environment constants
+// ---------------------------------------------------------------------------
+// Each recognizable landform class gets its own deposition-rate coefficient (G)
+// and sediment accumulation cap.  Values are conservative — all stay well inside
+// the headroom that terrainSampler.ts allows after clamping erosionDelta at ~line 538.
+//
+// Environment codes stored in depositEnv (Uint8Array):
+//   0 = DEFAULT   – generic / lake-floor (existing behaviour)
+//   1 = FLOODPLAIN – low-gradient mid-reach with moderate discharge
+//   2 = ALLUVIAL_FAN – steep-to-flat transition (fan apex)
+//   3 = DELTA       – channel entering ocean / lake margin
+
+const ENV_DEFAULT    = 0
+const ENV_FLOODPLAIN = 1
+const ENV_FAN        = 2
+const ENV_DELTA      = 3
+
+// Deposition rate coefficients — units: same as DEFAULT_DEPOSITION_G (dimensionless).
+// ENV_DEFAULT uses opts.depositionG (= DEFAULT_DEPOSITION_G = 1.5) so callers can
+// override the baseline without touching these per-class constants.
+const DEP_G_FLOODPLAIN = 2.0   // moderate, wide spreading
+const DEP_G_FAN        = 3.5   // rapid load-drop at grade break
+const DEP_G_DELTA      = 2.8   // high at shoreline margin
+
+// Per-class sediment accumulation caps (same units as SEDIMENT_MAX = 0.15)
+const SEDIMENT_MAX_DEFAULT    = SEDIMENT_MAX    // 0.15
+const SEDIMENT_MAX_FLOODPLAIN = 0.22            // genuine floodplain flats
+const SEDIMENT_MAX_FAN        = 0.28            // alluvial fan cone relief
+const SEDIMENT_MAX_DELTA      = 0.25            // delta lobes
+
+// Threshold tuning: all dimensionless in the H0 normalised-height space [0..1].
+// Slope metric = ΔH_normalized / 1_cell (no explicit denominator; implicit cell = 1).
+//
+// Derivation: for a fixed physical slope angle θ the per-cell normalised rise is
+//   ΔH_normalized = tan(θ) × cell_arc_metres / HEIGHT_SCALE
+// Cell arc-length scales as (radius / res), so the threshold scales by
+//   (radius / RADIUS_REF) × (HEIGHT_SCALE_REF / HEIGHT_SCALE) × (RES_REF / res)
+// Under a uniform scale (radius×k, HEIGHT_SCALE×k) the first two factors cancel,
+// leaving the threshold unchanged — scale-invariant.
+// This is exactly deriveSlopeThresh() from worldConstants.ts.
+//
+// Baseline (RADIUS_REF=50 000, RES_REF=256):
+//   DEP_SLOPE_LOW_THRESH_BASE  = 0.002
+//   DEP_SLOPE_HIGH_THRESH_BASE = 0.008
+//
+// NOTE: these thresholds scale with the runtime bake resolution (opts.res), NOT the
+// module-level EROSION_RES constant.  They are computed as local variables inside the
+// bake after `const res` is resolved, so the physical slope angle they represent
+// remains correct regardless of which slider value the user has chosen.
+const DEP_SLOPE_LOW_THRESH_BASE  = 0.002   // baseline flat threshold (at RADIUS_REF, RES_REF)
+const DEP_SLOPE_HIGH_THRESH_BASE = 0.008   // baseline steep threshold (at RADIUS_REF, RES_REF)
+const DEP_Q_FLOODPLAIN_MIN    = 0.05    // normalised discharge threshold for floodplain
+const DEP_Q_DELTA_MIN         = 0.08    // min discharge to classify as delta source
+const DEP_SHORE_HOPS          = 2       // BFS depth: cells within this many steps of ocean/lake = shoreline band
+// Fraction of surplus Qs spread laterally in fan cells (perpendicular to downslope)
+const FAN_LATERAL_SPREAD      = 0.20
 // FILL_EPS: tiny per-pop increment for Barnes ε-fill; keyed to flood ORDER, not spatial index.
 // FILL_EPS * N ≈ 1e-9 * 393216 ≈ 4e-4 — negligible vs [-1,1] height range but monotonic.
 const FILL_EPS      = 1e-9
@@ -69,10 +177,10 @@ const LAKE_MIN_DEPTH = 0.002
 // Domain-warp constants for query-time grid-alignment suppression
 // ---------------------------------------------------------------------------
 // Amplitude in direction-space radians; 1 erosion cell ≈ 0.006 rad at res 256.
-// 0.03 = ~5 cells — raised from 0.012 to organically curve the 256²-grid iso-contour
-// bands without a resolution bump. Low spatial frequency (2 octaves at freq 1.8) bends
-// whole features rather than adding high-freq jitter. Determinism holds: warp uses
-// the seeded _warpNoise, identical on main thread and workers.
+// WARP_AMP targets ~5 cells of warp at the module-level default res (256).
+// If the user raises res to 512 via the GUI slider the warp covers ~10 cells —
+// slightly more, but still within the "break grid alignment without smearing"
+// window and not worth a dynamic adjustment (baked amplitude, not per-query).
 const WARP_AMP   = 0.03
 const WARP_FREQ  = 1.8
 const WARP_OCT   = 2
@@ -114,6 +222,9 @@ class MinHeap {
   private data: HeapItem[] = []
 
   get size(): number { return this.data.length }
+
+  /** Reset the heap to empty without re-allocating the backing array. */
+  clear(): void { this.data.length = 0 }
 
   push(item: HeapItem): void {
     this.data.push(item)
@@ -174,6 +285,12 @@ export interface ErosionBaked {
   flowDirZ:     Float32Array  // 6*res*res; world-space unit downhill tangent Z
   lakeLevel:    Float32Array  // 6*res*res; basin spill elevation; LAKE_SENTINEL where not a lake
   lakeMask:     Float32Array  // 6*res*res; 1 inside a real lake basin, 0 elsewhere (safe to bilinear)
+  /**
+   * Depositional environment code per texel (ENV_DEFAULT/FLOODPLAIN/FAN/DELTA).
+   * DISCRETE — sample nearest-neighbor only (depositEnvAt); NEVER feed into heightFn.
+   * Used exclusively for mesh color pass; color discontinuities are acceptable.
+   */
+  depositEnv:   Uint8Array    // 6*res*res; environment code ∈ {0,1,2,3}
   K0:       number
   mExp:     number
   nExp:     number
@@ -195,6 +312,15 @@ export interface ErosionOpts {
   talus?:        number
   kwMin?:        number
   depositionG?:  number   // deposition rate coefficient (default DEFAULT_DEPOSITION_G)
+  /**
+   * Baked Tectonics instance for per-cell rock hardness sampling during bake.
+   * When provided, incision rate (K0) is modulated by hardness (hard→slower,
+   * soft→faster) and talus angle is biased so hard rock holds cliffier slopes.
+   * Hardness sampled via tectonics.hardnessAt() — same C1 baked-grid lookup
+   * used by T1 / query().rockHardness; no new worker field needed (bake-only).
+   * When absent, behaviour is byte-identical to pre-T2 (no modulation).
+   */
+  tectonics?: Tectonics
   // B path — iterated uplift+erode loop (all optional; absent = existing frozen-flow path)
   /** 6*res*res uplift field; when present, runs the iterated B loop instead of the frozen-flow path. */
   upliftForcing?: Float32Array
@@ -230,6 +356,8 @@ export class Erosion {
   private readonly flowDirZ:     Float32Array
   private readonly lakeLevel:    Float32Array
   private readonly lakeMask:     Float32Array
+  /** Depositional environment code (ENV_*) per texel; nearest-neighbor query only. */
+  private readonly depositEnv:   Uint8Array
   private readonly K0:           number
   private readonly mExp:         number
   private readonly nExp:         number
@@ -316,7 +444,9 @@ export class Erosion {
 
       const upliftForcing = opts.upliftForcing
       const bSteps        = opts.bSteps    ?? 30
-      const bUpliftRate   = opts.bUpliftRate ?? 60  // metres per step
+      // bUpliftRate authored at HEIGHT_SCALE_REF=1200 as 60 m/step; fallback scales with
+      // B_HEIGHT_SCALE so normalized (/ B_HEIGHT_SCALE) contribution is scale-invariant.
+      const bUpliftRate   = opts.bUpliftRate ?? (60 * (B_HEIGHT_SCALE / HEIGHT_SCALE_REF))
 
       // Constants in metre-space
       const DH_CLAMP_M   = 0.02 * B_HEIGHT_SCALE   // 24 m per-cell per-iteration cap
@@ -341,6 +471,25 @@ export class Erosion {
             H0[c] = hNorm * B_HEIGHT_SCALE   // convert to metres
             opts.climate.sample(_dir, hNorm, climateSample)
             rain[c] = Math.max(kwMin, climateSample.moisture)
+          }
+        }
+      }
+
+      // Rock hardness per cell — B path (in metre-space, same formula as existing path).
+      // erodibilityB[c] modulates K0; talusScaleB[c] modulates thermal talus angle.
+      // TALUS_M declared above (= talus * B_HEIGHT_SCALE).
+      const erodibilityB = new Float32Array(N).fill(1.0)
+      const talusScaleB  = new Float32Array(N).fill(TALUS_M)
+      if (opts.tectonics) {
+        for (let face = 0; face < 6; face++) {
+          for (let y = 0; y < res; y++) {
+            for (let x = 0; x < res; x++) {
+              const c = texelIndex(face, x, y, res)
+              texelToDir(face, x, y, res, _dir)
+              const h = opts.tectonics.hardnessAt(_dir)
+              erodibilityB[c] = 1.0 + HARD_ERODIBILITY_STR * (0.5 - h)
+              talusScaleB[c]  = TALUS_M * (1.0 + HARD_TALUS_STR * (h - 0.5))
+            }
           }
         }
       }
@@ -382,7 +531,10 @@ export class Erosion {
       // Last-step results (updated each iteration, finalized after loop)
       let lakeLevel    = new Float32Array(N).fill(LAKE_SENTINEL)
       let lakeMask     = new Float32Array(N)
-      let mfdNeighbors: Array<Array<{ n: number; w: number }>> = new Array(N)
+      // Hoisted: allocated once, reset each B-step (avoids GB-scale GC churn).
+      // Numerical output is byte-identical — reset to empty before each use.
+      const mfdNeighbors: Array<Array<{ n: number; w: number }>> = new Array(N)
+      const heapB = new MinHeap()
       let flowDirX     = new Float32Array(N)
       let flowDirY     = new Float32Array(N)
       let flowDirZ     = new Float32Array(N)
@@ -407,10 +559,10 @@ export class Erosion {
         // b+c. Priority-flood on current workH
         // -----------------------------------------------------------------
         Hf = workH.slice()
-        lakeLevel = new Float32Array(N).fill(LAKE_SENTINEL)
+        lakeLevel.fill(LAKE_SENTINEL)
         const inQueueB    = new Uint8Array(N)
         const processedB  = new Uint8Array(N)
-        const heapB = new MinHeap()
+        heapB.clear()
 
         for (let c = 0; c < N; c++) {
           if (isOcean[c]) {
@@ -464,7 +616,8 @@ export class Erosion {
         // -----------------------------------------------------------------
         // e. Re-route MFD on current Hf
         // -----------------------------------------------------------------
-        mfdNeighbors = new Array(N)
+        // mfdNeighbors is hoisted; each cell slot is cleared below in the loop
+        // (mfdNeighbors[c] = []) before being written, matching prior behaviour.
         flowDirX = new Float32Array(N)
         flowDirY = new Float32Array(N)
         flowDirZ = new Float32Array(N)
@@ -559,7 +712,10 @@ export class Erosion {
             slope += w * Math.max(0, bufA[c] - bufA[n])
           }
 
-          const eros  = dt_B * K0 * Math.pow(Q[c], mExp) * Math.pow(Math.max(slope, 1e-8), nExp)
+          // Stream-power incision scaled by per-cell erodibility (hardness-derived).
+          // The 1e-8 floor is in normalized-height units; scale by B_HEIGHT_SCALE so the
+          // physical floor is invariant under uniform scale (negligible at both scales).
+          const eros  = dt_B * K0 * erodibilityB[c] * Math.pow(Q[c], mExp) * Math.pow(Math.max(slope, 1e-8 * B_HEIGHT_SCALE), nExp)
           const dep   = dt_B * G_B * Qs_B[c] / Math.max(Q[c], EPS_Q)
 
           let dh = dep - eros
@@ -583,10 +739,12 @@ export class Erosion {
         for (let tPass = 0; tPass < 3; tPass++) {
           bufB.set(bufA)
           for (let c = 0; c < N; c++) {
+            // Per-cell talus angle in metre-space (hard rock → steeper, cliffier).
+            const talusCM = talusScaleB[c]
             for (const n of neigh[c]) {
               const slopeCN = bufA[c] - bufA[n]
-              if (slopeCN > TALUS_M) {
-                const transfer = 0.0005 * (slopeCN - TALUS_M) * 0.5
+              if (slopeCN > talusCM) {
+                const transfer = 0.0005 * (slopeCN - talusCM) * 0.5
                 bufB[c] -= transfer
                 bufB[n] += transfer
               }
@@ -655,18 +813,34 @@ export class Erosion {
       this.flowDirZ     = flowDirZ
       this.lakeLevel    = lakeLevel
       this.lakeMask     = lakeMask
+      // B path has no Step-5b classifier; depositEnv stays all-zero (ENV_DEFAULT).
+      // Color pass will treat every cell as default landform — acceptable for B path.
+      this.depositEnv   = new Uint8Array(N)
 
     } else {
       // =====================================================================
       // EXISTING PATH — frozen-flow pipeline (unchanged)
       // =====================================================================
 
+      // Slope thresholds: must be derived from the RUNTIME res (opts.res ?? EROSION_RES),
+      // not the module-level EROSION_RES constant. At RES_REF=256, RADIUS_REF=50 000,
+      // HEIGHT_SCALE_REF=1200 the base values 0.002/0.008 represent ~0.13°/~0.51°
+      // physical slopes. deriveSlopeThresh rescales them to whatever (RADIUS, HEIGHT_SCALE,
+      // res) the current bake is using so the physical slope angle is invariant across
+      // slider changes and uniform planet-scale changes.
+      const depSlopeLow  = deriveSlopeThresh(DEP_SLOPE_LOW_THRESH_BASE,  RADIUS, HEIGHT_SCALE, res)
+      const depSlopeHigh = deriveSlopeThresh(DEP_SLOPE_HIGH_THRESH_BASE, RADIUS, HEIGHT_SCALE, res)
+
       // -----------------------------------------------------------------------
       // Step 1 — Sample H0 grid + rainfall
       // -----------------------------------------------------------------------
 
-      const H0   = new Float32Array(N)
-      const rain = new Float32Array(N)
+      const H0       = new Float32Array(N)
+      const rain     = new Float32Array(N)
+      // Per-cell base temperature (°C, deterministic — no sun term) used for
+      // temperature-gated process modulation (Part B).  Captured here alongside
+      // moisture so we only call climate.sample() once per cell.
+      const tempGrid = new Float32Array(N)
       const climateSample: ClimateSample = { temperature: 0, moisture: 0 }
 
       for (let face = 0; face < 6; face++) {
@@ -676,8 +850,77 @@ export class Erosion {
             texelToDir(face, x, y, res, _dir)
             H0[c] = opts.heightFn(_dir, EROSION_BAKE_LEVEL)
             opts.climate.sample(_dir, H0[c], climateSample)
-            rain[c] = Math.max(kwMin, climateSample.moisture)
+            rain[c]     = Math.max(kwMin, climateSample.moisture)
+            tempGrid[c] = climateSample.temperature
           }
+        }
+      }
+
+      // Rock hardness per cell [0,1]: sampled from baked tectonics grid (C1, domain-warped).
+      // erodibility[c] = 1 + HARD_ERODIBILITY_STR * (0.5 - hardness)
+      //   hard rock (1) → erodibility < 1 → incises slower → ridges/escarpments persist.
+      //   soft rock (0) → erodibility > 1 → incises faster → smooth basins/badlands.
+      // When opts.tectonics is absent all erodibilities stay 1.0 (pre-T2 behaviour).
+      const erodibility = new Float32Array(N).fill(1.0)
+      // talusScale[c] = talus * (1 + HARD_TALUS_STR * (hardness - 0.5))
+      //   hard rock holds steeper talus angles (cliffier); soft rock collapses sooner.
+      const talusScale  = new Float32Array(N).fill(talus)
+      if (opts.tectonics) {
+        for (let face = 0; face < 6; face++) {
+          for (let y = 0; y < res; y++) {
+            for (let x = 0; x < res; x++) {
+              const c = texelIndex(face, x, y, res)
+              texelToDir(face, x, y, res, _dir)
+              const h = opts.tectonics.hardnessAt(_dir)  // [0,1] C1 baked-grid lookup
+              erodibility[c] = 1.0 + HARD_ERODIBILITY_STR * (0.5 - h)
+              talusScale[c]  = talus * (1.0 + HARD_TALUS_STR * (h - 0.5))
+            }
+          }
+        }
+      }
+
+      // -----------------------------------------------------------------------
+      // Temperature-gated process modulation (Part B)
+      //
+      // Two independent continuous adjustments derived from the per-cell base
+      // temperature (°C, deterministic — sampled above with no sun term):
+      //
+      // 1. Talus-angle bias: cold cells (freeze-thaw / frost shattering) lower the
+      //    talus angle so debris accumulates at shallower angles; warm cells add a
+      //    small cement-hardening lift.  Applied multiplicatively on top of the
+      //    hardness-derived talusScale so the two effects compose cleanly.
+      //
+      // 2. Chemical-weathering factor on erodibility: warm + wet conditions dissolve
+      //    rock faster (gentle rounded valleys); cold conditions suppress chemical
+      //    action (mechanical-dominated, leaving sharper forms).
+      //
+      // Both factors are CONTINUOUS smoothstep blends between TEMP_COLD_THRESH and
+      // TEMP_WARM_THRESH — no hard thresholds so adjacent chunks on either side of
+      // any isothermal contour remain byte-identical (no seam risk).
+      //
+      // Only the bake is affected; neither factor ever enters heightFn geometry.
+      // -----------------------------------------------------------------------
+      {
+        const tempRange = TEMP_WARM_THRESH - TEMP_COLD_THRESH   // degrees spanning the transition
+        for (let c = 0; c < N; c++) {
+          const T = tempGrid[c]
+
+          // t: continuous 0 (cold) → 1 (warm) with smoothstep easing
+          const tLinear = (T - TEMP_COLD_THRESH) / tempRange
+          const tClamp  = tLinear < 0 ? 0 : tLinear > 1 ? 1 : tLinear
+          const tSmooth = tClamp * tClamp * (3 - 2 * tClamp)  // smoothstep(0,1,t)
+
+          // 1. Talus bias: lerp between cold and warm multipliers
+          const talusTempMul = TEMP_TALUS_COLD_MUL + (TEMP_TALUS_WARM_MUL - TEMP_TALUS_COLD_MUL) * tSmooth
+          talusScale[c] *= talusTempMul
+
+          // 2. Chemical weathering: cold suppresses incision; warm+wet boosts it.
+          //    Warm bonus scales linearly with moisture (only warm AND wet dissolves rock).
+          //    coldFactor: lerp from TEMP_CHEM_COLD_FACTOR (fully cold) → 1.0 (fully warm).
+          //    warmBonus: tSmooth * rain[c] * TEMP_CHEM_WARM_EXTRA (additive over baseline 1.0).
+          const coldFactor  = TEMP_CHEM_COLD_FACTOR + (1.0 - TEMP_CHEM_COLD_FACTOR) * tSmooth
+          const warmBonus   = tSmooth * rain[c] * TEMP_CHEM_WARM_EXTRA
+          erodibility[c] *= coldFactor * (1.0 + warmBonus)
         }
       }
 
@@ -886,13 +1129,139 @@ export class Erosion {
       }
 
       // -----------------------------------------------------------------------
+      // Step 5b — Classify depositional environments
+      //
+      // Each land cell is assigned one of four environment codes (ENV_*) from
+      // data already in scope: local slope, upstream slope, discharge Q,
+      // and proximity to ocean/lake shore.  Classification is purely read-only —
+      // no heights are modified here — and deterministic (fixed iteration order,
+      // no randomness).
+      //
+      // Inputs (all computed above):
+      //   Hf          – flood-filled heights
+      //   Q           – discharge per cell
+      //   isOcean     – ocean mask
+      //   lakeLevel   – LAKE_SENTINEL or spill elevation
+      //   mfdNeighbors – per-cell lower-neighbor MFD weights
+      //   neigh        – full 8-connectivity adjacency table
+      //
+      // Output: depositEnv[c] ∈ {ENV_DEFAULT, ENV_FLOODPLAIN, ENV_FAN, ENV_DELTA}
+      // -----------------------------------------------------------------------
+
+      // --- Normalise Q to [0,1] for threshold comparisons ---
+      const Qnorm = new Float32Array(N)
+      const QlogMax = Math.log(1 + Qmax)
+      for (let c = 0; c < N; c++) {
+        const v = Math.log(1 + Q[c]) / (QlogMax || 1)
+        Qnorm[c] = v < 0 ? 0 : v > 1 ? 1 : v
+      }
+
+      // --- Local downslope gradient at each cell (weighted-average over MFD) ---
+      const localSlope = new Float32Array(N)
+      for (let c = 0; c < N; c++) {
+        if (isOcean[c]) continue
+        let s = 0
+        for (const { n, w } of mfdNeighbors[c]) {
+          s += w * Math.max(0, Hf[c] - Hf[n])
+        }
+        localSlope[c] = s
+      }
+
+      // --- Max upstream slope arriving at each cell (steepest contributing channel) ---
+      // For alluvial fan detection: the upstream slope was steep but c is gentle.
+      const upstreamSlope = new Float32Array(N)
+      // A land cell c receives an upstream-slope contribution from any neighbor n
+      // where Hf[n] > Hf[c] (n drains into c in MFD sense).
+      // We walk neigh[c] and check if c appears as a lower neighbor of n.
+      // Simple proxy: max(Hf[n] - Hf[c]) over all higher neighbors n.
+      for (let c = 0; c < N; c++) {
+        if (isOcean[c]) continue
+        let maxUpSlope = 0
+        for (const n of neigh[c]) {
+          if (Hf[n] > Hf[c]) {
+            const s = Hf[n] - Hf[c]
+            if (s > maxUpSlope) maxUpSlope = s
+          }
+        }
+        upstreamSlope[c] = maxUpSlope
+      }
+
+      // --- Shoreline band: cells within DEP_SHORE_HOPS BFS hops of ocean/lake ---
+      // Uses a simple BFS (deterministic: processes cells in index order each wave).
+      const isShore = new Uint8Array(N)
+      {
+        let frontier: number[] = []
+        for (let c = 0; c < N; c++) {
+          if (isOcean[c] || lakeLevel[c] !== LAKE_SENTINEL) {
+            isShore[c] = 1
+            frontier.push(c)
+          }
+        }
+        for (let hop = 0; hop < DEP_SHORE_HOPS; hop++) {
+          const next: number[] = []
+          for (const c of frontier) {
+            for (const n of neigh[c]) {
+              if (!isShore[n]) {
+                isShore[n] = 1
+                next.push(n)
+              }
+            }
+          }
+          frontier = next
+        }
+        // Clear ocean/lake cells from shore mask — only the LAND fringe is shore
+        for (let c = 0; c < N; c++) {
+          if (isOcean[c] || lakeLevel[c] !== LAKE_SENTINEL) isShore[c] = 0
+        }
+      }
+
+      // --- Classify ---
+      const depositEnv = new Uint8Array(N)  // ENV_DEFAULT everywhere to start
+      for (let c = 0; c < N; c++) {
+        if (isOcean[c]) continue
+
+        const sl  = localSlope[c]
+        const usl = upstreamSlope[c]
+        const qn  = Qnorm[c]
+
+        // DELTA: near shore with meaningful discharge
+        if (isShore[c] && qn >= DEP_Q_DELTA_MIN) {
+          depositEnv[c] = ENV_DELTA
+          continue
+        }
+
+        // ALLUVIAL FAN: steep-to-flat transition — upstream was steep, here is gentle
+        if (sl < depSlopeLow && usl > depSlopeHigh) {
+          depositEnv[c] = ENV_FAN
+          continue
+        }
+
+        // FLOODPLAIN: low gradient, moderate discharge, not near shore
+        if (sl < depSlopeLow && qn >= DEP_Q_FLOODPLAIN_MIN) {
+          depositEnv[c] = ENV_FLOODPLAIN
+          continue
+        }
+
+        // DEFAULT: everything else (high-gradient incision, low Q flats, lake floor)
+        depositEnv[c] = ENV_DEFAULT
+      }
+
+      // -----------------------------------------------------------------------
       // Step 6 — Erosion-deposition (Davy–Lague / Yuan stream-power extension)
       //
       // Per cell, per iteration (topological sweep high→low via landCells order):
-      //   erosion   = dt · K0 · Q^mExp · S^nExp          (detachment — lowers bed)
-      //   deposition = dt · G · QsIn / max(Q, eps)        (raises bed from incoming flux)
-      //   dh        = deposition − erosion
-      //   QsOut     = QsIn + erosion − deposition         (mass conservation)
+      //   erosion    = dt · K0 · Q^mExp · S^nExp            (detachment — lowers bed)
+      //   deposition = dt · G_env · QsIn / max(Q, eps)      (raises bed from incoming flux)
+      //   dh         = deposition − erosion
+      //   QsOut      = QsIn + erosion − deposition           (mass conservation)
+      //
+      // G_env and SEDIMENT_MAX_env vary per depositional environment (ENV_*) so
+      // alluvial fans, floodplains and deltas build recognisable landforms while
+      // high-gradient reaches retain the original behaviour.
+      //
+      // Alluvial fans additionally spread a fraction (FAN_LATERAL_SPREAD) of their
+      // outgoing Qs sideways to non-downslope 8-connectivity neighbors at similar
+      // elevation — building the characteristic perpendicular-to-flow cone shape.
       //
       // QsOut is routed to lower neighbors using the same MFD weights computed in
       // Step 4. Qs resets to zero at the start of each iteration so the flux is
@@ -903,12 +1272,58 @@ export class Erosion {
       // -----------------------------------------------------------------------
 
       const DH_CLAMP = 0.02   // per-iteration per-cell height-change cap (raised from 0.01 for deposition headroom)
-      const G = depositionG
       const dt = 0.005        // same as the old incision timestep
+
+      // Lookup tables indexed by ENV_* for zero-branch inner loop.
+      // ENV_DEFAULT respects opts.depositionG override so external callers that bump
+      // the base G still affect uncategorised cells while landform classes keep their
+      // own coefficients.
+      const ENV_G: readonly number[] = [
+        depositionG,       // 0 = ENV_DEFAULT (respects opts.depositionG override)
+        DEP_G_FLOODPLAIN,  // 1 = ENV_FLOODPLAIN
+        DEP_G_FAN,         // 2 = ENV_FAN
+        DEP_G_DELTA,       // 3 = ENV_DELTA
+      ]
+      const ENV_SMAX: readonly number[] = [
+        SEDIMENT_MAX_DEFAULT,     // 0 = ENV_DEFAULT
+        SEDIMENT_MAX_FLOODPLAIN,  // 1 = ENV_FLOODPLAIN
+        SEDIMENT_MAX_FAN,         // 2 = ENV_FAN
+        SEDIMENT_MAX_DELTA,       // 3 = ENV_DELTA
+      ]
+
+      // Pre-compute lateral spread neighbor lists for fan cells — done once so the
+      // inner loop allocates nothing.  Uses Hf (the pre-erosion flood-filled surface)
+      // as the reference elevation; gentle deviations during iteration don't matter for
+      // this structural classification.
+      //
+      // A lateral candidate is a neighbor of a fan cell that:
+      //   • is not ocean
+      //   • is not a downslope MFD target (which gets the primary flux already)
+      //   • is at a similar elevation: within [−localSlope, 2*localSlope + depSlopeLow]
+      //     of c, i.e. roughly iso-elevation or very gently lower — the lateral flank.
+      const fanLateralNeighbors: number[][] = new Array(N).fill(null).map(() => [])
+      for (let c = 0; c < N; c++) {
+        if (depositEnv[c] !== ENV_FAN) continue
+        const mfd = mfdNeighbors[c]
+        const sl  = localSlope[c]
+        // MFD target set for fast exclusion (small per cell, array scan acceptable)
+        const mfdTargets: number[] = mfd.map(({ n }) => n)
+        for (const n of neigh[c]) {
+          if (isOcean[n]) continue
+          if (mfdTargets.includes(n)) continue
+          const dh_cn = Hf[c] - Hf[n]
+          if (dh_cn >= -sl && dh_cn <= 2 * sl + depSlopeLow) {
+            fanLateralNeighbors[c].push(n)
+          }
+        }
+      }
 
       let bufA = Hf.slice()
       let bufB = new Float32Array(N)
       const Qs  = new Float64Array(N)  // sediment flux (recomputed each iteration)
+
+      // Per-cell accumulated deposition (tracks against per-class SEDIMENT_MAX cap)
+      const totalDep = new Float32Array(N)
 
       for (let iter = 0; iter < DEFAULT_ITERS_INCISION; iter++) {
         bufB.set(bufA)
@@ -927,24 +1342,65 @@ export class Erosion {
             slope += w * Math.max(0, bufA[c] - bufA[n])
           }
 
-          const erosion   = dt * K0 * Math.pow(Q[c], mExp) * Math.pow(Math.max(slope, 1e-8), nExp)
-          const deposition = dt * G * Qs[c] / Math.max(Q[c], EPS_Q)
+          const env   = depositEnv[c]
+          const G_env = ENV_G[env]
+          const smax  = ENV_SMAX[env]
+
+          // Stream-power incision: K0 scaled by per-cell erodibility (hardness-derived).
+          // Hard rock (erodibility < 1) incises slower → ridges and escarpments persist.
+          // Soft rock (erodibility > 1) incises faster → smooth basins and badlands form.
+          const erosion    = dt * K0 * erodibility[c] * Math.pow(Q[c], mExp) * Math.pow(Math.max(slope, 1e-8), nExp)
+          // Per-class deposition: soft-cap by remaining headroom so fast depositors
+          // don't stack beyond their environment's geomorphic ceiling.
+          const headroom   = Math.max(0, smax - totalDep[c])
+          const rawDep     = dt * G_env * Qs[c] / Math.max(Q[c], EPS_Q)
+          const deposition = rawDep < headroom ? rawDep : headroom
 
           // Height change: cap per-iteration delta to prevent runaway
           let dh = deposition - erosion
           if (dh >  DH_CLAMP) dh =  DH_CLAMP
           if (dh < -DH_CLAMP) dh = -DH_CLAMP
           bufB[c] = bufA[c] + dh
+          if (dh > 0) totalDep[c] += dh
 
-          // Route outgoing sediment flux to lower neighbors.
+          // Route outgoing sediment flux to lower (downslope) neighbors.
           // NOTE: max(0, QsIn + erosion − deposition) is NOT strict mass conservation —
           // the floor discards flux that drains to the ocean or sinks (no downstream cell
           // to receive it). Negative flux would be unphysical, so it is clamped to zero.
           const QsOut = Qs[c] + (erosion - deposition)
           const QsOutClamped = QsOut > 0 ? QsOut : 0  // floor: sediment leaving to ocean/sink is discarded
+
+          // Alluvial fan lateral spread: MOVE a fraction of outgoing Qs sideways to
+          // pre-computed lateral neighbors (perpendicular-to-flow cone shape).
+          // The lateral list is empty for non-fan cells so this is a no-op in those cases.
+          //
+          // Normal case (fan cell with downslope MFD targets):
+          //   downslope gets (1 − FAN_LATERAL_SPREAD) of flux;
+          //   lateral gets FAN_LATERAL_SPREAD → total = 1.0, mass conserved.
+          //
+          // Pit/sink case (fan cell with no MFD lower neighbors, mfd.length === 0):
+          //   Routing all flux only to downslope (= nothing) would silently discard it.
+          //   Instead, route ALL remaining flux to lateral neighbors — the cone still
+          //   spreads, nothing is lost.  If there are no lateral neighbors either, the
+          //   sink discards as normal (consistent with the ocean/lake-floor sink behaviour).
+          let downSlopeFrac = 1.0
+          if (env === ENV_FAN && QsOutClamped > 0) {
+            const lateralNeighbors = fanLateralNeighbors[c]
+            const nLateral = lateralNeighbors.length
+            if (nLateral > 0) {
+              // If no MFD downslope targets exist, the full flux goes laterally.
+              const lateralFrac = mfd.length === 0 ? 1.0 : FAN_LATERAL_SPREAD
+              downSlopeFrac = 1.0 - lateralFrac
+              const share = (QsOutClamped * lateralFrac) / nLateral
+              for (let li = 0; li < nLateral; li++) {
+                Qs[lateralNeighbors[li]] += share
+              }
+            }
+          }
+
           for (const { n, w } of mfd) {
             if (!isOcean[n]) {
-              Qs[n] += QsOutClamped * w
+              Qs[n] += QsOutClamped * downSlopeFrac * w
             }
           }
         }
@@ -959,10 +1415,12 @@ export class Erosion {
       for (let iter = 0; iter < DEFAULT_ITERS_THERMAL; iter++) {
         bufB.set(bufA)
         for (let c = 0; c < N; c++) {
+          // Per-cell talus angle: harder rock holds steeper slopes (cliffier escarpments).
+          const talusC = talusScale[c]
           for (const n of neigh[c]) {
             const slopeCN = bufA[c] - bufA[n]
-            if (slopeCN > talus) {
-              const transfer = 0.0005 * (slopeCN - talus) * 0.5
+            if (slopeCN > talusC) {
+              const transfer = 0.0005 * (slopeCN - talusC) * 0.5
               bufB[c] -= transfer
               bufB[n] += transfer
             }
@@ -990,7 +1448,10 @@ export class Erosion {
       let erosionDelta = new Float32Array(N)
       for (let c = 0; c < N; c++) {
         const d = workH[c] - H0[c]
-        erosionDelta[c] = d < -EROSION_MAX ? -EROSION_MAX : d > SEDIMENT_MAX ? SEDIMENT_MAX : d
+        // Upper clamp is per-environment so fans/floodplains/deltas keep their
+        // extra relief while the erosion floor stays at the global EROSION_MAX.
+        const smax = ENV_SMAX[depositEnv[c]]
+        erosionDelta[c] = d < -EROSION_MAX ? -EROSION_MAX : d > smax ? smax : d
       }
 
       // -----------------------------------------------------------------------
@@ -1030,6 +1491,7 @@ export class Erosion {
       this.flowDirZ     = flowDirZ
       this.lakeLevel    = lakeLevel
       this.lakeMask     = lakeMask
+      this.depositEnv   = depositEnv
     }
   }
 
@@ -1053,6 +1515,9 @@ export class Erosion {
     R['flowDirZ']     = b.flowDirZ
     R['lakeLevel']    = b.lakeLevel
     R['lakeMask']     = b.lakeMask
+    // depositEnv: MUST be assigned explicitly — Object.create does not run field
+    // initializers, so workers would read undefined and deposit-env queries would crash.
+    R['depositEnv']   = b.depositEnv
     R['K0']    = b.K0
     R['mExp']  = b.mExp
     R['nExp']  = b.nExp
@@ -1084,6 +1549,7 @@ export class Erosion {
     R['flowDirZ']     = new Float32Array(N)
     const ll = new Float32Array(N); ll.fill(LAKE_SENTINEL); R['lakeLevel'] = ll
     R['lakeMask']     = new Float32Array(N)  // all zeros = no lakes
+    R['depositEnv']   = new Uint8Array(N)    // all zeros = ENV_DEFAULT everywhere
     R['K0']    = DEFAULT_K0
     R['mExp']  = DEFAULT_M_EXP
     R['nExp']  = DEFAULT_N_EXP
@@ -1122,6 +1588,7 @@ export class Erosion {
       flowDirZ:     this.flowDirZ,
       lakeLevel:    this.lakeLevel,
       lakeMask:     this.lakeMask,
+      depositEnv:   this.depositEnv,
       K0:       this.K0,
       mExp:     this.mExp,
       nExp:     this.nExp,
@@ -1343,5 +1810,56 @@ export class Erosion {
    */
   lakeMaskAt(dir: Vector3): number {
     return this._sampleC1(this.lakeMask, this._warpedDir(dir))
+  }
+
+  /**
+   * Depositional environment code at dir.
+   * Returns one of ENV_DEFAULT (0), ENV_FLOODPLAIN (1), ENV_FAN (2), ENV_DELTA (3).
+   *
+   * Sampled NEAREST-NEIGHBOR — NOT C1 or bilinear — because depositEnv is a discrete
+   * integer classification, not a continuous field.  Interpolating between environment
+   * codes is meaningless and would produce fractional values without semantic content.
+   *
+   * The domain warp is still applied so query locations match the same distorted grid
+   * used by all other Erosion samplers.
+   *
+   * IMPORTANT: this value must NEVER feed into heightFn geometry.  Color discontinuities
+   * at environment boundaries are acceptable; geometry seams are not.
+   *
+   * Returns the environment code as a number (0–3); cast to number for use in lookups.
+   */
+  depositEnvAt(dir: Vector3): number {
+    // Apply the same domain warp used by all other samplers so queries are consistent.
+    const dw  = this._warpedDir(dir)
+    const res = this.res
+
+    // Nearest-neighbor cube-map lookup (no interpolation).
+    const dx = dw.x, dy = dw.y, dz = dw.z
+    const ax = Math.abs(dx)
+    const ay = Math.abs(dy)
+    const az = Math.abs(dz)
+
+    let face: number, sc: number, tc: number, mc: number
+    if (ax >= ay && ax >= az) {
+      if (dx > 0) { face = 0; mc = ax; sc =  dz; tc = dy }
+      else        { face = 1; mc = ax; sc = -dz; tc = dy }
+    } else if (ay >= ax && ay >= az) {
+      if (dy > 0) { face = 2; mc = ay; sc = dx; tc =  dz }
+      else        { face = 3; mc = ay; sc = dx; tc = -dz }
+    } else {
+      if (dz > 0) { face = 4; mc = az; sc = -dx; tc = dy }
+      else        { face = 5; mc = az; sc =  dx; tc = dy }
+    }
+
+    const half = res * 0.5
+    const fx   = (sc / mc + 1.0) * half - 0.5
+    const fy   = (tc / mc + 1.0) * half - 0.5
+    // Nearest: round to nearest texel, clamped to [0, res-1]
+    let x = Math.round(fx)
+    let y = Math.round(fy)
+    if (x < 0) x = 0; else if (x >= res) x = res - 1
+    if (y < 0) y = 0; else if (y >= res) y = res - 1
+
+    return this.depositEnv[face * res * res + y * res + x]
   }
 }

@@ -1,5 +1,5 @@
 import { PerspectiveCamera, Vector3 } from 'three'
-import type { SurfaceSampler, SurfacePlacement } from './NavMode.js'
+import type { SurfaceSampler, SurfacePlacement, CaveCollider } from './NavMode.js'
 
 // ---------------------------------------------------------------------------
 // Zero-allocation scratch — module-level Vector3s reused every update() call.
@@ -13,6 +13,10 @@ const _s = {
   camPos:  new Vector3(), // camera position scratch
   lookDir: new Vector3(), // look direction (fwd tilted by pitch)
   tmp:     new Vector3(), // generic scratch
+  norm:    new Vector3(), // collision normal scratch
+  feet:    new Vector3(), // feet-sphere sample point scratch
+  head:    new Vector3(), // head-sphere sample point scratch
+  torso:   new Vector3(), // torso-sphere sample point scratch
 }
 
 const _WORLD_X = new Vector3(1, 0, 0)
@@ -20,6 +24,29 @@ const _WORLD_Z = new Vector3(0, 0, 1)
 
 // Clamp pitch to ±85° — never let the view flip upside-down
 const PITCH_LIMIT = (85 * Math.PI) / 180
+
+// ---------------------------------------------------------------------------
+// Cave physics constants
+// ---------------------------------------------------------------------------
+
+/** Height from feet to top of head, metres. Matches default eyeHeight. */
+const PLAYER_HEIGHT = 1.7
+/** Radius of the feet collision sphere, metres. */
+const FEET_R = 0.35
+/** Radius of the head collision sphere, metres. */
+const HEAD_R = 0.30
+/** Radius of the torso collision sphere for wall slides, metres. */
+const TORSO_R = 0.35
+/** Gravitational acceleration toward planet centre, m/s². */
+const G = 14
+/** Maximum displacement per sub-step before sub-stepping kicks in, metres. */
+const MAX_STEP_M = 0.3
+/** How close to the surface radius (metres above) before snapping to SURFACE mode. */
+const SURFACE_SNAP_M = 0.5
+/** Small gap added when pushing out of rock, prevents re-penetration next query. */
+const PUSHOUT_BIAS = 0.01
+/** Hysteresis offset for SURFACE→CAVE transition: this many metres below surface. */
+const CAVE_ENTER_DEPTH = 0.2
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -31,17 +58,20 @@ export interface FirstPersonOptions {
   moveSpeed?:        number   // world units/sec; default 10
   runMultiplier?:    number   // shift multiplier; default 5
   lookSensitivity?:  number   // rad/pixel; default 0.0022
+  collider?:         CaveCollider  // optional cave SDF; if absent, SURFACE only
 }
 
 export class FirstPersonController {
   // ---- Public contract -------------------------------------------------------
   readonly position: Vector3   // world position of player feet
   get isLocked(): boolean { return this._isLocked }
+  get mode(): 'surface' | 'cave' { return this._mode }
 
   // ---- Private state ---------------------------------------------------------
   private readonly _camera:          PerspectiveCamera
   private readonly _dom:             HTMLElement
   private readonly _sampler:         SurfaceSampler
+  private readonly _collider:        CaveCollider | undefined
   private readonly _eyeHeight:       number
   private readonly _moveSpeed:       number
   private readonly _runMultiplier:   number
@@ -69,6 +99,10 @@ export class FirstPersonController {
   private _isEnabled  = false
   private _isDisposed = false
 
+  // Cave locomotion state
+  private _mode: 'surface' | 'cave' = 'surface'
+  private _vy = 0  // velocity along radial up, m/s (positive = outward)
+
   // Bound listener refs (stored so removeEventListener gets the exact same fn)
   private readonly _onKeyDown:            (e: KeyboardEvent) => void
   private readonly _onKeyUp:              (e: KeyboardEvent) => void
@@ -85,6 +119,7 @@ export class FirstPersonController {
     this._camera          = camera
     this._dom             = dom
     this._sampler         = opts.sampler
+    this._collider        = opts.collider
     this._eyeHeight       = opts.eyeHeight       ?? 1.7
     this._moveSpeed       = opts.moveSpeed        ?? 10
     this._runMultiplier   = opts.runMultiplier    ?? 5
@@ -104,9 +139,30 @@ export class FirstPersonController {
   }
 
   // ---------------------------------------------------------------------------
+  // setCollider — inject a cave collider after construction
+  // ---------------------------------------------------------------------------
+  setCollider(collider: CaveCollider): void {
+    // TypeScript: _collider is readonly but we need to allow a post-construction
+    // injection for the cave-manager wiring in main.ts. Cast through unknown.
+    ;(this as unknown as { _collider: CaveCollider })._collider = collider
+  }
+
+  // ---------------------------------------------------------------------------
+  // setMode — externally request a mode switch (e.g. entering a cave mouth)
+  // ---------------------------------------------------------------------------
+  setMode(m: 'surface' | 'cave'): void {
+    if (m === this._mode) return
+    if (m === 'cave' && !this._collider) return  // no-op: can't enter cave without collider
+    this._mode = m
+    if (m === 'cave') {
+      this._vy = 0  // start with zero vertical velocity
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // spawn — place + orient; does NOT lock pointer
   // ---------------------------------------------------------------------------
-  spawn(placement: SurfacePlacement): void {
+  spawn(placement: SurfacePlacement, mode?: 'surface' | 'cave'): void {
     this._up.copy(placement.up).normalize()
     // Snap feet to the sampler-authoritative surface radius (same formula as update()).
     // This guarantees spawn and per-frame re-projection are consistent even if
@@ -116,6 +172,14 @@ export class FirstPersonController {
 
     // Reset pitch; yaw is implicit in _forward (reset by building a fresh tangent)
     this._pitch = 0
+    this._vy    = 0
+
+    // Apply requested mode (default: surface; cave requires collider)
+    if (mode !== undefined) {
+      this._mode = (mode === 'cave' && this._collider) ? 'cave' : 'surface'
+    } else {
+      this._mode = 'surface'
+    }
 
     // Build initial forward: project +Z onto the tangent plane. Fall back to +X
     // if +Z is nearly parallel to up (player spawned at a pole).
@@ -215,12 +279,16 @@ export class FirstPersonController {
     this._pitch  = Math.min(Math.max(this._pitch, -PITCH_LIMIT), PITCH_LIMIT)
 
     // ---- 4. WASD movement in the tangent plane --------------------------------
+    //    Build the normalized move direction and compute per-frame speed.
+    //    For SURFACE mode the displacement is applied immediately (original behavior).
+    //    For CAVE mode the displacement is deferred into the sub-step loop below so
+    //    both horizontal and vertical motion share the same tunneling guard.
     const fwdInput    = (this._keys.has('KeyW') ? 1 : 0) - (this._keys.has('KeyS') ? 1 : 0)
     const strafeInput = (this._keys.has('KeyD') ? 1 : 0) - (this._keys.has('KeyA') ? 1 : 0)
 
-    if (fwdInput !== 0 || strafeInput !== 0) {
-      const speed = this._moveSpeed * (this._shiftHeld ? this._runMultiplier : 1)
+    const speed = this._moveSpeed * (this._shiftHeld ? this._runMultiplier : 1)
 
+    if (fwdInput !== 0 || strafeInput !== 0) {
       // right = forward × up (fresh after possible yaw rotation)
       _s.right.crossVectors(this._forward, this._up).normalize()
 
@@ -231,21 +299,155 @@ export class FirstPersonController {
       // Non-zero check guards the normalize; diagonals are normalized to 1
       if (_s.move.lengthSq() > 0) {
         _s.move.normalize()
-        this.position.addScaledVector(_s.move, speed * safeDt)
       }
+    } else {
+      _s.move.set(0, 0, 0)
     }
 
-    // ---- 5. Re-project feet to surface ----------------------------------------
-    //    Critical: keeps the player glued to the sphere regardless of float error
-    //    accumulation in position. Compute radial direction, query sampler, snap.
-    _s.up.copy(this.position).normalize()
-    const surfR = this._sampler.surfaceRadiusAt(_s.up)
-    this.position.copy(_s.up).multiplyScalar(surfR)
-    this._up.copy(_s.up)   // update stored radial up to match new position
+    // ---- 5. Mode-dependent vertical resolution --------------------------------
+    if (this._mode === 'surface' || !this._collider) {
+      // ---- SURFACE mode: pin feet to terrain height (original behavior) --------
+      // Apply horizontal move in one shot (no sub-stepping needed on the surface).
+      if (_s.move.lengthSq() > 0) {
+        this.position.addScaledVector(_s.move, speed * safeDt)
+      }
 
-    // Camera eye position
-    _s.camPos.copy(_s.up).multiplyScalar(surfR + this._eyeHeight)
-    this._camera.position.copy(_s.camPos)
+      _s.up.copy(this.position).normalize()
+      const surfR = this._sampler.surfaceRadiusAt(_s.up)
+      this.position.copy(_s.up).multiplyScalar(surfR)
+      this._up.copy(_s.up)
+
+      // Camera eye position
+      _s.camPos.copy(_s.up).multiplyScalar(surfR + this._eyeHeight)
+      this._camera.position.copy(_s.camPos)
+
+      // Auto-transition SURFACE→CAVE when the surface-pinned feet are inside void
+      if (this._collider) {
+        const density = this._collider.densityAt(this.position)
+        // density ≤ 0 means the surface-pinned spot is in a void (cave void
+        // extends above the terrain surface, so the player is at the cave mouth).
+        // Apply hysteresis: only enter cave if we're in void by at least CAVE_ENTER_DEPTH.
+        if (density <= -CAVE_ENTER_DEPTH) {
+          this._mode = 'cave'
+          this._vy   = 0
+        }
+      }
+    } else {
+      // ---- CAVE mode: gravity + SDF pushout ------------------------------------
+      _s.up.copy(this.position).normalize()
+      this._up.copy(_s.up)
+
+      // Compute total displacement magnitude this frame for sub-step guard.
+      // horzDisp uses the actual intended move distance (0 when no input).
+      const horzDisp = _s.move.lengthSq() > 0 ? speed * safeDt : 0
+      const gravDisp = Math.abs(this._vy * safeDt) + 0.5 * G * safeDt * safeDt
+      const totalDisp = horzDisp + gravDisp
+      const nSubSteps = Math.max(1, Math.ceil(totalDisp / MAX_STEP_M))
+      const subDt = safeDt / nSubSteps
+      // Per-step horizontal advance (metres along _s.move); 0 when no WASD input.
+      const horzStep = horzDisp / nSubSteps
+
+      for (let step = 0; step < nSubSteps; step++) {
+        // 5a. Horizontal WASD: advance a fraction of the full-frame displacement.
+        //     Doing this inside the loop is the tunneling fix — every sub-step
+        //     advances at most MAX_STEP_M total, so fast horizontal moves are
+        //     broken up the same way gravity steps are.
+        if (horzStep > 0) {
+          this.position.addScaledVector(_s.move, horzStep)
+        }
+
+        // 5b. Gravity: integrate vertical velocity and apply radial displacement
+        this._vy -= G * subDt
+        this.position.addScaledVector(this._up, this._vy * subDt)
+
+        // 5c. Floor collision: feet sphere at `position + up * FEET_R`
+        //     Iterate 2-3 times for robust convergence
+        let grounded = false
+        for (let iter = 0; iter < 3; iter++) {
+          _s.feet.copy(this.position).addScaledVector(this._up, FEET_R)
+          const fd = this._collider.densityAt(_s.feet)
+          // Positive density means we're inside rock. Push out by (fd + bias) along outward normal.
+          if (fd > 0) {
+            this._collider.normalAt(_s.feet, _s.norm)
+            const pushDist = fd + PUSHOUT_BIAS
+            this.position.addScaledVector(_s.norm, pushDist)
+            // If the normal has a positive up-component, correction moved us upward → grounded
+            if (_s.norm.dot(this._up) > 0) {
+              grounded = true
+            }
+          } else {
+            break  // not penetrating, stop iteration
+          }
+        }
+        if (grounded) {
+          this._vy = 0
+          // Recompute up after positional correction
+          _s.up.copy(this.position).normalize()
+          this._up.copy(_s.up)
+        }
+
+        // 5d. Ceiling collision: head sphere at `position + up * PLAYER_HEIGHT`
+        _s.head.copy(this.position).addScaledVector(this._up, PLAYER_HEIGHT - HEAD_R)
+        const cd = this._collider.densityAt(_s.head)
+        if (cd > 0) {
+          this._collider.normalAt(_s.head, _s.norm)
+          this.position.addScaledVector(_s.norm, cd + PUSHOUT_BIAS)
+          // Clamp upward velocity if ceiling pushes us down (normal has negative up component)
+          if (_s.norm.dot(this._up) < 0 && this._vy > 0) {
+            this._vy = 0
+          }
+          // Recompute up
+          _s.up.copy(this.position).normalize()
+          this._up.copy(_s.up)
+        }
+
+        // 5e. Wall collision: torso sphere along horizontal move direction.
+        //     Only check if there was horizontal input this frame.
+        if (_s.move.lengthSq() > 0) {
+          _s.torso.copy(this.position)
+            .addScaledVector(this._up, 1.0)       // mid-torso height
+            .addScaledVector(_s.move, TORSO_R)    // displaced toward intended move dir
+          const wd = this._collider.densityAt(_s.torso)
+          if (wd > 0) {
+            this._collider.normalAt(_s.torso, _s.norm)
+            // Slide: project the horizontal move out of the wall normal
+            // move -= norm * dot(move, norm)
+            const proj = _s.move.dot(_s.norm)
+            if (proj < 0) {  // only cancel the into-wall component
+              _s.move.addScaledVector(_s.norm, -proj)
+              // Re-normalize if still non-zero so slide speed is consistent
+              if (_s.move.lengthSq() > 1e-10) _s.move.normalize()
+            }
+            // Push position out of wall as well
+            this.position.addScaledVector(_s.norm, wd + PUSHOUT_BIAS)
+          }
+        }
+      }
+
+      // 5f. Camera eye for cave mode: feet + up * eyeHeight
+      _s.up.copy(this.position).normalize()
+      this._up.copy(_s.up)
+      _s.camPos.copy(this.position).addScaledVector(this._up, this._eyeHeight)
+      this._camera.position.copy(_s.camPos)
+
+      // 5g. CAVE→SURFACE transition: if position radius nears surfaceRadius, snap back
+      const r = this.position.length()
+      const surfR = this._sampler.surfaceRadiusAt(this._up)
+      if (r >= surfR - SURFACE_SNAP_M) {
+        // Only snap if the surface-pin spot is open above (density ≤ 0 at surface feet)
+        // — prevents snapping if the cave roof happens to graze the surface.
+        _s.tmp.copy(this._up).multiplyScalar(surfR)  // where surface-mode would pin us
+        const surfaceDensity = this._collider.densityAt(_s.tmp)
+        if (surfaceDensity <= 0) {
+          // Emerged onto open surface — snap to SURFACE mode
+          this.position.copy(this._up).multiplyScalar(surfR)
+          this._vy   = 0
+          this._mode = 'surface'
+          _s.camPos.copy(this._up).multiplyScalar(surfR + this._eyeHeight)
+          this._camera.position.copy(_s.camPos)
+        }
+      }
+    }
 
     // ---- 6. Re-orthonormalize _forward against the new _up --------------------
     //    As the player walks around the planet's curvature, _up rotates so

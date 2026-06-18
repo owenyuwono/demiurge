@@ -19,6 +19,7 @@ WASD      orbit
 shift     fast
 
 ─── walk mode ───────────────
+c  go to cave mouth
 Walk here → click planet · mouse look · WASD/shift · Back to orbit`.trimStart()
 
 export class Hud {

@@ -195,10 +195,16 @@ export class MeshWorkerPool {
       plateColors:  msg.plateColors !== null
         ? new Float32Array(msg.plateColors, 0, vertCount * 3)
         : null,
-      climateMoist: msg.climateMoist !== null
-        ? new Float32Array(msg.climateMoist, 0, vertCount)
+      climateMoist:   msg.climateMoist !== null
+        ? new Float32Array(msg.climateMoist,  0, vertCount)
         : null,
-      indices:      new Uint32Array(msg.indices,      0, indexCount),
+      subsurfaceWet:  msg.subsurfaceWet !== null
+        ? new Float32Array(msg.subsurfaceWet, 0, vertCount)
+        : null,
+      rockHardness:   msg.rockHardness !== null
+        ? new Float32Array(msg.rockHardness,  0, vertCount)
+        : null,
+      indices:        new Uint32Array(msg.indices,      0, indexCount),
       originX:      msg.originX,
       originY:      msg.originY,
       originZ:      msg.originZ,

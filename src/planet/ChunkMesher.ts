@@ -47,7 +47,35 @@ export interface ChunkParams {
      * 0/1 field (no sentinel mixing). Values > 0.5 are inside a lake basin.
      */
     lakeMaskAt(dir: Vector3): number;
+    /**
+     * Deposition environment code for a unit sphere direction.
+     * Returns ENV_* code: 0=DEFAULT, 1=FLOODPLAIN, 2=FAN, 3=DELTA.
+     * Nearest-neighbor sample — used for color only, never heightFn.
+     */
+    depositEnvAt(dir: Vector3): number;
   } | null;
+  /**
+   * optional subsurface sampler (pipeline step 11).
+   * When present, land vertices receive emergence overlays: springs, permafrost
+   * ice seeps, and ore outcrops blended over the base biome/erosion color.
+   */
+  subsurface?: {
+    /** normalized water table elevation for a unit sphere direction */
+    waterTableAt(dir: Vector3): number;
+    /** ore density at a given unit sphere direction and absolute normalized elevation */
+    oreAt(dir: Vector3, elev: number): number;
+    /** permafrost presence mask (0/1) for a unit sphere direction */
+    permafrostMaskAt(dir: Vector3): number;
+    /** permafrost top elevation for a unit sphere direction */
+    permafrostTopAt(dir: Vector3): number;
+  } | null;
+  /**
+   * optional hardness sampler — returns C1 baked-grid rock hardness in [0,1]
+   * for a unit sphere direction. When present, per-vertex hardness is baked as
+   * a BufferAttribute ('rockHardness') for the materials view, AND used for
+   * sediment/cap-rock color tinting in the normal view.
+   */
+  hardnessFn?: (dir: Vector3) => number;
 }
 
 export interface ChunkMeshData {
@@ -57,12 +85,15 @@ export interface ChunkMeshData {
 }
 
 export interface ChunkMeshArrays {
-  positions:   Float32Array;
-  normals:     Float32Array;
-  colors:      Float32Array;
-  plateColors:  Float32Array | null;
-  climateMoist: Float32Array | null;
-  indices:     Uint32Array;
+  positions:     Float32Array;
+  normals:       Float32Array;
+  colors:        Float32Array;
+  plateColors:   Float32Array | null;
+  climateMoist:  Float32Array | null;
+  subsurfaceWet: Float32Array | null;
+  /** Per-vertex rock hardness in [0,1]. null when hardnessFn not provided. */
+  rockHardness:  Float32Array | null;
+  indices:       Uint32Array;
   originX: number;
   originY: number;
   originZ: number;
@@ -476,14 +507,103 @@ const LAKE_R = 0x3a / 255;   // #3a5e7a
 const LAKE_G = 0x5e / 255;
 const LAKE_B = 0x7a / 255;
 
+// ---------------------------------------------------------------------------
+// Subsurface emergence overlay constants.
+//
+// SPRING: water table at or above the terrain surface → spring / wet ground.
+//   WT_WET_BAND      — normalized-height band over which spring emergence ramps
+//                      to full blend (water table this far above surface = fully wet).
+//   SPRING_BLEND     — max color-blend weight toward the spring tint.
+//   SPRING_DISCHARGE — synthetic discharge injected into the river formula at
+//                      spring vertices so a short stream appears downhill.
+//
+// ICE SEEP: permafrost top at or above the terrain surface → pale blue film.
+//   ICE_BLEND — blend weight toward the ice-seep tint.
+//
+// ORE OUTCROP: surface ore density above threshold → rust/ochre stain.
+//   ORE_OUTCROP_THRESH — minimum oreAt(dir, h) to show a tint.
+//   ORE_BLEND          — blend weight toward the ore tint.
+// ---------------------------------------------------------------------------
+
+const WT_WET_BAND        = 0.01;
+const SPRING_BLEND       = 0.60;
+const SPRING_DISCHARGE   = 0.90;  // synthetic acc injected at spring heads
+const ICE_BLEND          = 0.50;
+const ORE_OUTCROP_THRESH = 0.60;
+const ORE_BLEND          = 0.45;
+
+// Spring tint: dark green-blue #2f6e54
+const SPRING_R = 0x2f / 255;
+const SPRING_G = 0x6e / 255;
+const SPRING_B = 0x54 / 255;
+
+// Ice-seep tint: pale blue #bfe0ff
+const ICE_R = 0xbf / 255;
+const ICE_G = 0xe0 / 255;
+const ICE_B = 0xff / 255;
+
+// Ore-outcrop tint: rust/ochre #c08a3a
+const ORE_R = 0xc0 / 255;
+const ORE_G = 0x8a / 255;
+const ORE_B = 0x3a / 255;
+
+// ---------------------------------------------------------------------------
+// Sediment / cap-rock tint constants (normal-view T7 coloring).
+//
+// These tints are applied AFTER biome/erosion coloring — final compositing step.
+// All blends are smooth (no hard thresholds) so seams cannot result.
+//
+// HARD CAP-ROCK: high hardness (>0.65) on land → slight grey-brown shift on ridges.
+//   Tint toward #7e7060 — desaturated dark brown-grey (harder than bare rock base).
+//   Max blend 0.30 so biome color still reads through.
+//
+// SEDIMENT FANS/FLOODPLAINS: depositEnv == FAN (2) or FLOODPLAIN (1) → warm alluvial tone.
+//   FLOODPLAIN tint: muted clay tan #a89270 — flat, silty, moist alluvial lowland.
+//   FAN tint: dry alluvial fan sandy beige #c4aa7a.
+//
+// DELTA: salt-flat / tidal mudflat greyish-tan #9a9080.
+//   Light, slightly desaturated; shows the marine-fluvial transition clearly.
+// ---------------------------------------------------------------------------
+
+const HARDCAP_THRESH     = 0.65;   // hardness above which cap-rock tint starts
+const HARDCAP_BLEND_MAX  = 0.30;
+const HARDCAP_R = 0x7e / 255;      // #7e7060
+const HARDCAP_G = 0x70 / 255;
+const HARDCAP_B = 0x60 / 255;
+
+// depositEnv code constants (mirrors erosion.ts ENV_* values)
+const ENV_DEFAULT    = 0;
+const ENV_FLOODPLAIN = 1;
+const ENV_FAN        = 2;
+const ENV_DELTA      = 3;
+
+const SEDIMENT_BLEND  = 0.28;       // max blend weight for sediment tints
+
+// Floodplain: muted clay tan #a89270
+const FLOODPLAIN_R = 0xa8 / 255;
+const FLOODPLAIN_G = 0x92 / 255;
+const FLOODPLAIN_B = 0x70 / 255;
+
+// Alluvial fan: dry sandy beige #c4aa7a
+const FAN_R = 0xc4 / 255;
+const FAN_G = 0xaa / 255;
+const FAN_B = 0x7a / 255;
+
+// Delta: greyish-tan #9a9080
+const DELTA_R = 0x9a / 255;
+const DELTA_G = 0x90 / 255;
+const DELTA_B = 0x80 / 255;
+
 export function computeChunkArrays(p: ChunkParams, seaLevel: number): ChunkMeshArrays {
-  const { faceIndex, level, ix, iy, resolution: res, radius, heightScale, heightFn, plateColorFn, climateFn, erosion } = p;
+  const { faceIndex, level, ix, iy, resolution: res, radius, heightScale, heightFn, plateColorFn, climateFn, erosion, subsurface, hardnessFn } = p;
   // Convenience: heightFn with level pre-bound — avoids repeating `level` at every call site
   // inside this function (all vertices in a chunk share the same LOD level).
   const hFn = (dir: Vector3): number => heightFn(dir, level);
   const basis = FACE_BASES[faceIndex];
-  const hasPlateColor = plateColorFn !== undefined;
-  const hasClimate = climateFn !== undefined;
+  const hasPlateColor  = plateColorFn !== undefined;
+  const hasClimate     = climateFn    !== undefined;
+  const hasSubsurface  = subsurface !== null && subsurface !== undefined;
+  const hasHardness    = hardnessFn  !== undefined;
 
   // Vertex counts
   const gridSize    = res + 1;              // vertices per side of interior grid
@@ -516,9 +636,11 @@ export function computeChunkArrays(p: ChunkParams, seaLevel: number): ChunkMeshA
   const positions    = new Float32Array(totalVerts * 3);
   const normals      = new Float32Array(totalVerts * 3);
   const colors       = new Float32Array(totalVerts * 3);
-  const plateColors  = hasPlateColor ? new Float32Array(totalVerts * 3) : null;
-  const climateMoist = hasClimate    ? new Float32Array(totalVerts)     : null;
-  const indices      = new Uint32Array(totalIndices);
+  const plateColors    = hasPlateColor  ? new Float32Array(totalVerts * 3) : null;
+  const climateMoist   = hasClimate     ? new Float32Array(totalVerts)     : null;
+  const subsurfaceWet  = hasSubsurface  ? new Float32Array(totalVerts)     : null;
+  const rockHardness   = hasHardness    ? new Float32Array(totalVerts)     : null;
+  const indices        = new Uint32Array(totalIndices);
 
   // Scratch objects — reused, no per-vertex allocation
   const dir    = new Vector3();
@@ -713,26 +835,42 @@ export function computeChunkArrays(p: ChunkParams, seaLevel: number): ChunkMeshA
         elevationColor(h, slope, seaLevel, colors, vi * 3);
       }
 
-      // -- Erosion tinting: rivers + lakes (land only, guard on erosion present) --
-      // Applied after biome/elevation color so it overlays cleanly.
-      // Only queries land vertices (seabed already has a full geology palette).
+      // -- Erosion + subsurface tinting (land only) --------------------------------
+      // Compositing order (matches HEAD for the no-subsurface path):
+      //   1. River(effAcc) — effAcc === acc when subsurface absent
+      //   2. Lake
+      //   3. Spring / ice-seep / ore (subsurface only — skipped when absent)
+      // This preserves the exact River-then-Lake order from HEAD while still
+      // allowing a spring to boost acc → effAcc before the river tint fires.
       if (erosion !== null && erosion !== undefined && h >= seaLevel) {
         const base3 = vi * 3;
-
-        // River tint: muted flowing-water blue #4a6e8a
-        // Threshold 0.78 — only strong trunk channels read as water; small streams fade.
         const acc = erosion.accAt(dir);
-        if (acc > RIVER_THRESHOLD) {
-          const riverT = clamp01((acc - RIVER_THRESHOLD) / (1.0 - RIVER_THRESHOLD)) * RIVER_MAX_BLEND;
+
+        // Step 1a: compute effAcc (spring boost when subsurface present).
+        // When subsurface is absent the block is skipped → effAcc === acc.
+        let effAcc = acc;
+        let springEmergence = 0;
+        if (hasSubsurface && subsurface !== null && subsurface !== undefined) {
+          const wt = subsurface.waterTableAt(dir);
+          springEmergence = clamp01((wt - h) / WT_WET_BAND);
+          if (springEmergence > 0) {
+            effAcc = Math.max(acc, springEmergence * SPRING_DISCHARGE);
+          }
+        }
+
+        // Step 1b: River tint using effAcc (muted flowing-water blue #4a6e8a).
+        // Threshold 0.78 — only strong trunk channels read as water; streams fade.
+        // subsurface-absent ⇒ effAcc === acc ⇒ identical to HEAD.
+        if (effAcc > RIVER_THRESHOLD) {
+          const riverT = clamp01((effAcc - RIVER_THRESHOLD) / (1.0 - RIVER_THRESHOLD)) * RIVER_MAX_BLEND;
           colors[base3    ] = lerp(colors[base3    ], RIVER_R, riverT);
           colors[base3 + 1] = lerp(colors[base3 + 1], RIVER_G, riverT);
           colors[base3 + 2] = lerp(colors[base3 + 2], RIVER_B, riverT);
         }
 
-        // Lake tint: still-water blue #3a5e7a
-        // Keys off the clean 0/1 lake mask (bilinear-safe — no sentinel mixing).
-        // The 0.5 isocontour is the clean shoreline; scale tint by mask for a
-        // soft fade at the shore rather than a hard edge.
+        // Step 2: Lake tint (still-water blue #3a5e7a).
+        // Keys off the clean 0/1 lake mask; 0.5 isocontour is the shoreline.
+        // Identical position to HEAD (after river, before any subsurface tints).
         const lkMask = erosion.lakeMaskAt(dir);
         if (lkMask > 0.5) {
           const lakeT = LAKE_BLEND * lkMask;
@@ -740,6 +878,74 @@ export function computeChunkArrays(p: ChunkParams, seaLevel: number): ChunkMeshA
           colors[base3 + 1] = lerp(colors[base3 + 1], LAKE_G, lakeT);
           colors[base3 + 2] = lerp(colors[base3 + 2], LAKE_B, lakeT);
         }
+
+        // Step 3: Subsurface-only overlays — spring, ice seep, ore outcrop.
+        // Entire block is skipped when subsurface is absent, so the no-subsurface
+        // path above (steps 1b + 2) is byte-identical to HEAD.
+        if (hasSubsurface && subsurface !== null && subsurface !== undefined) {
+          let wet = 0;
+
+          // --- SPRING / wet ground ------------------------------------------------
+          // Water table at or above terrain → dark green-blue tint (#2f6e54).
+          // springEmergence already computed above for the effAcc boost.
+          if (springEmergence > 0) {
+            const t = springEmergence * SPRING_BLEND;
+            colors[base3    ] = lerp(colors[base3    ], SPRING_R, t);
+            colors[base3 + 1] = lerp(colors[base3 + 1], SPRING_G, t);
+            colors[base3 + 2] = lerp(colors[base3 + 2], SPRING_B, t);
+            wet = Math.max(wet, t);
+          }
+
+          // --- ICE SEEP -----------------------------------------------------------
+          // Permafrost top at or above terrain → pale blue film (#bfe0ff).
+          if (subsurface.permafrostMaskAt(dir) > 0.5 && subsurface.permafrostTopAt(dir) >= h) {
+            colors[base3    ] = lerp(colors[base3    ], ICE_R, ICE_BLEND);
+            colors[base3 + 1] = lerp(colors[base3 + 1], ICE_G, ICE_BLEND);
+            colors[base3 + 2] = lerp(colors[base3 + 2], ICE_B, ICE_BLEND);
+            wet = Math.max(wet, ICE_BLEND);
+          }
+
+          // --- ORE OUTCROP --------------------------------------------------------
+          // High surface-ore density at this elevation → rust/ochre stain (#c08a3a).
+          // Second arg is the absolute normalized terrain elevation (same units as h).
+          if (subsurface.oreAt(dir, h) > ORE_OUTCROP_THRESH) {
+            colors[base3    ] = lerp(colors[base3    ], ORE_R, ORE_BLEND);
+            colors[base3 + 1] = lerp(colors[base3 + 1], ORE_G, ORE_BLEND);
+            colors[base3 + 2] = lerp(colors[base3 + 2], ORE_B, ORE_BLEND);
+          }
+
+          subsurfaceWet![vi] = wet;
+        }
+      } else if (hasSubsurface && subsurface !== null && subsurface !== undefined && h >= seaLevel) {
+        // Subsurface present but no erosion: spring/ice/ore still apply.
+        // River and lake tints are skipped (no acc available).
+        const base3 = vi * 3;
+        let wet = 0;
+
+        const wt = subsurface.waterTableAt(dir);
+        const springEmergence = clamp01((wt - h) / WT_WET_BAND);
+        if (springEmergence > 0) {
+          const t = springEmergence * SPRING_BLEND;
+          colors[base3    ] = lerp(colors[base3    ], SPRING_R, t);
+          colors[base3 + 1] = lerp(colors[base3 + 1], SPRING_G, t);
+          colors[base3 + 2] = lerp(colors[base3 + 2], SPRING_B, t);
+          wet = Math.max(wet, t);
+        }
+
+        if (subsurface.permafrostMaskAt(dir) > 0.5 && subsurface.permafrostTopAt(dir) >= h) {
+          colors[base3    ] = lerp(colors[base3    ], ICE_R, ICE_BLEND);
+          colors[base3 + 1] = lerp(colors[base3 + 1], ICE_G, ICE_BLEND);
+          colors[base3 + 2] = lerp(colors[base3 + 2], ICE_B, ICE_BLEND);
+          wet = Math.max(wet, ICE_BLEND);
+        }
+
+        if (subsurface.oreAt(dir, h) > ORE_OUTCROP_THRESH) {
+          colors[base3    ] = lerp(colors[base3    ], ORE_R, ORE_BLEND);
+          colors[base3 + 1] = lerp(colors[base3 + 1], ORE_G, ORE_BLEND);
+          colors[base3 + 2] = lerp(colors[base3 + 2], ORE_B, ORE_BLEND);
+        }
+
+        subsurfaceWet![vi] = wet;
       }
 
       // Plate color (if provided)
@@ -748,6 +954,51 @@ export function computeChunkArrays(p: ChunkParams, seaLevel: number): ChunkMeshA
         plateColors[vi * 3    ] = pc[0];
         plateColors[vi * 3 + 1] = pc[1];
         plateColors[vi * 3 + 2] = pc[2];
+      }
+
+      // Rock hardness attribute (materials view) + sediment/cap-rock tint (normal view).
+      // hardnessFn is the same C1 baked-grid lookup used by tectonics.hardnessAt — deterministic.
+      if (hasHardness && hardnessFn !== undefined) {
+        const hval = hardnessFn(dir);
+        // Bake scalar attribute for the materials view.
+        if (rockHardness !== null) rockHardness[vi] = hval;
+
+        // Sediment / cap-rock tinting in the normal view (land only).
+        // Applied last so it composites over biome + subsurface overlays.
+        // All blends are continuous smoothsteps — no hard thresholds (seam-safe).
+        if (h >= seaLevel) {
+          const base3 = vi * 3;
+
+          // --- CAP-ROCK: hard ridges → slight grey-brown shift ---
+          // Smoothstep gate from HARDCAP_THRESH to 1.0 so the blend ramps in
+          // gradually; fully hard rock = HARDCAP_BLEND_MAX mix toward #7e7060.
+          if (hval > HARDCAP_THRESH) {
+            const capT = clamp01((hval - HARDCAP_THRESH) / (1.0 - HARDCAP_THRESH)) * HARDCAP_BLEND_MAX;
+            colors[base3    ] = lerp(colors[base3    ], HARDCAP_R, capT);
+            colors[base3 + 1] = lerp(colors[base3 + 1], HARDCAP_G, capT);
+            colors[base3 + 2] = lerp(colors[base3 + 2], HARDCAP_B, capT);
+          }
+
+          // --- SEDIMENT DEPOSITION: floodplain / fan / delta → warm alluvial tone ---
+          // depositEnvAt is nearest-neighbor on erosion's discrete ENV grid.
+          // Only active when erosion is present (depositEnvAt lives on erosion).
+          if (erosion !== null && erosion !== undefined) {
+            const env = erosion.depositEnvAt(dir);
+            if (env !== ENV_DEFAULT) {
+              let tR: number, tG: number, tB: number;
+              if (env === ENV_FLOODPLAIN) {
+                tR = FLOODPLAIN_R; tG = FLOODPLAIN_G; tB = FLOODPLAIN_B;
+              } else if (env === ENV_FAN) {
+                tR = FAN_R; tG = FAN_G; tB = FAN_B;
+              } else { // ENV_DELTA
+                tR = DELTA_R; tG = DELTA_G; tB = DELTA_B;
+              }
+              colors[base3    ] = lerp(colors[base3    ], tR, SEDIMENT_BLEND);
+              colors[base3 + 1] = lerp(colors[base3 + 1], tG, SEDIMENT_BLEND);
+              colors[base3 + 2] = lerp(colors[base3 + 2], tB, SEDIMENT_BLEND);
+            }
+          }
+        }
       }
 
       vi++;
@@ -815,6 +1066,16 @@ export function computeChunkArrays(p: ChunkParams, seaLevel: number): ChunkMeshA
     // Copy climateMoist from border vertex
     if (hasClimate && climateMoist !== null) {
       climateMoist[vi] = climateMoist[borderVI];
+    }
+
+    // Copy subsurfaceWet from border vertex
+    if (hasSubsurface && subsurfaceWet !== null) {
+      subsurfaceWet[vi] = subsurfaceWet[borderVI];
+    }
+
+    // Copy rockHardness from border vertex
+    if (hasHardness && rockHardness !== null) {
+      rockHardness[vi] = rockHardness[borderVI];
     }
 
     vi++;
@@ -891,7 +1152,7 @@ export function computeChunkArrays(p: ChunkParams, seaLevel: number): ChunkMeshA
     emitSkirtQuad(border0, border1, skirt0, skirt1);
   }
 
-  return { positions, normals, colors, plateColors, climateMoist, indices, originX, originY, originZ };
+  return { positions, normals, colors, plateColors, climateMoist, subsurfaceWet, rockHardness, indices, originX, originY, originZ };
 }
 
 // ---------------------------------------------------------------------------
@@ -908,6 +1169,12 @@ export function arraysToGeometry(a: ChunkMeshArrays): ChunkMeshData {
   }
   if (a.climateMoist !== null) {
     geometry.setAttribute('climateMoist', new BufferAttribute(a.climateMoist, 1));
+  }
+  if (a.subsurfaceWet !== null) {
+    geometry.setAttribute('subsurfaceWet', new BufferAttribute(a.subsurfaceWet, 1));
+  }
+  if (a.rockHardness !== null) {
+    geometry.setAttribute('rockHardness', new BufferAttribute(a.rockHardness, 1));
   }
   geometry.setIndex(new BufferAttribute(a.indices, 1));
   geometry.computeBoundingSphere();

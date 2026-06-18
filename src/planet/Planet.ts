@@ -1,5 +1,6 @@
 import {
   BufferGeometry,
+  Color,
   Frustum,
   Group,
   Mesh,
@@ -36,14 +37,21 @@ import {
 import { Tectonics, TectonicQuery } from './tectonics'
 import { Climate, ClimateSample } from './climate'
 import { Erosion } from './erosion'
+import { Subsurface } from './subsurface'
 import { makeTerrainSampler } from './terrainSampler'
+import { makeCaveSampler, CaveField } from './caveField'
 import { texelToDir, texelIndex, neighborTexel } from './cubemap'
 import { InteriorParams, DerivedInterior, DEFAULT_INTERIOR, deriveInterior } from './interior'
 import { buildChunkGeometry, arraysToGeometry, ChunkMeshArrays, ChunkMeshData } from './ChunkMesher'
 import { MeshWorkerPool } from './MeshWorkerPool'
 import { QuadtreeNode } from './QuadtreeNode'
 import { TectonicsDebug } from './TectonicsDebug'
+import { WindDebug } from './WindDebug'
+import { WindFlow } from './WindFlow'
+import { VolumetricClouds } from './VolumetricClouds'
+import { Atmosphere } from './Atmosphere'
 import { PlanetGizmos } from './PlanetGizmos'
+import { RADIUS as WORLD_RADIUS, HEIGHT_SCALE_REF, deriveErosionRes } from './worldConstants'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -248,12 +256,18 @@ export class Planet extends Group {
   // B (iterated uplift+erode) parameters
   /** Number of B loop iterations (default 30). */
   private bSteps: number = 30
-  /** Uplift magnitude per B step in metres (default 40). */
-  private bUpliftRate: number = 40
-
+  /** Uplift magnitude per B step in metres.
+   * Authored at HEIGHT_SCALE_REF=1200 as 40 m/step; scales proportionally with heightScale
+   * so the normalized (/ B_HEIGHT_SCALE) uplift contribution is invariant under uniform scale.
+   * Initialized lazily in constructor once heightScale is known. */
+  private bUpliftRate: number
   private heightFn!: (dir: Vector3, level: number) => number
   /** Erosion instance — set by buildHeightFn, passed to sync-fallback meshing. */
   private _erosion: Erosion | null = null
+  private _subsurface: Subsurface | null = null
+
+  /** Cave field — rebuilt each buildHeightFn() call (main-thread only, not shipped to workers). */
+  private _caveField: CaveField | null = null
 
   /**
    * Waterline elevation — normalized units matching heightFn output (~[-1,1]).
@@ -349,6 +363,42 @@ export class Planet extends Group {
   private windViewActive = false
   private _windField: 'flow' | 'speed' | 'direction' = 'flow'
 
+  // Materials debug view (rock hardness scalar)
+  /** Hardness node material — built once in constructor, disposed in dispose(). */
+  private readonly hardnessMaterial: MeshBasicNodeMaterial
+  private materialsViewActive = false
+
+  // Wind bake parameters — stored on Planet so regenerate() can rebuild Climate with them.
+  // These affect only the baked wind field (not the sampler), so fromBaked stays unchanged.
+  private _windSwirlStrength  = 0.6   // blend weight of vortex swirls vs zonal base (default 0.6)
+  private _windNHigh          = 4     // HIGH-pressure centres per hemisphere (default 4)
+  private _windNLow           = 3     // LOW-pressure centres per hemisphere (default 3)
+  private _windCrossIsobarMax = 0.4   // max cross-isobar tilt angle in radians (default 0.4)
+  private _windSigmaBase      = 0.18  // base Gaussian half-width in radians for pressure centres (default 0.18)
+  private _windLatSpread      = 0.17  // ± latitude spread for pressure-centre placement (default 0.17)
+  private _windRetrogradeBake = 1     // +1 prograde / -1 retrograde for baked field (default +1)
+  private _windEquatorTaper   = 0.20  // equatorial taper half-width in radians (default 0.20)
+
+  /** WindDebug overlay — built after climateSim exists, always a child of this Group. */
+  private windDebug!: WindDebug
+
+  /** WindFlow overlay — advected particle streaklines, coexists with arrows. */
+  private windFlow!: WindFlow
+
+  /** VolumetricClouds overlay — raymarched cloud layer, independent toggle. */
+  cloudShell!: VolumetricClouds
+
+  /** Atmosphere shell — analytic single-scatter glow, always visible. */
+  atmosphereShell!: Atmosphere
+
+  /** Whether wind arrows are shown when in wind view. */
+  private _showWindArrows = true
+  /** Whether wind flow streaklines are shown when in wind view. */
+  private _showWindFlow = true
+
+  /** Arrow density for WindDebug — live settable. */
+  private _windArrowDensity = 1500
+
   // Wind material uniforms (all live-updatable via setters; _uPoleAxis is shared with climate)
   private readonly _uWindBands     = uniform(3)      // N band pairs, initialised from deriveBandCount()
   private readonly _uWindStrength  = uniform(1)      // global speed multiplier
@@ -422,9 +472,14 @@ export class Planet extends Group {
     this.manualSurfaceTemp = 15
     this.manualAtmosphere = 0.6
     // Erosion bake defaults.
-    this.erosionRes = 256
+    // deriveErosionRes(WORLD_RADIUS) = 256 — the proven ~1.5 s budget.
+    // main.ts ui.erosionRes is initialised to the same value so slider and bake agree.
+    this.erosionRes = deriveErosionRes(WORLD_RADIUS)
     this.erosionStrength = 1.0
     this.erosionDeposition = 1.0
+    // bUpliftRate: authored at HEIGHT_SCALE_REF as 40 m/step; scales with heightScale so
+    // the normalized (workH / B_HEIGHT_SCALE) uplift per step is invariant under uniform scale.
+    this.bUpliftRate = 40 * (this.heightScale / HEIGHT_SCALE_REF)
     // Safe fallbacks — caller updates these on the first update() call.
     this._vFovRadians = Math.PI / 3  // 60°
     this._screenHeightPx = 1080
@@ -472,6 +527,10 @@ export class Planet extends Group {
     // Both are updated after buildHeightFn initialises the climate sim (see below).
     this.windMaterial = this._buildWindMaterial()
 
+    // Hardness debug material: reads the baked per-vertex 'rockHardness' float attribute
+    // and maps it to a clear dark-to-bright ramp for the materials view.
+    this.hardnessMaterial = this._buildHardnessMaterial()
+
     // Pure unlit wireframe: white edges only, no fill, no lighting.
     // When wireframe mode is on, every chunk renders with this material regardless of view mode.
     this.wireMaterial = new MeshBasicMaterial({ color: 0xffffff, wireframe: true })
@@ -494,6 +553,10 @@ export class Planet extends Group {
     this._uWindBands.value    = this.deriveBandCount()
     this._uWindStrength.value = 1.0
     this.buildTectonicsDebug(opts.seed)
+    this.buildWindDebug(opts.seed)
+    this.buildWindFlow()
+    this.buildCloudShell()
+    this.buildAtmosphere()
 
     // Gizmos are seed-independent — built once, never rebuilt on regenerate().
     this.gizmos = new PlanetGizmos({ radius: this.radius })
@@ -534,6 +597,12 @@ export class Planet extends Group {
     this._invWorldMatrix.copy(this.matrixWorld).invert()
     // Extract inverse rotation quaternion for direction transforms (no translation needed).
     this.getWorldQuaternion(this._invWorldQuat).invert()
+
+    // Push fresh per-frame cloud uniforms: time (from the wind clock, set before update()),
+    // camera world position, and inverse world rotation so density is sampled in planet-local frame.
+    if (this.cloudShell.visible) {
+      this.cloudShell.update(this._uWindTime.value, cameraWorldPos, this._invWorldQuat)
+    }
 
     // Convert camera world position → planet-local position (zero alloc via scratch).
     this._camLocalScratch.copy(cameraWorldPos).applyMatrix4(this._invWorldMatrix)
@@ -588,13 +657,15 @@ export class Planet extends Group {
 
   setDebugColors(on: boolean): void {
     this.debugColorsActive = on
-    // Mutual exclusivity: turning on LOD colors turns off tectonics + heightmap views.
+    // Mutual exclusivity: turning on LOD colors turns off tectonics + heightmap + materials + wind views.
     if (on) {
       if (this.tectonicsViewActive) {
         this.tectonicsViewActive = false
         this.tectonicsDebug.visible = false
       }
+      this.windViewActive  = false
       this.heightmapViewActive = false
+      this.materialsViewActive = false
     }
     // Wireframe overrides view-mode material; only swap when wireframe is off.
     if (!this.wireframeActive) {
@@ -607,10 +678,12 @@ export class Planet extends Group {
   setTectonicsView(on: boolean): void {
     this.tectonicsViewActive = on
     this.tectonicsDebug.visible = on
-    // Mutual exclusivity: turning on tectonics turns off LOD debug colors + heightmap.
+    // Mutual exclusivity: turning on tectonics turns off LOD debug colors + heightmap + materials + wind.
     if (on) {
       this.debugColorsActive = false
       this.heightmapViewActive = false
+      this.materialsViewActive = false
+      this.windViewActive  = false
     }
     // Wireframe overrides view-mode material; only swap when wireframe is off.
     if (!this.wireframeActive) {
@@ -622,11 +695,13 @@ export class Planet extends Group {
 
   setHeightmapView(on: boolean): void {
     this.heightmapViewActive = on
-    // Mutual exclusivity: heightmap is its own view; turn off LOD colors + tectonics.
+    // Mutual exclusivity: heightmap is its own view; turn off LOD colors + tectonics + materials + wind.
     if (on) {
       this.debugColorsActive = false
       this.tectonicsViewActive = false
       this.tectonicsDebug.visible = false
+      this.materialsViewActive = false
+      this.windViewActive  = false
     }
     if (!this.wireframeActive) {
       for (const [, mesh] of this.visibleMeshes) {
@@ -650,6 +725,8 @@ export class Planet extends Group {
       this.tectonicsViewActive = false
       this.tectonicsDebug.visible = false
       this.heightmapViewActive = false
+      this.materialsViewActive = false
+      this.windViewActive  = false
     }
     if (!this.wireframeActive) {
       for (const [, mesh] of this.visibleMeshes) {
@@ -681,8 +758,28 @@ export class Planet extends Group {
   // ---------------------------------------------------------------------------
 
   /**
+   * Single source of truth for wind overlay visibility.
+   * Applies the per-overlay flags (_showWindArrows / _showWindFlow) so the caller
+   * never has to know about them. Call this instead of toggling windDebug/windFlow directly.
+   */
+  setWindOverlaysVisible(on: boolean): void {
+    this.windDebug.setVisible(on && this._showWindArrows)
+    this.windFlow.setVisible(on && this._showWindFlow)
+  }
+
+  /**
+   * Single source of truth for cloud-shell visibility.
+   * The shell should be shown in normal view and hidden in every debug view.
+   */
+  setCloudShellVisible(on: boolean): void {
+    this.cloudShell.setVisible(on)
+  }
+
+  /**
    * Enable or disable the wind debug view.
+   * Wind view shows the baked-field arrow overlay (WindDebug) over normal terrain.
    * Mutually exclusive with the other debug views (climate/tectonics/heightmap/lod).
+   * Wind overlay visibility is managed externally via setWindOverlaysVisible().
    */
   setWindView(on: boolean): void {
     this.windViewActive = on
@@ -692,7 +789,9 @@ export class Planet extends Group {
       this.tectonicsViewActive = false
       this.tectonicsDebug.visible = false
       this.heightmapViewActive = false
+      this.materialsViewActive = false
     }
+    // Terrain material reverts to normal when wind view is on (arrows/flow are the visualisation).
     if (!this.wireframeActive) {
       for (const [, mesh] of this.visibleMeshes) {
         mesh.material = this.materialFor(this.levelFromKey(mesh.userData.key as string))
@@ -714,6 +813,32 @@ export class Planet extends Group {
     if (this.windViewActive && !this.wireframeActive) {
       for (const [, mesh] of this.visibleMeshes) {
         mesh.material = this.windMaterial
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Materials debug view API (rock hardness)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Enable or disable the materials (rock hardness) debug view.
+   * Shows the baked per-vertex rockHardness scalar on a dark→bright ramp.
+   * Mutually exclusive with all other debug views.
+   */
+  setMaterialsView(on: boolean): void {
+    this.materialsViewActive = on
+    if (on) {
+      this.windViewActive      = false
+      this.climateViewActive   = false
+      this.debugColorsActive   = false
+      this.tectonicsViewActive = false
+      this.tectonicsDebug.visible = false
+      this.heightmapViewActive = false
+    }
+    if (!this.wireframeActive) {
+      for (const [, mesh] of this.visibleMeshes) {
+        mesh.material = this.materialFor(this.levelFromKey(mesh.userData.key as string))
       }
     }
   }
@@ -745,6 +870,211 @@ export class Planet extends Group {
   setWindTime(t: number): void {
     this._uWindTime.value = t
   }
+
+  // ---------------------------------------------------------------------------
+  // Wind bake param setters — each stores the value and triggers a full regenerate
+  // because these are baked into Climate's wind cubemap (not live uniforms).
+  // ---------------------------------------------------------------------------
+
+  /** Vortex swirl blend weight [0,1]. 0 = pure zonal belts, 1 = full vortex. Triggers rebake. */
+  setWindSwirl(n: number): void {
+    this._windSwirlStrength = Math.max(0, Math.min(2, n))
+    this.regenerate(this.seed)
+  }
+
+  /** HIGH-pressure centres per hemisphere [0,12]. Triggers rebake. */
+  setWindHighs(n: number): void {
+    this._windNHigh = Math.max(0, Math.min(12, Math.round(n)))
+    this.regenerate(this.seed)
+  }
+
+  /** LOW-pressure centres per hemisphere [0,12]. Triggers rebake. */
+  setWindLows(n: number): void {
+    this._windNLow = Math.max(0, Math.min(12, Math.round(n)))
+    this.regenerate(this.seed)
+  }
+
+  /** Max cross-isobar tilt angle in radians [0, π/2]. Triggers rebake. */
+  setWindCoriolis(n: number): void {
+    this._windCrossIsobarMax = Math.max(0, Math.min(Math.PI / 2, n))
+    this.regenerate(this.seed)
+  }
+
+  /** Base Gaussian half-width for pressure centres in radians [0.05, 1.0]. Triggers rebake. */
+  setWindVortexSize(n: number): void {
+    this._windSigmaBase = Math.max(0.05, Math.min(1.0, n))
+    this.regenerate(this.seed)
+  }
+
+  /** ± latitude spread for pressure-centre placement in radians [0, π/4]. Triggers rebake. */
+  setWindLatSpread(n: number): void {
+    this._windLatSpread = Math.max(0, Math.min(Math.PI / 4, n))
+    this.regenerate(this.seed)
+  }
+
+  /** Equatorial taper half-width in radians [0, 0.5]. Triggers rebake. */
+  setWindEquatorTaper(v: number): void {
+    this._windEquatorTaper = Math.max(0, Math.min(0.5, v))
+    this.regenerate(this.seed)
+  }
+
+  // ---------------------------------------------------------------------------
+  // Transient wind setters — LIVE, no rebake. Forward to climateSim.setWindTransient.
+  // ---------------------------------------------------------------------------
+
+  setWindDrift(v: number): void       { this.climateSim.setWindTransient({ driftSpeed: v }) }
+  setWindPulseRate(v: number): void   { this.climateSim.setWindTransient({ pulseRate: v }) }
+  setWindPulseDepth(v: number): void  { this.climateSim.setWindTransient({ pulseDepth: v }) }
+  setWindEddyStrength(v: number): void { this.climateSim.setWindTransient({ eddyStrength: v }) }
+  setWindEddyScale(v: number): void   { this.climateSim.setWindTransient({ eddyScale: v }) }
+  setWindEddyTimeScale(v: number): void { this.climateSim.setWindTransient({ eddyTimeScale: v }) }
+
+  /**
+   * Animate the wind overlays at time `t` with frame delta `dt`. Self-gated:
+   * each overlay returns immediately when not visible (zero cost off-screen).
+   * Call once per frame after planet.setWindTime(t).
+   */
+  animateWind(t: number, dt: number): void {
+    if (this.windDebug.visible)   this.windDebug.animate(t)
+    if (this.windFlow.visible)    this.windFlow.animate(t, dt)
+    // Cloud update (time + fresh _invWorldQuat + cameraWorldPos) is pushed in update(),
+    // which runs after animateWind so the rotation quaternion is from the current frame.
+  }
+
+  /** Retrograde bake flag. +1 = prograde (Earth-like), -1 = retrograde (Venus-like). Triggers rebake. */
+  setWindRetrogradeBake(r: number): void {
+    this._windRetrogradeBake = r >= 0 ? 1 : -1
+    this.regenerate(this.seed)
+  }
+
+  /**
+   * Set the wind arrow density (Fibonacci-sphere sample count). Live rebuild — rebuilds
+   * WindDebug immediately. No rebake of the baked field.
+   */
+  setWindArrowDensity(n: number): void {
+    this._windArrowDensity = Math.max(1, Math.round(n))
+    this.windDebug.setDensity(this._windArrowDensity)
+  }
+
+  /**
+   * Scale the rendered arrow length. 1.0 = default (radius * 0.045 per arrow).
+   * Live — scales the InstancedMesh objects directly without rebuilding. No rebake.
+   */
+  setWindArrowScale(s: number): void {
+    this.windDebug.setArrowScale(Math.max(0.01, s))
+  }
+
+  /**
+   * Show or hide the wind arrow overlay. Live — applies immediately when in wind view.
+   */
+  setWindArrowsVisible(b: boolean): void {
+    this._showWindArrows = b
+    if (this.windViewActive) this.windDebug.setVisible(b)
+  }
+
+  /**
+   * Show or hide the wind flow streaklines. Live — applies immediately when in wind view.
+   */
+  setWindFlowVisible(b: boolean): void {
+    this._showWindFlow = b
+    if (this.windViewActive) this.windFlow.setVisible(b)
+  }
+
+  /** Set wind flow particle count. Triggers rebuild. */
+  setWindFlowDensity(n: number): void {
+    this.windFlow.setDensity(n)
+  }
+
+  /** Set wind flow advection speed. Live. */
+  setWindFlowSpeed(v: number): void {
+    this.windFlow.setFlowSpeed(v)
+  }
+
+  /** Set wind flow trail length. Triggers rebuild. */
+  setWindFlowTrail(k: number): void {
+    this.windFlow.setTrailLength(k)
+  }
+
+  /** Set wind flow particle lifetime. Live. */
+  setWindFlowLifetime(s: number): void {
+    this.windFlow.setLifetime(s)
+  }
+
+  // ---------------------------------------------------------------------------
+  // Cloud shell public API
+  // ---------------------------------------------------------------------------
+
+  /** Live — mutates cloud coverage uniform, no rebuild. */
+  setCloudCoverage(v: number): void    { this.cloudShell.setCoverage(v) }
+  /** Live — mutates cloud scroll speed uniform, no rebuild. */
+  setCloudScrollSpeed(v: number): void { this.cloudShell.setScrollSpeed(v) }
+  /** Live — mutates cloud FBM frequency uniform, no rebuild. */
+  setCloudScale(v: number): void       { this.cloudShell.setCloudScale(v) }
+  /** Live — mutates cloud wind-warp strength uniform, no rebuild. */
+  setCloudWarp(v: number): void        { this.cloudShell.setWindWarp(v) }
+  /** Live — mutates cloud opacity uniform, no rebuild. */
+  setCloudOpacity(v: number): void     { this.cloudShell.setOpacity(v) }
+  /** Scale shell altitude. Scales the mesh to the new radius. */
+  setCloudAltitude(mul: number): void  { this.cloudShell.setAltitude(mul) }
+  /** Live — mutates cloud favorability weight uniform, no rebuild. */
+  setCloudFavWeight(v: number): void   { this.cloudShell.setFavWeight(v) }
+  /** Live — mutates cloud moisture weight uniform, no rebuild. */
+  setCloudMoistWeight(v: number): void { this.cloudShell.setMoistWeight(v) }
+  /** Live — mutates cloud convergence weight uniform, no rebuild. */
+  setCloudConvWeight(v: number): void  { this.cloudShell.setConvWeight(v) }
+  /** Live — mutates cloud convergence gain uniform, no rebuild. */
+  setCloudConvGain(v: number): void    { this.cloudShell.setConvGain(v) }
+  /** Live — mutates cloud ITCZ weight uniform, no rebuild. */
+  setCloudItczWeight(v: number): void  { this.cloudShell.setItczWeight(v) }
+  /** Live — mutates cloud billow uniform, no rebuild. */
+  setCloudBillow(v: number): void      { this.cloudShell.setBillow(v) }
+  /** Live — mutates cloud detail uniform, no rebuild. */
+  setCloudDetail(v: number): void      { this.cloudShell.setDetail(v) }
+  /** Live — mutates cloud softness uniform, no rebuild. */
+  setCloudSoftness(v: number): void    { this.cloudShell.setSoftness(v) }
+  /** Live — mutates cloud volume uniform, no rebuild. */
+  setCloudVolume(v: number): void      { this.cloudShell.setVolume(v) }
+  /** Live — sets cloud layer base altitude (in heightScale multiples). Rescales mesh. */
+  setCloudBase(v: number): void        { this.cloudShell.setCloudBase(v) }
+  /** Live — sets cloud layer thickness (in heightScale multiples). Rescales mesh. */
+  setCloudThick(v: number): void       { this.cloudShell.setCloudThick(v) }
+  /** Live — mutates cloud extinction density (_uSigmaT) uniform, no rebuild. */
+  setCloudDensity(v: number): void     { this.cloudShell.setDensity(v) }
+  /** Live — sets raymarching step count. Clamps to >=1. */
+  setCloudStepCount(v: number): void   { this.cloudShell.setStepCount(v) }
+  /** Live — sets light-march step count per cloud sample. Clamps to >=1. */
+  setCloudLightSteps(v: number): void  { this.cloudShell.setLightSteps(v) }
+  /** Live — mutates Henyey-Greenstein anisotropy uniform, no rebuild. */
+  setCloudHg(v: number): void          { this.cloudShell.setHgAnisotropy(v) }
+  /** Live — mutates powder-effect strength uniform, no rebuild. */
+  setCloudPowder(v: number): void      { this.cloudShell.setPowder(v) }
+  /** Live — mutates detail-erosion noise scale uniform, no rebuild. */
+  setCloudDetailScale(v: number): void { this.cloudShell.setDetailScale(v) }
+  /** Live — mutates round-base profile exponent uniform, no rebuild. */
+  setCloudRoundBase(v: number): void   { this.cloudShell.setRoundBase(v) }
+  /** Live — mutates billow-top profile exponent uniform, no rebuild. */
+  setCloudBillowTop(v: number): void   { this.cloudShell.setBillowTop(v) }
+  /** Live — mutates ambient sky-light contribution uniform, no rebuild. */
+  setCloudAmbient(v: number): void     { this.cloudShell.setAmbient(v) }
+
+  // ---------------------------------------------------------------------------
+  // Atmosphere public API
+  // ---------------------------------------------------------------------------
+
+  /** Live — mutates atmosphere density uniform, no rebuild. */
+  setAtmosphereDensity(v: number): void      { this.atmosphereShell.setDensity(v) }
+  /** Live — mutates atmosphere tint uniform, no rebuild. */
+  setAtmosphereTint(c: Color): void {
+    this.atmosphereShell.setTint(c)
+  }
+  /** Live — mutates atmosphere sun intensity uniform, no rebuild. */
+  setAtmosphereSunIntensity(v: number): void { this.atmosphereShell.setSunIntensity(v) }
+  /** Live — mutates atmosphere horizon pow exponent uniform, no rebuild. */
+  setAtmosphereScaleHeight(v: number): void  { this.atmosphereShell.setScaleHeight(v) }
+  /** Scale atmosphere shell radius. Scales mesh without rebuild. */
+  setAtmosphereHeight(mul: number): void     { this.atmosphereShell.setAtmHeight(mul) }
+  /** Show or hide the atmosphere shell. */
+  setAtmosphereVisible(v: boolean): void     { this.atmosphereShell.setVisible(v) }
 
   /**
    * Set the world-space sun direction (normalised). Live — no rebake.
@@ -859,9 +1189,15 @@ export class Planet extends Group {
    * Merge additional interior parameters into the active InteriorParams and regenerate.
    * Accepts the new 5-root params: mass, composition, age, insolation, waterBudget.
    * surfaceTemp is now a derived output — use setManualSurfaceTemp() to pin it directly.
+   *
+   * Guard: if the merged result is identical to the current interior (e.g. startup call
+   * with default values already set by the constructor), skip regenerate to avoid a
+   * redundant bake.
    */
   setInteriorParams(p: Partial<InteriorParams>): void {
-    this.interior = { ...this.interior, ...p }
+    const merged = { ...this.interior, ...p }
+    if (JSON.stringify(merged) === JSON.stringify(this.interior)) return
+    this.interior = merged
     this.regenerate(this.seed)
   }
 
@@ -953,21 +1289,28 @@ export class Planet extends Group {
 
   /**
    * Set the B uplift rate in metres per step.
-   * Clamped to [0, 500]. Takes effect on the next regenerate() call.
+   * Upper bound scales with heightScale: 500 m/step at HEIGHT_SCALE_REF=1200,
+   * proportionally larger at larger scales (5000 m/step at HEIGHT_SCALE=12000).
    */
   setBUpliftRate(n: number): void {
-    this.bUpliftRate = Math.max(0, Math.min(500, n))
+    const maxRate = 500 * (this.heightScale / HEIGHT_SCALE_REF)
+    this.bUpliftRate = Math.max(0, Math.min(maxRate, n))
     this.regenerate(this.seed)
   }
 
   /**
    * Set the axial tilt in degrees. Updates planet.rotation.z, refreshes the pole-axis
    * uniform, and regenerates so the climate rebuilds with the new axialTiltRad.
+   *
+   * Guard: if the value is already the same (e.g. startup call with default 23.4 already
+   * set by the constructor), skip regenerate to avoid a redundant bake.  rotation.z and
+   * the pole-axis uniform are still updated so the visual state stays correct.
    */
   setAxialTilt(deg: number): void {
-    this.axialTiltDeg = deg
     this.rotation.z = (deg * Math.PI) / 180
     this.refreshPoleAxis()
+    if (deg === this.axialTiltDeg) return
+    this.axialTiltDeg = deg
     this.regenerate(this.seed)
   }
 
@@ -1069,18 +1412,45 @@ export class Planet extends Group {
     this.splitPending.clear()
     this.mergePending.clear()
 
-    // Preserve tectonics debug visibility across regeneration.
-    const debugWasVisible = this.tectonicsDebug.visible
+    // Preserve debug overlay visibility across regeneration.
+    const debugWasVisible  = this.tectonicsDebug.visible
+    const cloudsWasVisible = this.cloudShell.visible
+    const atmWasVisible    = this.atmosphereShell.visible
+    // Wind overlays are restored from the active view flags after rebuild (see below).
 
     // Dispose existing TectonicsDebug (remove from this Group, free GPU resources).
     this.tectonicsDebug.dispose()
     this.remove(this.tectonicsDebug)
+
+    // Dispose existing WindDebug (removes its InstancedMeshes from scene + frees GPU resources).
+    this.windDebug.dispose()
+
+    // Dispose existing WindFlow (removes LineSegments from scene + frees GPU resources).
+    this.windFlow.dispose()
+
+    // Dispose existing VolumetricClouds (removes mesh from scene + frees GPU resources).
+    this.cloudShell.dispose()
+
+    // Dispose existing Atmosphere (removes mesh from scene + frees GPU resources).
+    this.atmosphereShell.dispose()
 
     // Rebuild
     ;(this as { seed: number }).seed = seed
     this.buildHeightFn(seed)
     this.buildTectonicsDebug(seed)
     this.tectonicsDebug.visible = debugWasVisible
+    this.buildWindDebug(seed)
+    this.buildWindFlow()
+    // Restore wind overlay visibility via the single source of truth.
+    // windViewActive is still set from before the regen.
+    this.setWindOverlaysVisible(this.windViewActive)
+    this.buildCloudShell()
+    // Restore cloud-shell visibility: shell was only on in normal view, so restoring the
+    // saved flag is safe. applyView in main.ts will re-assert the correct state next frame.
+    this.setCloudShellVisible(cloudsWasVisible)
+    this.buildAtmosphere()
+    // Restore atmosphere visibility (always-on, but respect any explicit toggle).
+    this.setAtmosphereVisible(atmWasVisible)
     // Refresh pole-axis uniform in case the world matrix changed since construction.
     this._updatePoleAxis()
 
@@ -1107,6 +1477,16 @@ export class Planet extends Group {
   /** Expose the Climate instance (rebuilt on regenerate). */
   get climate(): Climate {
     return this.climateSim
+  }
+
+  /** Expose the Subsurface instance (rebuilt on regenerate; null until first buildHeightFn). */
+  getSubsurface(): Subsurface | null {
+    return this._subsurface
+  }
+
+  /** Expose the CaveField (main-thread only; rebuilt on regenerate; null until first buildHeightFn). */
+  getCaveField(): CaveField | null {
+    return this._caveField
   }
 
   getStats(): Stats {
@@ -1156,9 +1536,14 @@ export class Planet extends Group {
     this.heightmapMaterial.dispose()
     this.climateMaterial.dispose()
     this.windMaterial.dispose()
+    this.hardnessMaterial.dispose()
     this.wireMaterial.dispose()
     this.pointsMaterial.dispose()
     this.tectonicsDebug.dispose()
+    this.windDebug.dispose()
+    this.windFlow.dispose()
+    this.cloudShell.dispose()
+    this.atmosphereShell.dispose()
     this.gizmos.dispose()
     this.climateSim.dispose()
     this.pool?.dispose()
@@ -1205,6 +1590,7 @@ export class Planet extends Group {
       hotspotCount: d.hotspotCount,
       hotspotIntensity: d.hotspotIntensity,
       driftScale: d.driftScale,
+      composition: this.interior.composition,
     })
 
     // Shared sampler options (without tectonics/climate/erosion — added per step below)
@@ -1220,6 +1606,15 @@ export class Planet extends Group {
       axialTiltRad: (this.axialTiltDeg * Math.PI) / 180,
       driftScale: d.driftScale,
       tectonics,
+      // Wind bake params — forwarded to Climate so the baked field reflects slider values.
+      swirlStrength:     this._windSwirlStrength,
+      nHigh:             this._windNHigh,
+      nLow:              this._windNLow,
+      crossIsobarMax:    this._windCrossIsobarMax,
+      sigmaBase:         this._windSigmaBase,
+      latSpread:         this._windLatSpread,
+      windRetrograde:    this._windRetrogradeBake,
+      equatorTaperWidth: this._windEquatorTaper,
     }
 
     // --- Step 1: build base-only sampler (seed for B; omits orogenic stamps) ---
@@ -1237,7 +1632,7 @@ export class Planet extends Group {
     const upliftForcing = new Float32Array(bN)
     {
       const _bDir     = new Vector3()
-      const _bScratch: TectonicQuery = { plateId:0, neighborId:0, boundaryDist:0, convergence:0, shear:0, crustDist:0, paleoDist:0, otherCrustDist:0, baseElevation:0 }
+      const _bScratch: TectonicQuery = { plateId:0, neighborId:0, boundaryDist:0, convergence:0, shear:0, crustDist:0, paleoDist:0, otherCrustDist:0, baseElevation:0, rockHardness:0 }
       for (let face = 0; face < 6; face++) {
         for (let y = 0; y < B_RES; y++) {
           for (let x = 0; x < B_RES; x++) {
@@ -1261,6 +1656,7 @@ export class Planet extends Group {
       seed,
       heightFn: baseSampler0.heightFn,
       climate,
+      tectonics,    // rock hardness modulates per-cell incision rate + talus angle
       oceanCoverage: d.oceanCoverage,
       res: this.erosionRes,
       K0:           EROSION_DEFAULT_K0 * this.erosionStrength,
@@ -1271,17 +1667,78 @@ export class Planet extends Group {
     })
     if (DEBUG_TIMING) console.log(`B bake ${(performance.now() - bakeT0).toFixed(1)}ms`)
 
+    // --- Step 3.5: bake Subsurface (geology layers) ----------------------------
+    // Baked after erosion (needs erosion.accAt/lakeMaskAt/deltaAt) and before the
+    // final sampler so we avoid a circular dependency on this.heightFn.
+    // heightFn: use the same base sampler that erosion used — pre-orogenic-stamp
+    // base elevations are sufficient for geology bake accuracy at SUB_BAKE_LEVEL=5.
+    // seaLevel (provisional): computed from baseSampler0.heightFn via the same
+    // Fibonacci hypsometry approach used post-sampler, but on the pre-erosion base.
+    // This is provisional — the final seaLevel (used for water rendering) is computed
+    // below on the eroded heightFn. The difference is small enough that geology
+    // layers (water table, hydrocarbon) need only approximate coastline placement.
+    let provisionalSeaLevel = 0
+    {
+      const N_HYPS     = 8192
+      const LOD_HYPS   = 5
+      const goldenAngle = Math.PI * (3 - Math.sqrt(5))
+      const hypsHeights = new Float32Array(N_HYPS)
+      const hypsDir    = new Vector3()
+      for (let i = 0; i < N_HYPS; i++) {
+        const y = 1 - (2 * i + 1) / N_HYPS
+        const r = Math.sqrt(Math.max(0, 1 - y * y))
+        const theta = goldenAngle * i
+        hypsDir.set(r * Math.cos(theta), y, r * Math.sin(theta))
+        hypsHeights[i] = baseSampler0.heightFn(hypsDir, LOD_HYPS)
+      }
+      hypsHeights.sort()
+      const idx = Math.min(N_HYPS - 1, Math.floor(d.oceanCoverage * N_HYPS))
+      provisionalSeaLevel = hypsHeights[idx]
+    }
+    const subsurfaceBakeT0 = performance.now()
+    const subsurface = new Subsurface({
+      seed,
+      heightFn: baseSampler0.heightFn,
+      climate,
+      erosion,
+      tectonics,
+      derived: d,
+      composition: this.interior.composition,
+      res: this.erosionRes,
+      seaLevel: provisionalSeaLevel,
+    })
+    if (DEBUG_TIMING) console.log(`Subsurface bake ${(performance.now() - subsurfaceBakeT0).toFixed(1)}ms`)
+
     // --- Step 4: rebuild final sampler WITH erosion AND bActive -----------------
     // bActive = true: orogenic stamps are gated off so bDelta owns the elevation budget.
-    const sampler = makeTerrainSampler({ ...samplerOpts, tectonics, climate, erosion, bActive: true })
+    const sampler = makeTerrainSampler({ ...samplerOpts, tectonics, climate, erosion, subsurface, bActive: true })
 
     this.tectonics    = sampler.tectonics
     this.climateSim   = sampler.climate
     this.heightFn     = sampler.heightFn
     this._plateColorFn = sampler.plateColorFn
     this._erosion     = sampler.erosion
+    this._subsurface  = sampler.subsurface
     this.climateFn    = (dir: Vector3, height: number): ClimateSample =>
       this.climateSim.sample(dir, height, this._climateScratch)
+
+    // --- Cave field (main-thread only; not shipped to workers) --------------------
+    // Built from the final eroded heightFn so cave mouths sit on the real terrain surface.
+    // The cave field is experimental and main-thread-only. A fault in it must NOT
+    // abort buildHeightFn — everything AFTER this (sea-level hypsometry, worker-pool
+    // init + ship, mesh building) would be skipped, leaving the planet with NO terrain
+    // meshes = a black screen. Isolate it: on error, disable caves and keep building.
+    try {
+      this._caveField = makeCaveSampler({
+        seed,
+        heightFn: sampler.heightFn,
+        radius: this.radius,
+        heightScale: this.heightScale,
+      })
+    } catch (err) {
+      console.error('[cave] makeCaveSampler failed in buildHeightFn — disabling caves; terrain unaffected:', err)
+      this._caveField = null
+    }
 
     // --- Hypsometry: compute seaLevel from oceanCoverage ----------------------
     // Runs on the ERODED heightFn so the waterline correctly reflects erosion.
@@ -1333,6 +1790,7 @@ export class Planet extends Group {
         tectonics: this.tectonics.toBaked(),
         climate: this.climateSim.toBaked(),
         erosion: erosion.toBaked(),
+        subsurface: subsurface.toBaked(),
         seaLevel: this._seaLevel,
         bActive: true,
       })
@@ -1364,6 +1822,64 @@ export class Planet extends Group {
     })
     this.tectonicsDebug.visible = false  // starts hidden
     this.add(this.tectonicsDebug)
+  }
+
+  /** Build (or rebuild) WindDebug and add it as a child. */
+  private buildWindDebug(_seed: number): void {
+    // climateSim must have been set by buildHeightFn before this is called.
+    const localScratch = new Vector3()
+    this.windDebug = new WindDebug(this, this.climateSim, {
+      radius: this.radius,
+      heightScale: this.heightScale,
+      // Level 6 matches TectonicsDebug — accurate enough for arrow lift positioning.
+      surfaceRadiusAt: (localDir: Vector3) => {
+        localScratch.copy(localDir).normalize()
+        return this.radius + this.heightFn(localScratch, 6) * this.heightScale
+      },
+      density: this._windArrowDensity,
+    })
+    this.windDebug.setVisible(false)  // starts hidden
+    // WindDebug adds its InstancedMeshes directly to the scene passed in constructor,
+    // which is `this` (the Planet Group). No explicit this.add() needed — WindDebug
+    // calls scene.add(instancedArrows) on every mesh it creates.
+  }
+
+  /** Build (or rebuild) WindFlow and add its LineSegments as a child. */
+  private buildWindFlow(): void {
+    // climateSim must have been set by buildHeightFn before this is called.
+    this.windFlow = new WindFlow(this, this.climateSim, {
+      radius:      this.radius,
+      heightScale: this.heightScale,
+      density:     2000,
+    })
+    this.windFlow.setVisible(false)  // starts hidden
+    // WindFlow adds its LineSegments directly to the scene passed in constructor,
+    // which is `this` (the Planet Group). No explicit this.add() needed.
+  }
+
+  /** Build (or rebuild) VolumetricClouds and add its sphere mesh as a child. */
+  private buildCloudShell(): void {
+    // climateSim must have been set by buildHeightFn before this is called.
+    this.cloudShell = new VolumetricClouds(this, this.climateSim, {
+      radius:      this.radius,
+      heightScale: this.heightScale,
+      sunDir:      this._uSunDir,   // passed BY REFERENCE — live sun GUI updates propagate
+    })
+    this.cloudShell.setVisible(false)  // starts hidden
+    // VolumetricClouds adds its Mesh directly to the scene passed in constructor,
+    // which is `this` (the Planet Group). No explicit this.add() needed.
+  }
+
+  /** Build (or rebuild) Atmosphere and add its sphere mesh as a child. */
+  private buildAtmosphere(): void {
+    this.atmosphereShell = new Atmosphere(this, {
+      radius:      this.radius,
+      heightScale: this.heightScale,
+      sunDir:      this._uSunDir,   // passed BY REFERENCE — live sun GUI updates propagate
+    })
+    this.atmosphereShell.setVisible(true)  // default ON — atmosphere is always-on appearance
+    // Atmosphere adds its Mesh directly to the scene passed in constructor,
+    // which is `this` (the Planet Group). No explicit this.add() needed.
   }
 
   private buildRoots(): void {
@@ -1753,6 +2269,8 @@ export class Planet extends Group {
           plateColorFn: this._plateColorFn,
           climateFn: this.climateFn,
           erosion: this._erosion,
+          subsurface: this._subsurface,
+          hardnessFn: (dir) => this.tectonics.hardnessAt(dir),
         }, this._seaLevel)
 
         this.geoCache.set(item.key, new CachedMeshData(data))
@@ -2148,16 +2666,63 @@ export class Planet extends Group {
   }
 
   // ---------------------------------------------------------------------------
+  // Internal: hardness material
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Build the single hardness MeshBasicNodeMaterial for the materials view.
+   *
+   * Reads the baked per-vertex 'rockHardness' float attribute (0 = soft sediment,
+   * 1 = hard igneous/volcanic) and maps it to a vivid turbo-style ramp for
+   * maximum perceptual discrimination:
+   *   0.00 → deep indigo  #2b00d4
+   *   0.25 → cyan         #00e5ff
+   *   0.50 → lime green   #39ff14
+   *   0.75 → orange       #ff7700
+   *   1.00 → crimson red  #dd0000
+   *
+   * Four segments, each covering 0.25 of the [0,1] range.  saturate() clamps
+   * the attribute so skirt-copied border vertices don't escape the ramp.
+   */
+  private _buildHardnessMaterial(): MeshBasicNodeMaterial {
+    const h = attribute('rockHardness', 'float')
+
+    // Five stops — vivid, high-contrast, spans luminance AND hue
+    const c0 = vec3(0x2b / 255, 0x00 / 255, 0xd4 / 255) // deep indigo  #2b00d4
+    const c1 = vec3(0x00 / 255, 0xe5 / 255, 0xff / 255) // cyan         #00e5ff
+    const c2 = vec3(0x39 / 255, 0xff / 255, 0x14 / 255) // lime green   #39ff14
+    const c3 = vec3(0xff / 255, 0x77 / 255, 0x00 / 255) // orange       #ff7700
+    const c4 = vec3(0xdd / 255, 0x00 / 255, 0x00 / 255) // crimson red  #dd0000
+
+    // Per-segment parameter: each t_n runs 0→1 over its quarter of [0,1]
+    const hClamped = saturate(h)
+    const t0 = saturate(hClamped.mul(4))                   // 0..1 over [0.00, 0.25]
+    const t1 = saturate(hClamped.sub(0.25).mul(4))         // 0..1 over [0.25, 0.50]
+    const t2 = saturate(hClamped.sub(0.50).mul(4))         // 0..1 over [0.50, 0.75]
+    const t3 = saturate(hClamped.sub(0.75).mul(4))         // 0..1 over [0.75, 1.00]
+
+    // Chain four mix() calls — each overwrites the previous blend once its
+    // segment starts, keeping the mapping continuous end-to-end.
+    const colorNode = mix(mix(mix(mix(c0, c1, t0), c2, t1), c3, t2), c4, t3)
+
+    const mat = new MeshBasicNodeMaterial()
+    mat.colorNode = colorNode
+    mat.vertexColors = false
+    return mat
+  }
+
+  // ---------------------------------------------------------------------------
   // Internal: helpers
   // ---------------------------------------------------------------------------
 
   /**
    * Returns the shared material for a chunk at this level.
-   * View mode priority: wind → climate → heightmap → tectonics → lodColors → normal.
+   * View mode priority: materials → climate → heightmap → tectonics → lodColors → normal.
+   * Wind view uses the windDebug arrow overlay over normal terrain — no special mesh material.
    */
   private materialFor(level: number): MeshStandardMaterial | MeshBasicMaterial | MeshBasicNodeMaterial {
-    if (this.windViewActive) {
-      return this.windMaterial
+    if (this.materialsViewActive) {
+      return this.hardnessMaterial
     }
     if (this.climateViewActive) {
       return this.climateMaterial

@@ -24,6 +24,16 @@
  *
  * Determinism: any stochastic offsets derive from `seed` via deriveSeed (a local
  * splitmix32 stream, stream id documented at the call site). No Math.random.
+ *
+ * Stream ids reserved:
+ *   200 — moisture-field jitter (analytic band model currently; reserved for future use)
+ *   201 — wind-field low-amplitude swirl jitter (bakeWind — see equator taper note below)
+ *   202 — transient curl-noise eddy (visualization-only, windAtTime)
+ *
+ * bakeWind equator taper: an eqMask = smoothstep(0, sin(equatorTaperWidth), |dir.y|)
+ * is applied to the vortex swirl contribution only. This damps pressure vortices at
+ * the equator (where physical Coriolis → 0) without touching the zonal base or
+ * Coriolis tilt (which are already physically correct near the equator).
  */
 
 import { Vector3 } from 'three'
@@ -34,6 +44,7 @@ import {
   neighborTexel,
   sampleSmooth,
 } from './cubemap'
+import { createNoise3D } from './noise'
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -56,6 +67,48 @@ export interface ClimateParams {
   greenhouse?: number
   /** Lapse rate: °C lost over the full normalized terrain height (replaces LAPSE_PER_HEIGHT). Default 50. */
   lapseRate?: number
+
+  // ---- Wind bake parameters (affect only bakeWind; fromBaked stays unchanged) ----
+
+  /**
+   * Blend weight of vortex swirls vs the base zonal flow. 0 = pure zonal belts,
+   * 1 = full vortex contribution. Earth default ≈ 0.6.
+   */
+  swirlStrength?: number
+  /** Number of HIGH-pressure centres per hemisphere. Earth default 4. */
+  nHigh?: number
+  /** Number of LOW-pressure centres per hemisphere. Earth default 3. */
+  nLow?: number
+  /**
+   * Maximum cross-isobar tilt angle (radians). Wind deflects rightward (N) /
+   * leftward (S) from the pressure-gradient direction by up to this much at the
+   * equator, fading to 0 at the poles. Earth default ≈ 0.4 rad.
+   */
+  crossIsobarMax?: number
+  /**
+   * Base half-width (radians) of each pressure-system Gaussian. Scaled by
+   * sqrt(3/bandCount) so swirls stay visible regardless of band density.
+   * Default ≈ 0.18 rad — makes vortices clearly visible on a 500 km planet.
+   */
+  sigmaBase?: number
+  /**
+   * ± spread (radians) of pressure-centre latitudes around their target belt.
+   * Default ≈ 0.17 rad.
+   */
+  latSpread?: number
+  /**
+   * Sign of the zonal base flow at the equator (+1 = prograde/eastward equatorial
+   * trade winds — Earth-like; -1 = retrograde). Default +1.
+   * Note: the sign convention in U_zonal uses -cos(…) so retrograde=+1 gives
+   * westward trades (easterly) at the equator, matching Earth.
+   */
+  retrograde?: number
+  /**
+   * Half-width (radians) of the equatorial taper applied to the vortex swirl only.
+   * Below this latitude the swirl is damped to zero (physical: Coriolis→0 at equator).
+   * Default 0.20 rad. Range [0, 0.5].
+   */
+  equatorTaperWidth?: number
 }
 
 export interface ClimateSample {
@@ -63,6 +116,57 @@ export interface ClimateSample {
   temperature: number
   /** 0..1. */
   moisture: number
+}
+
+/**
+ * Baked wind sample at a surface point. The vector (x/y/z) is a unit tangent-plane
+ * wind direction in planet-local space (magnitude ≈ 1 when speed > 0, zero vector at
+ * poles where zonal wind collapses). Speed is a non-negative dimensionless measure
+ * with 1.0 ≈ peak trade-wind magnitude; it couples to band shear and ΔT strength.
+ */
+export interface WindSample {
+  /** Planet-local wind direction (unit tangent-plane vector). */
+  x: number
+  y: number
+  z: number
+  /** Dimensionless wind speed ≥ 0 (1 = strongest band-boundary shear). */
+  speed: number
+}
+
+/**
+ * Parameters for the transient (visualization-only) wind animation layer.
+ * All fields are live-updatable via setWindTransient() — no rebake needed.
+ */
+export interface WindTransientParams {
+  /** Angular drift speed of vortex centres along their zonal belt (rad/s). Default 0.015. */
+  driftSpeed: number
+  /** Oscillation rate of vortex amplitude (rad/s). Default 0.25. */
+  pulseRate: number
+  /** Fractional depth of vortex amplitude pulsing [0,1]. Default 0.35. */
+  pulseDepth: number
+  /** Blend weight of curl-noise eddies onto the wind velocity. Default 0.35. */
+  eddyStrength: number
+  /** Spatial frequency scale for curl-noise eddies. Default 6. */
+  eddyScale: number
+  /** Temporal frequency scale for curl-noise eddies. Default 0.3. */
+  eddyTimeScale: number
+}
+
+/** Internal representation of one pressure vortex for both bake and windAtTime. */
+interface Vortex {
+  px: number; py: number; pz: number
+  sigma: number
+  A: number
+  /** Longitude of the vortex centre at t=0 (radians). */
+  baseLon: number
+  /** Latitude of the vortex centre (radians, signed). */
+  latC: number
+  /** cos(latC) — precomputed for drifting centre rebuilds. */
+  cosLatC: number
+  /** sin(latC) — precomputed for drifting centre rebuilds. */
+  sinLatC: number
+  /** Per-vortex phase offset = i * 2.39996 (golden angle) — deterministic, no RNG draw. */
+  phase: number
 }
 
 /**
@@ -77,6 +181,15 @@ export interface ClimateBaked {
   moistRes: number
   /** Baked cube-map moisture field, length 6·moistRes². */
   moistureField: Float32Array
+  /**
+   * Baked wind direction (X/Y/Z) + speed cube-map fields, each length 6·moistRes².
+   * windX/Y/Z form a unit tangent-plane vector (zero at poles); windSpeed ∈ [0,1].
+   * Stream id 201 was consumed during the bake for low-amplitude swirl jitter.
+   */
+  windX: Float32Array
+  windY: Float32Array
+  windZ: Float32Array
+  windSpeed: Float32Array
   /** Scalar params needed to recompute the sampler-side derived values. */
   baseTemp: number
   atmosphere: number
@@ -193,6 +306,17 @@ export class Climate {
   private readonly greenhouse: number
   private readonly lapseRate: number
 
+  // Wind bake parameters — affect only bakeWind(); not serialised into ClimateBaked
+  // (the baked arrays already encode their effect, so fromBaked stays unchanged).
+  private readonly swirlStrength: number
+  private readonly nHigh: number
+  private readonly nLow: number
+  private readonly crossIsobarMax: number
+  private readonly sigmaBase: number
+  private readonly latSpread: number
+  private readonly retrograde: number
+  private readonly equatorTaperWidth: number
+
   /** Precomputed tilt-inversion blend (0 = normal gradient, 1 = fully pole-favouring). */
   private readonly invertBlend: number
   /** Precomputed equator→pole temperature gradient after the atmosphere shrink. */
@@ -204,11 +328,45 @@ export class Climate {
   /** Precomputed band-contrast exponent — thin atmosphere → sharper/deeper dry bands. */
   private readonly bandContrast: number
 
+  // Transient visualization state — main-thread only, NOT serialized to ClimateBaked.
+  // Workers never call windAtTime; fromBaked does not need these fields.
+  /** Vortex table persisted from bakeWind for use in windAtTime. */
+  private _vortices: Vortex[] = []
+  /** Curl-noise function for windAtTime eddies (stream 202). */
+  private _eddyNoise!: (x: number, y: number, z: number) => number
+  /** Live transient knobs — merge-updated via setWindTransient(). */
+  private _windTransient: WindTransientParams = {
+    driftSpeed:    0.015,
+    pulseRate:     0.25,
+    pulseDepth:    0.35,
+    eddyStrength:  0.35,
+    eddyScale:     6,
+    eddyTimeScale: 0.3,
+  }
+
+  // Scratch fields for windAtTime — zero-alloc in the hot path.
+  private readonly _wtBaseScratch: WindSample = { x: 0, y: 0, z: 0, speed: 0 }
+  private readonly _wtEastScratch  = new Vector3()
+  private readonly _wtNorthScratch = new Vector3()
+  private readonly _wtDirScratch   = new Vector3()
+
   /** Baked moisture field — Float32Array, length 6·MOIST_RES². sampleSmooth(this). */
   private readonly moistureField: Float32Array
 
+  /**
+   * Baked wind fields — each Float32Array length 6·MOIST_RES².
+   * windX/Y/Z: planet-local tangent-plane direction (unit vector, zero at poles).
+   * windSpeed: dimensionless speed ∈ [0,1] (1 = peak trade-wind band-boundary shear).
+   * Stream id 201 consumed for swirl jitter during bake.
+   */
+  private readonly windX: Float32Array
+  private readonly windY: Float32Array
+  private readonly windZ: Float32Array
+  private readonly windSpeed: Float32Array
+
   // Zero-alloc scratch for sample() and the bake.
   private readonly _scratch = new Vector3()
+  private readonly _windScratch = new Vector3()
   private readonly _eastScratch = new Vector3()
   private readonly _marchScratch = new Vector3()
   private readonly _texelDir = new Vector3()
@@ -223,6 +381,17 @@ export class Climate {
     this.redistribution = clamp01(opts.redistribution ?? 1)
     this.greenhouse = opts.greenhouse ?? 0
     this.lapseRate = opts.lapseRate ?? LAPSE_PER_HEIGHT
+    this.swirlStrength = opts.swirlStrength ?? 0.6
+    this.nHigh = opts.nHigh ?? 4
+    this.nLow = opts.nLow ?? 3
+    this.crossIsobarMax = opts.crossIsobarMax ?? 0.4
+    this.sigmaBase = opts.sigmaBase ?? 0.18
+    this.latSpread = opts.latSpread ?? 0.17
+    this.retrograde = opts.retrograde ?? 1
+    this.equatorTaperWidth = opts.equatorTaperWidth ?? 0.20
+
+    // Stream 202: curl-noise eddy for windAtTime (visualization-only).
+    this._eddyNoise = createNoise3D(deriveSeed(this.seed, 202))
 
     // Tilt inversion: above ≈54° poles receive more annual insolation than the
     // equator, flipping the gradient. Blend in smoothly to 75°.
@@ -248,6 +417,12 @@ export class Climate {
     this.bandContrast = 1.30 - 0.55 * this.atmosphere
 
     this.moistureField = this.bakeMoisture(opts.heightFn, opts.crustDistAt)
+
+    const wind = this.bakeWind()
+    this.windX = wind.windX
+    this.windY = wind.windY
+    this.windZ = wind.windZ
+    this.windSpeed = wind.windSpeed
   }
 
   // -------------------------------------------------------------------------
@@ -452,6 +627,266 @@ export class Climate {
   }
 
   // -------------------------------------------------------------------------
+  // Wind bake
+  // -------------------------------------------------------------------------
+
+  /**
+   * Bake tangent-plane wind direction (windX/Y/Z unit vectors) and dimensionless
+   * wind speed into cubemap Float32Arrays at MOIST_RES.
+   *
+   * Model (3-cell general circulation + divergence-free vortex swirls):
+   *
+   *   1. TANGENT BASIS per texel: east = polarAxis × dir (normalised); north = dir × east;
+   *      polarFade = |east before normalise| (→0 at poles); lat = asin(dir.y); absLat = |lat|.
+   *      Guard: if eLen < 1e-5 → zero vector, speed 0.
+   *
+   *   2. ZONAL BASE: U_zonal = retrograde * (-cos(2·bandCount·absLat)); windZonal = U_zonal * east.
+   *      Sign verification: equator absLat=0 → -cos(0)=-1 → retrograde(+1) gives -east
+   *      (westward trades); first reversal at absLat = π/(2·bandCount) → eastward westerlies;
+   *      second at absLat = π/bandCount → westward polar easterlies. ✓ Earth 3-cell model.
+   *
+   *   3. SWIRL VORTICES: generate from deriveSeed(seed,201), fixed iteration order
+   *      hemisphere(outer) → family(HIGH then LOW) → index(inner) so adding more vortices
+   *      never permutes earlier draws. HIGHs target latHigh = π/(4·bandCount);
+   *      LOWs target latLow = 3π/(8·bandCount). Per slot draw u0..u3 from splitmix32:
+   *        centerLat = targetLat * hemiSign + (u0-0.5)*2*latSpread
+   *        centerLon = u1 * 2π
+   *        p_k = unit vector at (centerLat, centerLon) about polarAxis
+   *        sigma_k = sigmaBase * (0.8 + 0.4·u2) * sqrt(3/bandCount)
+   *        A_k = (LOW?+1:-1) * (0.7 + 0.6·u3) * sign(centerLat)
+   *      Velocity from streamfunction (curl of Gaussian → divergence-free):
+   *        d = acos(clamp(dir·p_k,-1,1)); G = exp(-d²/(2σ²))
+   *        t = dir - (dir·p_k)*p_k; if |t|>eps: dHat=normalize(t)
+   *        grad_k = -(d/σ²) * G * A_k * dHat
+   *        vel_k = dir × grad_k; windVortex += vel_k
+   *
+   *   4. EQUATOR TAPER: eqMask = smoothstep(0, sin(equatorTaperWidth), |dir.y|).
+   *      Applied ONLY to the swirl contribution (vortices physically can't exist at the
+   *      equator where Coriolis→0). Zonal base and Coriolis tilt are unchanged.
+   *
+   *   5. COMBINE: windVec = windZonal + swirlStrength * eqMask * windVortex.
+   *
+   *   6. CORIOLIS cross-isobar tilt: ξ = crossIsobarMax * (1-|sin(lat)|) * sign(lat);
+   *      rotate windVec about dir by ξ via Rodrigues. (Max at equator, 0 at poles;
+   *      rightward N, leftward S — Ekman-layer cross-isobar flow.)
+   *
+   *   7. NORMALISE & SPEED: windX/Y/Z = w'/|w'|;
+   *      speedZonal = |sin(2·bandCount·lat)| * SHEAR_AMP * polarFade;
+   *      speed = clamp01(speedZonal + swirlStrength * eqMask * |windVortex|).
+   *
+   *   8. BLUR: same cross-face box blur as moisture.
+   *
+   * Determinism: fixed-order vortex generation from deriveSeed(seed,201); equator taper
+   * is a pure function of dir.y — no RNG, no reordering. fromBaked unchanged.
+   * Stream id 201 consumed here (200 = moisture; 202 = transient eddy visualization).
+   */
+  private bakeWind(): Pick<ClimateBaked, 'windX' | 'windY' | 'windZ' | 'windSpeed'> {
+    const res = MOIST_RES
+    const n = 6 * res * res
+    const rawX = new Float32Array(n)
+    const rawY = new Float32Array(n)
+    const rawZ = new Float32Array(n)
+    const rawS = new Float32Array(n)
+
+    const dir = this._texelDir
+    const east = this._eastScratch
+    const polar = this._polarAxis
+
+    const { bandCount, swirlStrength, nHigh, nLow,
+            crossIsobarMax, sigmaBase, latSpread, retrograde } = this
+
+    // Band-boundary shear amplitude couples to ΔT (thin atm → stronger jets).
+    const gradNorm = this.gradient / EQUATOR_POLE_DELTA  // 0.3 … 1.0
+    const SHEAR_AMP = 0.5 + 0.5 * gradNorm              // 0.65 … 1.0
+
+    // -----------------------------------------------------------------------
+    // Build vortex table ONCE (fixed order: hemisphere → family → index).
+    // Iterating hemisphere outer and family/index inner means adding vortices
+    // (larger nHigh/nLow) always appends draws — never reorders earlier ones.
+    // -----------------------------------------------------------------------
+
+    // Pre-derive the stream-201 seed then walk a splitmix32 sequence.
+    let rngState = deriveSeed(this.seed, 201)
+    function nextU01(): number {
+      rngState = splitmix32Step(rngState)
+      return rngState / 0x100000000  // [0, 1)
+    }
+
+    // Target latitudes for HIGH and LOW centres (radians, magnitude only).
+    // HIGH: first descending branch of the zonal cosine → ≈15–30° latitude.
+    // LOW: trough between HIGH and the next ascending branch → ≈30–60° latitude.
+    const latHigh = Math.PI / (4 * bandCount)          // ≈ π/(4·3) ≈ 15° for bc=3
+    const latLow  = (3 * Math.PI) / (8 * bandCount)   // ≈ 3π/(8·3) ≈ 22.5° for bc=3
+
+    // Each vortex: centre unit vector + spread + amplitude + transient fields.
+    const vortices: Vortex[] = []
+
+    const sigmaScale = sigmaBase * Math.sqrt(3 / bandCount)
+
+    let vortexIdx = 0  // global index for golden-angle phase
+    for (const hemiSign of [-1, 1]) {
+      // HIGH family first, LOW second — fixed order within each hemisphere.
+      for (const family of ['HIGH', 'LOW'] as const) {
+        const count   = family === 'HIGH' ? nHigh : nLow
+        const latTgt  = family === 'HIGH' ? latHigh : latLow
+        const aSign   = family === 'LOW' ? 1 : -1   // LOW=+1 (CCW N), HIGH=-1 (CW N)
+
+        for (let i = 0; i < count; i++) {
+          const u0 = nextU01()
+          const u1 = nextU01()
+          const u2 = nextU01()
+          const u3 = nextU01()
+
+          const centerLat = latTgt * hemiSign + (u0 - 0.5) * 2 * latSpread
+          const centerLon = u1 * 2 * Math.PI
+          const cosLat = Math.cos(centerLat)
+          const sinLat = Math.sin(centerLat)
+          const cosLon = Math.cos(centerLon)
+          const sinLon = Math.sin(centerLon)
+          // Unit vector about polar axis Y; lon=0 faces +Z.
+          //   x = cos(lat)*sin(lon), y = sin(lat), z = cos(lat)*cos(lon)
+          const px = cosLat * sinLon
+          const py = sinLat
+          const pz = cosLat * cosLon
+
+          const sigma = sigmaScale * (0.8 + 0.4 * u2)
+          // Amplitude sign: aSign * (0.7 + 0.6·u3) * sign(centerLat)
+          const latSign = centerLat >= 0 ? 1 : -1
+          const A = aSign * (0.7 + 0.6 * u3) * latSign
+
+          // Phase uses golden angle (no new nextU01() draw — preserves stream-201 count).
+          const phase = vortexIdx * 2.39996
+
+          vortices.push({
+            px, py, pz, sigma, A,
+            baseLon: centerLon,
+            latC: centerLat,
+            cosLatC: cosLat,
+            sinLatC: sinLat,
+            phase,
+          })
+          vortexIdx++
+        }
+      }
+    }
+
+    // Persist vortex table for windAtTime (visualization layer).
+    this._vortices = vortices
+
+    // Equator taper: precompute sin(equatorTaperWidth) once.
+    const eqSinTaper = Math.max(1e-3, Math.sin(this.equatorTaperWidth))
+
+    // -----------------------------------------------------------------------
+    // Per-texel evaluation.
+    // -----------------------------------------------------------------------
+    for (let face = 0; face < 6; face++) {
+      for (let y = 0; y < res; y++) {
+        for (let x = 0; x < res; x++) {
+          texelToDir(face, x, y, res, dir)
+
+          // 1. Tangent basis.
+          east.copy(polar).cross(dir)
+          const eLen = east.length()
+          const idx = texelIndex(face, x, y, res)
+
+          if (eLen < 1e-5) {
+            rawX[idx] = 0; rawY[idx] = 0; rawZ[idx] = 0; rawS[idx] = 0
+            continue
+          }
+          east.multiplyScalar(1 / eLen)
+
+          const lat = Math.asin(dir.y < -1 ? -1 : dir.y > 1 ? 1 : dir.y)
+          const absLat = Math.abs(lat)
+          const polarFade = eLen   // ≈1 at equator, →0 at poles
+
+          // 2. Zonal base: U = retrograde * (-cos(2·bandCount·absLat))
+          //    equator(absLat=0) → -1 → westward trades (correct for +retrograde)
+          //    first reversal at absLat=π/(2·bandCount) → eastward westerlies ✓
+          const U_zonal = retrograde * (-Math.cos(2 * bandCount * absLat))
+          const zonX = U_zonal * east.x
+          const zonY = U_zonal * east.y
+          const zonZ = U_zonal * east.z
+
+          // 3. Swirl vortices (curl of Gaussian streamfunction — divergence-free).
+          let vortX = 0, vortY = 0, vortZ = 0
+
+          for (const v of vortices) {
+            const dot = dir.x * v.px + dir.y * v.py + dir.z * v.pz
+            const dotC = dot < -1 ? -1 : dot > 1 ? 1 : dot
+            const d = Math.acos(dotC)
+            const sig2 = v.sigma * v.sigma
+            const G = Math.exp(-(d * d) / (2 * sig2))
+
+            // Tangent toward dir from centre: t = dir - dot * p_k
+            const tx = dir.x - dotC * v.px
+            const ty = dir.y - dotC * v.py
+            const tz = dir.z - dotC * v.pz
+            const tLen = Math.sqrt(tx * tx + ty * ty + tz * tz)
+            if (tLen < 1e-9) continue
+
+            const dHx = tx / tLen
+            const dHy = ty / tLen
+            const dHz = tz / tLen
+
+            // Gradient of Gaussian streamfunction (in the direction toward centre).
+            const gScale = -(d / sig2) * G * v.A
+            const gx = gScale * dHx
+            const gy = gScale * dHy
+            const gz = gScale * dHz
+
+            // vel = dir × grad (curl → tangent-plane, divergence-free).
+            vortX += dir.y * gz - dir.z * gy
+            vortY += dir.z * gx - dir.x * gz
+            vortZ += dir.x * gy - dir.y * gx
+          }
+
+          // 4. Equator taper — damp vortex swirl near equator (Coriolis→0 there).
+          const eqMask = smoothstep(0, eqSinTaper, Math.abs(dir.y))
+
+          // 5. Combine.
+          let wx = zonX + swirlStrength * eqMask * vortX
+          let wy = zonY + swirlStrength * eqMask * vortY
+          let wz = zonZ + swirlStrength * eqMask * vortZ
+
+          // 6. Coriolis cross-isobar tilt: rotate about dir by ξ (Rodrigues).
+          const latSign = lat >= 0 ? 1 : -1
+          const xi = crossIsobarMax * (1 - Math.abs(Math.sin(lat))) * latSign
+          const cosXi = Math.cos(xi)
+          const sinXi = Math.sin(xi)
+          const dDotW = dir.x * wx + dir.y * wy + dir.z * wz
+          // k × w (k = dir)
+          const crossX = dir.y * wz - dir.z * wy
+          const crossY = dir.z * wx - dir.x * wz
+          const crossZ = dir.x * wy - dir.y * wx
+          wx = wx * cosXi + crossX * sinXi + dir.x * dDotW * (1 - cosXi)
+          wy = wy * cosXi + crossY * sinXi + dir.y * dDotW * (1 - cosXi)
+          wz = wz * cosXi + crossZ * sinXi + dir.z * dDotW * (1 - cosXi)
+
+          // 7. Normalise direction.
+          const wLen = Math.sqrt(wx * wx + wy * wy + wz * wz)
+          const inv = wLen > 1e-9 ? 1 / wLen : 0
+          rawX[idx] = wx * inv
+          rawY[idx] = wy * inv
+          rawZ[idx] = wz * inv
+
+          // Speed: shear from band boundaries + vortex contribution (tapered at equator).
+          const speedZonal = Math.abs(Math.sin(2 * bandCount * lat)) * SHEAR_AMP * polarFade
+          const vortMag = Math.sqrt(vortX * vortX + vortY * vortY + vortZ * vortZ)
+          rawS[idx] = clamp01(speedZonal + swirlStrength * eqMask * vortMag)
+        }
+      }
+    }
+
+    // 8. Box-blur each component for seam-smooth sampling (same pass as moisture).
+    return {
+      windX: this.blurField(rawX, res),
+      windY: this.blurField(rawY, res),
+      windZ: this.blurField(rawZ, res),
+      windSpeed: this.blurField(rawS, res),
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // Sampling
   // -------------------------------------------------------------------------
 
@@ -465,6 +900,204 @@ export class Climate {
     out.moisture = sampleSmooth(this.moistureField, dir, MOIST_RES, this._scratch)
     if (out.moisture < 0) out.moisture = 0
     else if (out.moisture > 1) out.moisture = 1
+    return out
+  }
+
+  /**
+   * Sample the baked wind at a unit planet-local direction. Writes into `out`
+   * and returns it. Zero-alloc (reuses `_windScratch`).
+   *
+   * `out.x/y/z` is the planet-local tangent-plane wind direction (approximately
+   * unit length; may be a near-zero vector at poles). `out.speed` ∈ [0,1].
+   *
+   * Stream 201 was consumed during the bake for the swirl jitter; sampling is a
+   * pure bilinear cubemap lookup — deterministic and worker-safe.
+   */
+  windAt(dir: Vector3, out: WindSample): WindSample {
+    out.x = sampleSmooth(this.windX, dir, MOIST_RES, this._windScratch)
+    out.y = sampleSmooth(this.windY, dir, MOIST_RES, this._windScratch)
+    out.z = sampleSmooth(this.windZ, dir, MOIST_RES, this._windScratch)
+    out.speed = sampleSmooth(this.windSpeed, dir, MOIST_RES, this._windScratch)
+    if (out.speed < 0) out.speed = 0
+    else if (out.speed > 1) out.speed = 1
+    return out
+  }
+
+  /**
+   * Sample the baked wind speed only at a unit planet-local direction.
+   * Returns a value ∈ [0,1]. Use `windAt` when you also need the direction.
+   */
+  windSpeedAt(dir: Vector3): number {
+    const s = sampleSmooth(this.windSpeed, dir, MOIST_RES, this._windScratch)
+    return s < 0 ? 0 : s > 1 ? 1 : s
+  }
+
+  // -------------------------------------------------------------------------
+  // Transient visualization layer
+  // -------------------------------------------------------------------------
+
+  /**
+   * Merge `p` into the live transient knobs. Takes effect immediately on the next
+   * windAtTime() call — no rebake needed.
+   */
+  setWindTransient(p: Partial<WindTransientParams>): void {
+    Object.assign(this._windTransient, p)
+  }
+
+  /**
+   * Animated wind sample at `dir` and time `t` (seconds). Visualization-only —
+   * adds drifting/pulsing vortices and curl-noise eddies on top of the static
+   * baked field. ZERO-alloc: reuses instance scratch fields.
+   *
+   * NOT called by terrainSampler/workers — determinism is unaffected.
+   * windAt/windSpeedAt/toBaked/fromBaked are unchanged.
+   */
+  windAtTime(dir: Vector3, t: number, out: WindSample): WindSample {
+    const { driftSpeed, pulseRate, pulseDepth, eddyStrength, eddyScale, eddyTimeScale } =
+      this._windTransient
+
+    // a. Static mean wind as velocity vector.
+    this.windAt(dir, this._wtBaseScratch)
+    const staticSpeed = this._wtBaseScratch.speed
+    let wx = this._wtBaseScratch.x * staticSpeed
+    let wy = this._wtBaseScratch.y * staticSpeed
+    let wz = this._wtBaseScratch.z * staticSpeed
+
+    // b. Drifting / pulsing vortices.
+    // Equator taper (live read of equatorTaperWidth).
+    const eqSinTaperLive = Math.max(1e-3, Math.sin(this.equatorTaperWidth))
+    const eqMaskLive = smoothstep(0, eqSinTaperLive, Math.abs(dir.y))
+
+    let vortWx = 0, vortWy = 0, vortWz = 0
+    const { bandCount } = this
+    for (const v of this._vortices) {
+      // Drift: each vortex centre drifts along its local zonal belt
+      // (westward in trade belts, eastward in the westerlies).
+      const driftSign = -Math.cos(2 * bandCount * Math.abs(v.latC))
+      const lon = v.baseLon + driftSpeed * driftSign * t
+      const px = v.cosLatC * Math.sin(lon)
+      const py = v.sinLatC
+      const pz = v.cosLatC * Math.cos(lon)
+
+      // Pulse: amplitude oscillates.
+      const A = v.A * (1 + pulseDepth * Math.sin(pulseRate * t + v.phase))
+
+      // Gaussian-streamfunction curl (same math as bakeWind).
+      const dot = dir.x * px + dir.y * py + dir.z * pz
+      const dotC = dot < -1 ? -1 : dot > 1 ? 1 : dot
+      const d = Math.acos(dotC)
+      const sig2 = v.sigma * v.sigma
+      const G = Math.exp(-(d * d) / (2 * sig2))
+
+      const tx = dir.x - dotC * px
+      const ty = dir.y - dotC * py
+      const tz = dir.z - dotC * pz
+      const tLen = Math.sqrt(tx * tx + ty * ty + tz * tz)
+      if (tLen < 1e-9) continue
+
+      const dHx = tx / tLen
+      const dHy = ty / tLen
+      const dHz = tz / tLen
+
+      const gScale = -(d / sig2) * G * A
+      const gx = gScale * dHx
+      const gy = gScale * dHy
+      const gz = gScale * dHz
+
+      vortWx += dir.y * gz - dir.z * gy
+      vortWy += dir.z * gx - dir.x * gz
+      vortWz += dir.x * gy - dir.y * gx
+    }
+
+    wx += eqMaskLive * vortWx
+    wy += eqMaskLive * vortWy
+    wz += eqMaskLive * vortWz
+
+    // c. Curl-noise eddies (divergence-free surface flow).
+    // Tangent basis: east = normalize(polarAxis × dir), north = dir × east.
+    const polar = this._polarAxis
+    const east  = this._wtEastScratch
+    east.set(polar.y * dir.z - polar.z * dir.y,
+             polar.z * dir.x - polar.x * dir.z,
+             polar.x * dir.y - polar.y * dir.x)
+    const eLen = east.length()
+    if (eLen > 1e-6) {
+      east.multiplyScalar(1 / eLen)
+      const north = this._wtNorthScratch
+      // north = dir × east
+      north.set(
+        dir.y * east.z - dir.z * east.y,
+        dir.z * east.x - dir.x * east.z,
+        dir.x * east.y - dir.y * east.x,
+      )
+
+      // Streamfunction Ψ(dir, t): 2-octave curl noise evaluated at dir (unit sphere point).
+      // Using central finite differences for the surface gradient (h = 1e-3 rad).
+      const h = 1e-3
+      const N = this._eddyNoise
+
+      // Sample Ψ in east direction.
+      const dEast = this._wtDirScratch
+      dEast.set(dir.x + h * east.x, dir.y + h * east.y, dir.z + h * east.z)
+      const psiEp =
+        N(eddyScale * dEast.x + eddyTimeScale * t, eddyScale * dEast.y, eddyScale * dEast.z) +
+        0.5 * N(2 * eddyScale * dEast.x - eddyTimeScale * t, 2 * eddyScale * dEast.y, 2 * eddyScale * dEast.z)
+      dEast.set(dir.x - h * east.x, dir.y - h * east.y, dir.z - h * east.z)
+      const psiEm =
+        N(eddyScale * dEast.x + eddyTimeScale * t, eddyScale * dEast.y, eddyScale * dEast.z) +
+        0.5 * N(2 * eddyScale * dEast.x - eddyTimeScale * t, 2 * eddyScale * dEast.y, 2 * eddyScale * dEast.z)
+      const psiE = (psiEp - psiEm) / (2 * h)
+
+      // Sample Ψ in north direction.
+      const north0 = north
+      dEast.set(dir.x + h * north0.x, dir.y + h * north0.y, dir.z + h * north0.z)
+      const psiNp =
+        N(eddyScale * dEast.x + eddyTimeScale * t, eddyScale * dEast.y, eddyScale * dEast.z) +
+        0.5 * N(2 * eddyScale * dEast.x - eddyTimeScale * t, 2 * eddyScale * dEast.y, 2 * eddyScale * dEast.z)
+      dEast.set(dir.x - h * north0.x, dir.y - h * north0.y, dir.z - h * north0.z)
+      const psiNm =
+        N(eddyScale * dEast.x + eddyTimeScale * t, eddyScale * dEast.y, eddyScale * dEast.z) +
+        0.5 * N(2 * eddyScale * dEast.x - eddyTimeScale * t, 2 * eddyScale * dEast.y, 2 * eddyScale * dEast.z)
+      const psiN = (psiNp - psiNm) / (2 * h)
+
+      // gradPsi = psiE * east + psiN * north (tangent plane gradient).
+      // eddyVel = dir × gradPsi (divergence-free + tangent).
+      const gpx = psiE * east.x + psiN * north0.x
+      const gpy = psiE * east.y + psiN * north0.y
+      const gpz = psiE * east.z + psiN * north0.z
+
+      const eddyVx = dir.y * gpz - dir.z * gpy
+      const eddyVy = dir.z * gpx - dir.x * gpz
+      const eddyVz = dir.x * gpy - dir.y * gpx
+
+      // Latitude weighting: stronger at mid-latitudes, tapered at equator and poles.
+      // eqMaskLive is bit-identical to the equator smoothstep above — reuse it.
+      const stormWeight = eqMaskLive * (1 - dir.y * dir.y * dir.y * dir.y)
+
+      wx += eddyStrength * stormWeight * eddyVx
+      wy += eddyStrength * stormWeight * eddyVy
+      wz += eddyStrength * stormWeight * eddyVz
+    }
+
+    // d. Project out radial component (keep tangential only).
+    const radial = wx * dir.x + wy * dir.y + wz * dir.z
+    wx -= radial * dir.x
+    wy -= radial * dir.y
+    wz -= radial * dir.z
+
+    // Normalise and fill out.
+    const wMag = Math.sqrt(wx * wx + wy * wy + wz * wz)
+    if (wMag > 1e-9) {
+      out.x = wx / wMag
+      out.y = wy / wMag
+      out.z = wz / wMag
+    } else {
+      // Fall back to static direction.
+      out.x = this._wtBaseScratch.x
+      out.y = this._wtBaseScratch.y
+      out.z = this._wtBaseScratch.z
+    }
+    out.speed = clamp01(wMag)
     return out
   }
 
@@ -483,6 +1116,10 @@ export class Climate {
     return {
       moistRes: MOIST_RES,
       moistureField: this.moistureField,
+      windX: this.windX,
+      windY: this.windY,
+      windZ: this.windZ,
+      windSpeed: this.windSpeed,
       baseTemp: this.baseTemp,
       atmosphere: this.atmosphere,
       bandCount: this.bandCount,
@@ -528,11 +1165,16 @@ export class Climate {
     ;(c as unknown as Record<string, unknown>)['bandContrast'] =
       1.30 - 0.55 * atm
 
-    // --- baked field ---
+    // --- baked fields ---
     ;(c as unknown as Record<string, unknown>)['moistureField'] = b.moistureField
+    ;(c as unknown as Record<string, unknown>)['windX'] = b.windX
+    ;(c as unknown as Record<string, unknown>)['windY'] = b.windY
+    ;(c as unknown as Record<string, unknown>)['windZ'] = b.windZ
+    ;(c as unknown as Record<string, unknown>)['windSpeed'] = b.windSpeed
 
     // --- zero-alloc scratch (field initialisers don't run; must init manually) ---
     ;(c as unknown as Record<string, unknown>)['_scratch'] = new Vector3()
+    ;(c as unknown as Record<string, unknown>)['_windScratch'] = new Vector3()
     ;(c as unknown as Record<string, unknown>)['_eastScratch'] = new Vector3()
     ;(c as unknown as Record<string, unknown>)['_marchScratch'] = new Vector3()
     ;(c as unknown as Record<string, unknown>)['_texelDir'] = new Vector3()

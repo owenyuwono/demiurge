@@ -8,9 +8,8 @@ import { NavControlsBar } from './debug/NavControlsBar.js'
 import { Hud } from './debug/Hud.js'
 import { DEFAULT_INTERIOR } from './planet/interior.js'
 import { TabbedGui } from './debug/TabbedGui.js'
-
-const RADIUS = 50_000
-const HEIGHT_SCALE = 1_200
+import { CaveManager } from './planet/CaveManager.js'
+import { RADIUS, HEIGHT_SCALE, HEIGHT_SCALE_REF, deriveErosionRes } from './planet/worldConstants.js'
 
 function getSeedFromUrl(): number {
   const params = new URLSearchParams(window.location.search)
@@ -65,7 +64,25 @@ async function main(): Promise<void> {
 
   // --- Planet ---
   let seed = getSeedFromUrl()
-  const planet = new Planet({ seed, radius: RADIUS, heightScale: HEIGHT_SCALE, maxDepth: 18, targetTriPx: 2.0 })
+  // Pass initial interior params and axialTiltDeg so the constructor's single bake
+  // uses the same values that main.ts startup code would otherwise set via
+  // setInteriorParams / setAxialTilt — those calls become no-ops (identity guard)
+  // when the stored values already match, preventing a second full erosion bake.
+  const planet = new Planet({
+    seed,
+    radius: RADIUS,
+    heightScale: HEIGHT_SCALE,
+    maxDepth: 18,
+    targetTriPx: 2.0,
+    interior: {
+      mass:        DEFAULT_INTERIOR.mass,
+      composition: DEFAULT_INTERIOR.composition,
+      age:         DEFAULT_INTERIOR.age,
+      insolation:  DEFAULT_INTERIOR.insolation,
+      waterBudget: DEFAULT_INTERIOR.waterBudget,
+    },
+    axialTiltDeg: 23.4,   // matches ui.obliquity default
+  })
   scene.add(planet)
 
   // Polar axis in world space — computed after setAxialTilt(ui.obliquity) is called during
@@ -221,12 +238,16 @@ async function main(): Promise<void> {
   // eslint-disable-next-line prefer-const
   let refreshDerived: () => void = () => { /* assigned after GUI build */ }
 
+  // caveManager — constructed after planet's first build (post init block below).
+  // Declared here so ui.randomizeSeed / ui.regenerate can call setField() on new seeds.
+  let caveManager: CaveManager | null = null
+
   // tabbed declared before ui so randomizeSeed can reference tabbed.controllersRecursive()
   let tabbed: TabbedGui
 
   // --- UI state (single source of truth for GUI + hotkeys) ---
   const ui = {
-    view: 'normal' as 'normal' | 'lod' | 'tectonics' | 'heightmap' | 'climate' | 'wind',
+    view: 'normal' as 'normal' | 'lod' | 'tectonics' | 'heightmap' | 'climate' | 'wind' | 'materials',
     wireframe: false,
     vertices: false,
     freezeLod: false,
@@ -270,24 +291,81 @@ async function main(): Promise<void> {
     // Sun direction (azimuth 0..360°, elevation −90..90°)
     sunAzimuth: 45,
     sunElevation: 30,
-    // Wind parameters
-    windField: 'flow' as 'flow' | 'speed' | 'direction',
-    windStrength: 1,
-    windBands: 3,
-    turbulence: 0.2,
-    retrograde: false,
+    // Wind bake parameters (all trigger rebake on change)
+    windSwirlStrength:  0.6,
+    windHighs:          4,
+    windLows:           3,
+    windCoriolis:       0.4,   // radians
+    windVortexSize:     0.18,  // radians (sigmaBase)
+    windLatSpread:      0.17,  // radians
+    windEquatorTaper:   0.20,  // radians — equatorial vortex-taper half-width
+    // Wind transient parameters (live, no rebake)
+    windDriftSpeed:     0.015,
+    windPulseRate:      0.25,
+    windPulseDepth:     0.35,
+    windEddyStrength:   0.35,
+    windEddyScale:      6,
+    windEddyTimeScale:  0.3,
+    // Wind render parameters (live, no rebake)
+    windArrowDensity:   1500,
+    windArrowScale:     1.0,
+    // Wind flow overlay parameters
+    showWindArrows:     true,
+    showWindFlow:       true,
+    windFlowDensity:    2000,
+    windFlowSpeed:      0.15,
+    windFlowTrail:      8,
+    windFlowLifetime:   4.0,
+    // Cloud shell parameters (all live via setters — no rebake)
+    cloudCoverage:     0.22,
+    cloudScrollSpeed:  0.08,
+    cloudScale:        6,
+    cloudWarp:         0.0,
+    cloudBillow:       0.8,
+    cloudDetail:       0.2,
+    cloudSoftness:     0.3,
+    cloudVolume:       0.6,
+    cloudOpacity:      0.9,
+    cloudFavWeight:    0.3,
+    cloudMoistWeight:  0.6,
+    cloudConvWeight:   0.5,
+    cloudConvGain:     2.0,
+    cloudItczWeight:   0.05,
+    // Volumetric cloud parameters (new raymarched layer)
+    cloudBase:         1.2,
+    cloudThick:        0.6,
+    cloudDensity:      4.0,
+    cloudStepCount:    40,
+    cloudLightSteps:   5,
+    cloudHg:           0.35,
+    cloudPowder:       1.0,
+    cloudDetailScale:  4.0,
+    cloudRoundBase:    0.2,
+    cloudBillowTop:    0.5,
+    cloudAmbient:      0.25,
     // Erosion bake parameters — onFinishChange triggers rebake on release.
-    erosionRes: 256 as 128 | 256 | 512,
+    // Default matches deriveErosionRes(RADIUS) = 256 so slider and first bake agree.
+    erosionRes: deriveErosionRes(RADIUS) as 128 | 256 | 512,
     erosionStrength: 1.0,
     erosionDeposition: 1.0,
     bSteps: 30,
-    bUpliftRate: 60,
+    // Authored at HEIGHT_SCALE_REF=1200 as 60 m/step; scale with HEIGHT_SCALE so the slider
+    // default matches the Planet constructor default and is invariant under uniform scale.
+    bUpliftRate: Math.round(60 * (HEIGHT_SCALE / HEIGHT_SCALE_REF)),
+    // Atmosphere shell parameters (all live via setters — no rebake)
+    atmosphereOn:           true,
+    atmosphereDensity:      1.0,
+    atmosphereTint:         '#2e6bff',
+    atmosphereSunIntensity: 1.3,
+    atmosphereScaleHeight:  4.0,
+    atmosphereHeight:       2.5,
     seed: String(seed),
     randomizeSeed: () => {
       const newSeed = (Math.random() * 2 ** 31) | 0
       seed = newSeed
       ui.seed = String(newSeed)
       planet.regenerate(newSeed)
+      caveManager?.setField(planet.getCaveField()!)
       refreshDerived()
       const url = new URL(window.location.href)
       url.searchParams.set('seed', String(newSeed))
@@ -296,6 +374,7 @@ async function main(): Promise<void> {
     },
     regenerate: () => {
       planet.regenerate(seed)
+      caveManager?.setField(planet.getCaveField()!)
       refreshDerived()
     },
   }
@@ -322,6 +401,9 @@ async function main(): Promise<void> {
     planet.setHeightmapView(ui.view === 'heightmap')
     planet.setClimateView(ui.view === 'climate')
     planet.setWindView(ui.view === 'wind')
+    planet.setMaterialsView(ui.view === 'materials')
+    planet.setWindOverlaysVisible(ui.view === 'wind')
+    planet.setCloudShellVisible(ui.view === 'normal')
   }
 
   function applyWireframe(): void {
@@ -522,7 +604,8 @@ async function main(): Promise<void> {
   erosionFolder.add(ui, 'bSteps', 1, 100, 1).name('B steps').onFinishChange((v: number) => {
     planet.setBSteps(v)
   })
-  erosionFolder.add(ui, 'bUpliftRate', 0, 300, 1).name('B uplift rate (m/step)').onFinishChange((v: number) => {
+  // Range scales with HEIGHT_SCALE: 0–300 at 1200 m/step → 0–3000 at 12000 m/step.
+  erosionFolder.add(ui, 'bUpliftRate', 0, Math.round(300 * (HEIGHT_SCALE / HEIGHT_SCALE_REF)), 1).name('B uplift rate (m/step)').onFinishChange((v: number) => {
     planet.setBUpliftRate(v)
   })
 
@@ -555,22 +638,172 @@ async function main(): Promise<void> {
     planet.setTempRange(v)
   })
 
-  // Wind: all parameters are live uniform writes (no rebake).
+  // Wind: bake params trigger a full rebake; render params are live arrow rebuilds/scales.
+  // The old analytic shader uniforms (windBands, windStrength, turbulence, retrograde)
+  // are retired — the wind view now uses the baked-field WindDebug arrows over normal terrain.
   const windFolder = tabbed.atmosphereGui.addFolder('Wind')
-  windFolder.add(ui, 'windField', ['flow', 'speed', 'direction']).name('field').onChange((v: 'flow' | 'speed' | 'direction') => {
-    planet.setWindField(v)
+  windFolder.add(ui, 'windSwirlStrength', 0, 2, 0.01).name('swirl strength').onFinishChange((v: number) => {
+    planet.setWindSwirl(v)
   })
-  windFolder.add(ui, 'windStrength', 0, 3, 0.01).name('wind strength').onChange((v: number) => {
-    planet.setWindStrength(v)
+  windFolder.add(ui, 'windHighs', 0, 12, 1).name('highs / hemisphere').onFinishChange((v: number) => {
+    planet.setWindHighs(v)
   })
-  windFolder.add(ui, 'windBands', 1, 8, 1).name('bands (N)').onChange((v: number) => {
-    planet.setWindBands(v)
+  windFolder.add(ui, 'windLows', 0, 12, 1).name('lows / hemisphere').onFinishChange((v: number) => {
+    planet.setWindLows(v)
   })
-  windFolder.add(ui, 'turbulence', 0, 1, 0.01).name('turbulence').onChange((v: number) => {
-    planet.setTurbulence(v)
+  windFolder.add(ui, 'windCoriolis', 0, 1.57, 0.01).name('Coriolis (rad)').onFinishChange((v: number) => {
+    planet.setWindCoriolis(v)
   })
-  windFolder.add(ui, 'retrograde').name('retrograde').onChange((v: boolean) => {
-    planet.setRetrograde(v)
+  windFolder.add(ui, 'windVortexSize', 0.05, 1.0, 0.01).name('vortex size (rad)').onFinishChange((v: number) => {
+    planet.setWindVortexSize(v)
+  })
+  windFolder.add(ui, 'windLatSpread', 0, 0.785, 0.01).name('vortex lat spread (rad)').onFinishChange((v: number) => {
+    planet.setWindLatSpread(v)
+  })
+  windFolder.add(ui, 'windEquatorTaper', 0, 0.5, 0.01).name('equator taper (rad)').onFinishChange((v: number) => {
+    planet.setWindEquatorTaper(v)
+  })
+  windFolder.add(ui, 'windDriftSpeed', 0, 0.1, 0.001).name('drift speed').onChange((v: number) => {
+    planet.setWindDrift(v)
+  })
+  windFolder.add(ui, 'windPulseRate', 0, 1.5, 0.01).name('pulse rate').onChange((v: number) => {
+    planet.setWindPulseRate(v)
+  })
+  windFolder.add(ui, 'windPulseDepth', 0, 1, 0.01).name('pulse depth').onChange((v: number) => {
+    planet.setWindPulseDepth(v)
+  })
+  windFolder.add(ui, 'windEddyStrength', 0, 1, 0.01).name('eddy strength').onChange((v: number) => {
+    planet.setWindEddyStrength(v)
+  })
+  windFolder.add(ui, 'windEddyScale', 1, 20, 0.5).name('eddy scale').onChange((v: number) => {
+    planet.setWindEddyScale(v)
+  })
+  windFolder.add(ui, 'windEddyTimeScale', 0, 1.5, 0.01).name('eddy time scale').onChange((v: number) => {
+    planet.setWindEddyTimeScale(v)
+  })
+  windFolder.add(ui, 'windArrowDensity', 100, 5000, 50).name('arrow density').onChange((v: number) => {
+    planet.setWindArrowDensity(v)
+  })
+  windFolder.add(ui, 'windArrowScale', 0.1, 5.0, 0.05).name('arrow length').onChange((v: number) => {
+    planet.setWindArrowScale(v)
+  })
+  windFolder.add(ui, 'showWindArrows').name('wind arrows').onChange((v: boolean) => {
+    planet.setWindArrowsVisible(v)
+  })
+  windFolder.add(ui, 'showWindFlow').name('wind flow').onChange((v: boolean) => {
+    planet.setWindFlowVisible(v)
+  })
+  windFolder.add(ui, 'windFlowDensity', 200, 6000, 100).name('flow density').onFinishChange((v: number) => {
+    planet.setWindFlowDensity(v)
+  })
+  windFolder.add(ui, 'windFlowSpeed', 0, 0.5, 0.01).name('flow speed').onChange((v: number) => {
+    planet.setWindFlowSpeed(v)
+  })
+  windFolder.add(ui, 'windFlowTrail', 2, 16, 1).name('trail length').onFinishChange((v: number) => {
+    planet.setWindFlowTrail(v)
+  })
+  windFolder.add(ui, 'windFlowLifetime', 1, 10, 0.5).name('particle life').onChange((v: number) => {
+    planet.setWindFlowLifetime(v)
+  })
+
+  // Cloud shell overlay — always visible in normal view; all sliders are live (no rebake).
+  const cloudFolder = tabbed.atmosphereGui.addFolder('Clouds')
+  cloudFolder.add(ui, 'cloudCoverage', 0, 1, 0.01).name('coverage').onChange((v: number) => {
+    planet.setCloudCoverage(v)
+  })
+  cloudFolder.add(ui, 'cloudScrollSpeed', 0, 0.5, 0.005).name('scroll speed').onChange((v: number) => {
+    planet.setCloudScrollSpeed(v)
+  })
+  cloudFolder.add(ui, 'cloudScale', 1, 16, 0.1).name('cloud scale').onChange((v: number) => {
+    planet.setCloudScale(v)
+  })
+  cloudFolder.add(ui, 'cloudWarp', 0, 1, 0.01).name('wind warp').onChange((v: number) => {
+    planet.setCloudWarp(v)
+  })
+  cloudFolder.add(ui, 'cloudBillow', 0, 1, 0.01).name('billow').onChange((v: number) => {
+    planet.setCloudBillow(v)
+  })
+  cloudFolder.add(ui, 'cloudDetail', 0, 1, 0.01).name('detail').onChange((v: number) => {
+    planet.setCloudDetail(v)
+  })
+  cloudFolder.add(ui, 'cloudSoftness', 0.05, 0.6, 0.01).name('softness').onChange((v: number) => {
+    planet.setCloudSoftness(v)
+  })
+  cloudFolder.add(ui, 'cloudVolume', 0, 1, 0.01).name('volume').onChange((v: number) => {
+    planet.setCloudVolume(v)
+  })
+  cloudFolder.add(ui, 'cloudOpacity', 0, 1, 0.01).name('opacity').onChange((v: number) => {
+    planet.setCloudOpacity(v)
+  })
+  cloudFolder.add(ui, 'cloudFavWeight', 0, 1, 0.01).name('favorability').onChange((v: number) => {
+    planet.setCloudFavWeight(v)
+  })
+  cloudFolder.add(ui, 'cloudMoistWeight', 0, 1, 0.01).name('moisture wt').onChange((v: number) => {
+    planet.setCloudMoistWeight(v)
+  })
+  cloudFolder.add(ui, 'cloudConvWeight', 0, 1, 0.01).name('convergence wt').onChange((v: number) => {
+    planet.setCloudConvWeight(v)
+  })
+  cloudFolder.add(ui, 'cloudConvGain', 0, 20, 0.5).name('conv gain').onChange((v: number) => {
+    planet.setCloudConvGain(v)
+  })
+  cloudFolder.add(ui, 'cloudItczWeight', 0, 0.5, 0.01).name('ITCZ wt').onChange((v: number) => {
+    planet.setCloudItczWeight(v)
+  })
+  cloudFolder.add(ui, 'cloudBase', 1.0, 2.0, 0.05).name('cloud base').onChange((v: number) => {
+    planet.setCloudBase(v)
+  })
+  cloudFolder.add(ui, 'cloudThick', 0.2, 1.2, 0.05).name('cloud thickness').onChange((v: number) => {
+    planet.setCloudThick(v)
+  })
+  cloudFolder.add(ui, 'cloudDensity', 0.5, 12, 0.1).name('density').onChange((v: number) => {
+    planet.setCloudDensity(v)
+  })
+  cloudFolder.add(ui, 'cloudStepCount', 8, 96, 4).name('step count').onChange((v: number) => {
+    planet.setCloudStepCount(v)
+  })
+  cloudFolder.add(ui, 'cloudLightSteps', 1, 8, 1).name('light steps').onChange((v: number) => {
+    planet.setCloudLightSteps(v)
+  })
+  cloudFolder.add(ui, 'cloudHg', 0, 0.9, 0.01).name('HG anisotropy').onChange((v: number) => {
+    planet.setCloudHg(v)
+  })
+  cloudFolder.add(ui, 'cloudPowder', 0, 3, 0.05).name('powder').onChange((v: number) => {
+    planet.setCloudPowder(v)
+  })
+  cloudFolder.add(ui, 'cloudDetailScale', 1, 12, 0.5).name('detail scale').onChange((v: number) => {
+    planet.setCloudDetailScale(v)
+  })
+  cloudFolder.add(ui, 'cloudRoundBase', 0.05, 0.6, 0.01).name('round base').onChange((v: number) => {
+    planet.setCloudRoundBase(v)
+  })
+  cloudFolder.add(ui, 'cloudBillowTop', 0.1, 0.9, 0.01).name('billow top').onChange((v: number) => {
+    planet.setCloudBillowTop(v)
+  })
+  cloudFolder.add(ui, 'cloudAmbient', 0, 0.6, 0.01).name('ambient').onChange((v: number) => {
+    planet.setCloudAmbient(v)
+  })
+
+  // Atmosphere shell — always-on appearance (not a view mode); all sliders are live (no rebake).
+  const atmosphereFolder = tabbed.atmosphereGui.addFolder('Atmosphere shell')
+  atmosphereFolder.add(ui, 'atmosphereDensity', 0, 2, 0.01).name('atmosphere').onChange((v: number) => {
+    planet.setAtmosphereDensity(v)
+  })
+  atmosphereFolder.addColor(ui, 'atmosphereTint').name('tint').onChange((v: string) => {
+    // Convert '#rrggbb' hex to THREE.Color and pass to planet
+    planet.setAtmosphereTint(new THREE.Color(v))
+  })
+  atmosphereFolder.add(ui, 'atmosphereSunIntensity', 0, 4, 0.05).name('sun intensity').onChange((v: number) => {
+    planet.setAtmosphereSunIntensity(v)
+  })
+  atmosphereFolder.add(ui, 'atmosphereScaleHeight', 0, 8, 0.1).name('horizon thickness').onChange((v: number) => {
+    planet.setAtmosphereScaleHeight(v)
+  })
+  atmosphereFolder.add(ui, 'atmosphereHeight', 1.0, 6.0, 0.05).name('shell height').onChange((v: number) => {
+    planet.setAtmosphereHeight(v)
+  })
+  atmosphereFolder.add(ui, 'atmosphereOn').name('enabled').onChange((v: boolean) => {
+    planet.setAtmosphereVisible(v)
   })
 
   // Sun direction controls — world-space azimuth + elevation converted to a unit vector.
@@ -581,7 +814,7 @@ async function main(): Promise<void> {
 
   // === Tab 3: View ===
   const viewFolder = tabbed.viewGui.addFolder('View')
-  viewFolder.add(ui, 'view', ['normal', 'lod', 'tectonics', 'heightmap', 'climate', 'wind']).name('mode').onChange(() => applyView())
+  viewFolder.add(ui, 'view', ['normal', 'lod', 'tectonics', 'heightmap', 'climate', 'wind', 'materials']).name('mode').onChange(() => applyView())
   viewFolder.add(ui, 'wireframe').name('wireframe').onChange(() => applyWireframe())
   viewFolder.add(ui, 'vertices').name('vertices').onChange(() => applyVertices())
   viewFolder.add(ui, 'freezeLod').name('freeze LOD').onChange(() => applyFreeze())
@@ -619,6 +852,21 @@ async function main(): Promise<void> {
   planet.setAxialTilt(ui.obliquity)
   refreshDerived()
 
+  // Construct CaveManager after planet's first build (planet.setInteriorParams above triggers
+  // regenerate, so getCaveField() is valid here). Attach headlamp to camera and give the
+  // first-person controller the collider via setCollider() (it's already constructed above).
+  // Guard against a null cave field (cave construction can fail/disable itself in
+  // Planet.buildHeightFn without aborting the planet build). No cave field → no cave
+  // system this session; the planet still renders and is fully walkable on the surface.
+  const _caveField = planet.getCaveField()
+  if (_caveField !== null) {
+    caveManager = new CaveManager({ field: _caveField, planet })
+    caveManager.attachHeadlamp(camera)
+    firstPerson.setCollider(caveManager.getCollider())
+  } else {
+    console.warn('[cave] no cave field available — cave system disabled for this session')
+  }
+
   // Initialise climate/sun uniforms to match slider defaults.
   // These calls only update uniforms/fields; no regenerate() is triggered here.
   // The constructor's buildHeightFn already baked with these default values.
@@ -629,12 +877,31 @@ async function main(): Promise<void> {
   planet.setClimateField(ui.climateField)
   applySunDir()
 
-  // Initialise wind uniforms to match slider defaults (uniform-only, no rebake).
-  planet.setWindField(ui.windField)
-  planet.setWindStrength(ui.windStrength)
-  planet.setWindBands(ui.windBands)
-  planet.setTurbulence(ui.turbulence)
-  planet.setRetrograde(ui.retrograde)
+  // Initialise atmosphere uniforms from ui defaults so the first frame renders correctly.
+  planet.setAtmosphereDensity(ui.atmosphereDensity)
+  planet.setAtmosphereTint(new THREE.Color(ui.atmosphereTint))
+  planet.setAtmosphereSunIntensity(ui.atmosphereSunIntensity)
+  planet.setAtmosphereScaleHeight(ui.atmosphereScaleHeight)
+  planet.setAtmosphereHeight(ui.atmosphereHeight)
+  planet.setAtmosphereVisible(ui.atmosphereOn)
+
+  // Initialise cloud uniforms from ui defaults so the first frame renders correctly.
+  // VolumetricClouds defaults already match these values, but explicit init keeps ui in sync
+  // with any future default changes and follows the same pattern as atmosphere above.
+  planet.setCloudBase(ui.cloudBase)
+  planet.setCloudThick(ui.cloudThick)
+  planet.setCloudDensity(ui.cloudDensity)
+  planet.setCloudStepCount(ui.cloudStepCount)
+  planet.setCloudLightSteps(ui.cloudLightSteps)
+  planet.setCloudHg(ui.cloudHg)
+  planet.setCloudPowder(ui.cloudPowder)
+  planet.setCloudDetailScale(ui.cloudDetailScale)
+  planet.setCloudRoundBase(ui.cloudRoundBase)
+  planet.setCloudBillowTop(ui.cloudBillowTop)
+  planet.setCloudAmbient(ui.cloudAmbient)
+
+  // Wind bake params are already at their defaults (Climate constructor defaults match ui defaults).
+  // Arrow density + scale match Planet field defaults — no explicit init needed.
 
   // --- Hotkeys (route through ui state then sync GUI displays) ---
   window.addEventListener('keydown', (e) => {
@@ -664,6 +931,10 @@ async function main(): Promise<void> {
         ui.view = ui.view === 'wind' ? 'normal' : 'wind'
         applyView()
         break
+      case '7':
+        ui.view = ui.view === 'materials' ? 'normal' : 'materials'
+        applyView()
+        break
       case 'f':
         ui.freezeLod = !ui.freezeLod
         applyFreeze()
@@ -671,6 +942,34 @@ async function main(): Promise<void> {
       case 'g':
         ui.randomizeSeed()
         return // randomizeSeed already calls controllersRecursive().updateDisplay()
+      case 'c': {
+        // Teleport to the cave mouth (surface spawn at entrance so player can walk in).
+        // Only allowed from Globe mode — mirrors the "walk here" entry flow exactly.
+        if (navMode !== NavMode.Globe || caveManager === null) break
+
+        // Ensure world quaternion is current before reading getMouthWorld().
+        caveManager.update(camera.position)
+        const m = caveManager.getMouthWorld()
+
+        // Save state + pause spin (planet rotating under a world-fixed walker is wrong).
+        savedCamPos = camera.position.clone()
+        savedCamUp  = camera.up.clone()
+        savedSpin   = ui.spin
+        ui.spin     = false
+
+        // Dispose GlobeControls so it stops capturing input.
+        globeControls.dispose()
+
+        // Spawn the player standing at the cave mouth, facing inward (surface mode so they
+        // can walk to the edge and fall in, auto-switching to cave mode on descent).
+        firstPerson.spawn({ position: m.pos, up: m.up }, 'surface')
+        navMode = NavMode.FirstPerson
+        firstPerson.enable()
+
+        renderer.domElement.requestPointerLock()
+        bar.setMode(NavMode.FirstPerson)
+        break
+      }
     }
     tabbed.controllersRecursive().forEach((c) => c.updateDisplay())
   })
@@ -697,6 +996,7 @@ async function main(): Promise<void> {
     const dt = Math.min(clock.getDelta(), 0.1)
     elapsedS += dt
     planet.setWindTime(elapsedS)
+    planet.animateWind(elapsedS, dt)
 
     // Dispatch input update to whichever controller owns this frame.
     // Only ONE controller's update runs per frame — no double input on the camera.
@@ -719,6 +1019,21 @@ async function main(): Promise<void> {
     renderer.getDrawingBufferSize(_drawingSize)
     _viewProj.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse)
     planet.update(camera.position, THREE.MathUtils.degToRad(camera.fov), _drawingSize.y, _viewProj)
+
+    // Update cave manager AFTER planet.update() so the planet world quaternion is fresh.
+    // Headlamp follows the player into the cave and turns off on surface.
+    if (caveManager !== null) {
+      // The cave subsystem is experimental + near-field; a fault in it must NOT
+      // black out the whole planet. Isolate it: on error, log the cause once and
+      // disable it for the session so the main render keeps running.
+      try {
+        caveManager.update(camera.position)
+        caveManager.setHeadlampEnabled(firstPerson.mode === 'cave')
+      } catch (err) {
+        console.error('[cave] update threw — disabling cave system to keep rendering:', err)
+        caveManager = null
+      }
+    }
 
     // Lighting is fixed surround (set up once at init) — nothing to update per frame.
 

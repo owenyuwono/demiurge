@@ -23,6 +23,7 @@ import {
   texAng,
   neighborTexel,
 } from './cubemap'
+// (RADIUS / RADIUS_REF imports removed — volcano constants are angular, scale-invariant)
 
 // ---------------------------------------------------------------------------
 // PRNG helpers — same mixer as noise.ts (splitmix32)
@@ -91,6 +92,7 @@ export interface TectonicQuery {
   paleoDist: number     // radians — distance to nearest fossil/paleo crack boundary
   otherCrustDist: number  // crustDist mirrored to neighbor side (coarse, no fine warp)
   baseElevation: number   // blurred plate base elevation (smooth across Voronoi boundaries)
+  rockHardness: number    // [0,1] substrate hardness: 1=hard igneous/volcanic, 0=soft sediment/basin
 }
 
 export interface Volcano {
@@ -183,6 +185,7 @@ const MAX_STEPS_HARD = 1200    // hard step cap per walker
 // 16   = hotspot position RNG (NEW)
 // 17   = hotspot intensity RNG (NEW)
 // 18   = volcano roughening noise (NEW)
+// 19   = rock hardness FBM break-up noise (NEW)
 
 // ---------------------------------------------------------------------------
 // Non-tectonic continental mask constants (tuned to hit land-fraction gate)
@@ -1418,6 +1421,7 @@ export interface TectonicsBaked {
   hotspotPos: Float32Array     // 3 per hotspot, xyz interleaved
   hotspotIntensityArr: Float32Array
   hotspotIsChain: Uint8Array
+  rockHardness: Float32Array   // [0,1] per texel: substrate hardness (composition-contrast-scaled)
 }
 
 // ---------------------------------------------------------------------------
@@ -1432,6 +1436,7 @@ export class Tectonics {
   private readonly _arcDensity: number
   private readonly _hotspotCount: number
   private readonly _hotspotIntensity: number
+  private readonly _composition: number
 
   // Cube-map tables (read-only after construction)
   private readonly _compId:     Uint16Array   // per-texel plate id (0-based)
@@ -1443,6 +1448,8 @@ export class Tectonics {
   private readonly _shearField: Float32Array  // per-texel baked shear (stable, blurred)
   private readonly _upliftField: Float32Array  // per-texel baked wide uplift (blurred convField)
   private _baseElevField: Float32Array        // per-texel blurred plate base elevation (smooth across Voronoi boundaries)
+  private _crustAge:      Float32Array        // per-texel [0,1] age proxy: 0=fresh divergent, 1=old craton
+  private _rockHardness:  Float32Array        // per-texel [0,1] substrate hardness (composition-scaled contrast)
 
   // Domain-warp noise
   private readonly _warpNoise: (x: number, y: number, z: number) => number
@@ -1450,6 +1457,8 @@ export class Tectonics {
   private readonly _fineWarpNoise: (x: number, y: number, z: number) => number
   // Volcano roughening noise (stream 18) — irregular base + flank + gullies
   private readonly _volNoise: (x: number, y: number, z: number) => number
+  // Rock hardness FBM break-up noise (stream 19) — breaks up smooth hardness iso-contours
+  private readonly _hardnessNoise: (x: number, y: number, z: number) => number
 
   // Preallocated scratch — zero allocations in query() / velocityAt()
   private readonly _warpedDir  = new Vector3()
@@ -1494,7 +1503,7 @@ export class Tectonics {
   // Scratch for _bakeVolcanoes (one-time; preallocated to avoid GC churn during bake)
   private readonly _bakeQueryScratch: TectonicQuery = {
     plateId: 0, neighborId: 0, boundaryDist: 0, convergence: 0,
-    shear: 0, crustDist: 0, paleoDist: 0, otherCrustDist: 0, baseElevation: 0,
+    shear: 0, crustDist: 0, paleoDist: 0, otherCrustDist: 0, baseElevation: 0, rockHardness: 0,
   }
   private readonly _bakeDirScratch = new Vector3()
 
@@ -1504,15 +1513,21 @@ export class Tectonics {
   /** Public accessor: the baked mantle-plume hotspot sources. */
   get hotspots(): readonly Hotspot[] { return this._hotspots }
 
-  constructor(opts: { seed: number; plateCount?: number; arcDensity?: number; hotspotCount?: number; hotspotIntensity?: number; driftScale?: number }) {
+  constructor(opts: { seed: number; plateCount?: number; arcDensity?: number; hotspotCount?: number; hotspotIntensity?: number; driftScale?: number; composition?: number }) {
     const _tBakeStart = performance.now()
-    const { seed, plateCount = 16, arcDensity: arcDensityRaw = 1.0, hotspotCount: hotspotCountRaw = 6, hotspotIntensity: hotspotIntensityRaw = 1, driftScale = 1.0 } = opts
+    const { seed, plateCount = 16, arcDensity: arcDensityRaw = 1.0, hotspotCount: hotspotCountRaw = 6, hotspotIntensity: hotspotIntensityRaw = 1, driftScale = 1.0, composition: compositionRaw = 0.5 } = opts
+    // Clamp composition to [0,1]: 0 = icy/sediment (soft, low contrast), 1 = rocky/basaltic (hard, high contrast)
+    const composition = Math.max(0, Math.min(1, compositionRaw))
     const arcDensity = Math.max(0.2, Math.min(3, arcDensityRaw))
     // Store seed and clamped arcDensity for toBaked() / fromBaked() round-trip
     this._seed             = seed
     this._arcDensity       = arcDensity
     this._hotspotCount     = Math.max(0, Math.min(20, Math.round(hotspotCountRaw)))
     this._hotspotIntensity = Math.max(0, Math.min(3, hotspotIntensityRaw))
+    this._composition      = composition
+    // Initialise hardness arrays to defaults; overwritten by tectonic path below
+    this._crustAge     = new Float32Array(TOTAL_TEXELS).fill(0.5)
+    this._rockHardness = new Float32Array(TOTAL_TEXELS).fill(0.5)
     // Clamp plateCount to [0, 48]; values ≤ 1 trigger the non-tectonic branch
     const plateCountClamped = Math.max(0, Math.min(48, plateCount))
     const target = plateCountClamped  // EXACT target plate count (for tectonic path)
@@ -1536,6 +1551,7 @@ export class Tectonics {
     this._warpNoise = createNoise3D(deriveSeed(seed, 5))
     this._fineWarpNoise = createNoise3D(deriveSeed(seed, 13))
     this._volNoise = createNoise3D(deriveSeed(seed, 18))
+    this._hardnessNoise = createNoise3D(deriveSeed(seed, 19))
 
     // Non-tectonic branch: single plate, noise-driven crust SDF, no boundaries
     if (plateCountClamped <= 1) {
@@ -1550,6 +1566,8 @@ export class Tectonics {
       this._baseElevField = new Float32Array(TOTAL_TEXELS)  // all zeros — single plate, no variation
       this._crustDist   = nt.crustDist
       this._paleoDist   = nt.paleoDist
+      // Bake hardness field (no divergent boundaries → uniform age + FBM break-up)
+      this._bakeHardness(composition)
       const _t0 = performance.now()
       this._bakeVolcanoes(seed, arcDensity, this._hotspotCount, this._hotspotIntensity)
       this._volcanoBakeMs = performance.now() - _t0
@@ -2148,6 +2166,11 @@ export class Tectonics {
     // _convField is available for the arc-crust pass. Nothing to do here.
 
     // -------------------------------------------------------------------------
+    // Step 7b — Bake substrate hardness field (reads _convField, _distField, _crustDist)
+    // -------------------------------------------------------------------------
+    this._bakeHardness(composition)
+
+    // -------------------------------------------------------------------------
     // Step 8 — Bake arc volcanoes (LAST — reads _convField/_crustDist/_distField)
     // -------------------------------------------------------------------------
     const _t0 = performance.now();
@@ -2345,12 +2368,188 @@ export class Tectonics {
   }
 
   // ---------------------------------------------------------------------------
+  // _bakeHardness — bake crustAge + rockHardness cubemap fields
+  //
+  // crustAge [0,1]: 0 = fresh/divergent/volcanic crust, 1 = old stable craton.
+  // Algorithm:
+  //   1. Identify "divergent source" texels: convField < DIV_THRESH and
+  //      distField < DIV_DIST (near a divergent boundary). These represent
+  //      actively-spreading mid-ocean ridges — the youngest crust.
+  //   2. Multi-source Dijkstra from divergent sources → divergentDist (radians).
+  //   3. Also identify "volcanic" texels (high convField near arcs / hotspot
+  //      positions) → volcanicDist.
+  //   4. crustAge = saturate(divergentDist / AGE_SCALE) — far from ridges = old.
+  //   5. rockHardness: blend of
+  //        (a) age term: oldest craton = medium-hard (sediment-covered), freshest
+  //            divergent = hard basalt, mid = medium.
+  //        (b) volcanic proximity: near arc/hotspot → very hard (fresh igneous).
+  //        (c) crustDist sign: oceanic basalt harder than continental sediment cover.
+  //        (d) FBM break-up (stream 19) at low amplitude to avoid perfectly smooth iso-contours.
+  //      All terms weighted to produce result in [0,1] before composition scaling.
+  //   6. Composition scales contrast: hardness = mean + (hardness - mean) * contrastScale
+  //      where contrastScale = lerp(0.25, 1.0, composition) — basaltic worlds have
+  //      full contrast, icy/sediment worlds have flat hardness near the mean (0.5).
+  //   7. Box-blur 3 passes for C1-friendliness.
+  //
+  // Reads: _convField, _distField, _crustDist (all already assigned before this call).
+  // Reads: _volcanoes (empty at call time since _bakeVolcanoes runs AFTER this).
+  //   Instead of using volcano positions (not yet available), we use _convField > VOLC_THRESH
+  //   as a proxy for volcanic arc proximity, plus hotspot positions from _hotspots (also
+  //   not yet available). We use the raw _convField and _crustDist fields as proxies.
+  // ---------------------------------------------------------------------------
+
+  private _bakeHardness(composition: number): void {
+    // --- Constants ---
+    // Divergent boundary identification: convField < DIV_THRESH near a boundary
+    const DIV_THRESH   = -0.05  // convField below this → divergent
+    const DIV_DIST     = 0.08   // radians — must be near a plate boundary
+    // Age scale: divergentDist / AGE_SCALE → [0,1], saturated at 1
+    const AGE_SCALE    = 0.40   // radians — half-sphere worth of "age"
+    // Volcanic arc proximity proxy threshold
+    const VOLC_THRESH  = 0.15   // convField above this → arc/volcanic zone
+    // Hardness FBM break-up amplitude and frequency
+    const HARD_FBM_AMP  = 0.12  // ±0.12 hardness noise amplitude
+    const HARD_FBM_FREQ = 2.8   // spatial frequency on unit sphere
+
+    // ---- Step 1: Multi-source Dijkstra from divergent-boundary texels → divergentDist ----
+    const INF = 1e30
+    const divergentDist = new Float32Array(TOTAL_TEXELS).fill(INF)
+    const divSettled    = new Uint8Array(TOTAL_TEXELS)
+    const divHeap       = new BinaryHeap(TOTAL_TEXELS * 2)
+    const divNbr: { face: number; x: number; y: number } = { face: 0, x: 0, y: 0 }
+
+    // Seed: texels near divergent boundaries (spreading ridges)
+    for (let idx = 0; idx < TOTAL_TEXELS; idx++) {
+      const conv = this._convField[idx]
+      const dist = this._distField[idx]
+      if (conv < DIV_THRESH && dist < DIV_DIST) {
+        divergentDist[idx] = 0
+        divHeap.push(0, idx)
+      }
+    }
+
+    // If no divergent texels (non-tectonic case), leave divergentDist at INF → crustAge = 1 everywhere
+    if (!divHeap.isEmpty()) {
+      const DDIAG = TEX_ANG * Math.SQRT2
+      const DORTH = TEX_ANG
+      const ddx8 = [ 1, -1,  0,  0,  1, -1,  1, -1] as const
+      const ddy8 = [ 0,  0,  1, -1,  1,  1, -1, -1] as const
+
+      while (!divHeap.isEmpty()) {
+        const { key: dd, val: didx } = divHeap.popMin()
+        if (divSettled[didx]) continue
+        divSettled[didx] = 1
+        const face = (didx / (RES * RES)) | 0
+        const rem  = didx % (RES * RES)
+        const dy   = (rem / RES) | 0
+        const dx   = rem % RES
+        for (let d = 0; d < 8; d++) {
+          neighborTexel(face, dx, dy, ddx8[d] as -1|0|1, ddy8[d] as -1|0|1, RES, divNbr)
+          const ni = texelIndex(divNbr.face, divNbr.x, divNbr.y, RES)
+          if (divSettled[ni]) continue
+          const cost = (ddx8[d] !== 0 && ddy8[d] !== 0) ? DDIAG : DORTH
+          const nd = dd + cost
+          if (nd < divergentDist[ni]) {
+            divergentDist[ni] = nd
+            divHeap.push(nd, ni)
+          }
+        }
+      }
+    }
+
+    // ---- Step 2: Build crustAge field ----
+    // crustAge: 0 = freshest (divergent zones), 1 = oldest (cratons far from ridges)
+    const crustAge = new Float32Array(TOTAL_TEXELS)
+    for (let i = 0; i < TOTAL_TEXELS; i++) {
+      const d = divergentDist[i]
+      crustAge[i] = d >= INF * 0.5 ? 1.0 : Math.min(1.0, d / AGE_SCALE)
+    }
+    // Light blur for C1-friendliness
+    this._crustAge = blurFieldN(crustAge, 2)
+
+    // ---- Step 3: Build rockHardness field ----
+    // Blend four terms into a [0,1] hardness value per texel:
+    //   (a) Age term: young divergent = hard basalt (0.85), stable craton = medium (0.55),
+    //       very old sediment-covered = soft (0.35). Uses a tent: peaks at freshest.
+    //       hardAge = lerp(0.55, 0.85, 1 - age) for age < 0.5;
+    //                 lerp(0.55, 0.35, (age - 0.5) / 0.5) for age >= 0.5
+    //   (b) Volcanic arc proximity: convField > VOLC_THRESH → high hardness (0.90)
+    //       blended in smoothly. This covers arc crust and near-volcanic areas.
+    //   (c) Crust type: oceanic basalt (crustDist < 0) → +0.10 offset; continental
+    //       sediment cover (crustDist > 0.05) → -0.10 offset.
+    //   (d) FBM break-up: ±HARD_FBM_AMP amplitude noise to break up iso-contours.
+    const hardnessRaw = new Float32Array(TOTAL_TEXELS)
+    const dirScratch  = new Vector3()
+
+    for (let i = 0; i < TOTAL_TEXELS; i++) {
+      const face = (i / (RES * RES)) | 0
+      const rem  = i % (RES * RES)
+      const ty   = (rem / RES) | 0
+      const tx   = rem % RES
+      texelToDir(face, tx, ty, RES, dirScratch)
+
+      // (a) Age term
+      const age = this._crustAge[i]
+      let hardAge: number
+      if (age < 0.5) {
+        // Fresh crust (0=divergent) → hard basalt; towards mid-age → medium
+        hardAge = 0.55 + (0.85 - 0.55) * (1 - age * 2)
+      } else {
+        // Old craton → medium; very old sediment-draped → softer
+        hardAge = 0.55 - (0.55 - 0.35) * ((age - 0.5) * 2)
+      }
+
+      // (b) Volcanic arc proximity (using convField as proxy — high conv = subduction/arc)
+      const conv = this._convField[i]
+      const volcFrac = Math.max(0, Math.min(1, (conv - VOLC_THRESH) / (1.0 - VOLC_THRESH)))
+      const hardVolc = 0.90  // hardness near volcanic arc (fresh igneous)
+      const hardB = hardAge + volcFrac * (hardVolc - hardAge)
+
+      // (c) Crust-type offset: oceanic basalt harder than continental sediment cover
+      const cd = this._crustDist[i]
+      // crustDist < 0 = oceanic side (basalt), > 0 = continental side (sediment)
+      const crustOffset = cd < 0 ? 0.08 : (cd > 0.05 ? -0.08 : 0)
+      const hardC = hardB + crustOffset
+
+      // (d) FBM break-up
+      const fbmVal = fbm(
+        this._hardnessNoise,
+        dirScratch.x * HARD_FBM_FREQ,
+        dirScratch.y * HARD_FBM_FREQ,
+        dirScratch.z * HARD_FBM_FREQ,
+        { octaves: 4 },
+      )
+      const hardD = hardC + HARD_FBM_AMP * fbmVal
+
+      hardnessRaw[i] = Math.max(0, Math.min(1, hardD))
+    }
+
+    // ---- Step 4: Apply box blur for C1-friendliness (3 passes) ----
+    const hardnessBlurred = blurFieldN(hardnessRaw, 3)
+
+    // ---- Step 5: Scale contrast by composition ----
+    // contrastScale: 0=icy/sediment → flat near 0.5; 1=rocky/basaltic → full range.
+    // lerp(0.25, 1.0, composition)
+    const contrastScale = 0.25 + 0.75 * composition
+    const HARD_MEAN = 0.5
+    const rockHardness = new Float32Array(TOTAL_TEXELS)
+    for (let i = 0; i < TOTAL_TEXELS; i++) {
+      const h = HARD_MEAN + (hardnessBlurred[i] - HARD_MEAN) * contrastScale
+      rockHardness[i] = Math.max(0, Math.min(1, h))
+    }
+
+    this._rockHardness = rockHardness
+  }
+
+  // ---------------------------------------------------------------------------
   // _bakeVolcanoes — one-time bake of subduction-arc volcano positions
   // ---------------------------------------------------------------------------
 
   private _bakeVolcanoes(seed: number, arcDensity: number, hotspotCount: number, hotspotIntensity: number): void {
     // Reset hotspots at top so early-exit paths always leave a clean state.
     this._hotspots = []
+    // Volcano constants are ANGULAR (radians) — scale-invariant under uniform planet scale.
+    // No volScaleFactor needed: same angular cone at 500 km looks identical to 50 km.
     const ARC_CONV_THRESH_EFF = ARC_CONV_THRESH / arcDensity
     const ARC_SPACING_EFF     = ARC_SPACING / arcDensity
 
@@ -2557,6 +2756,7 @@ export class Tectonics {
       // Widening the floor + trimming the height top keeps the steepest flank's
       // 120 m delta comfortably under 0.10 with no exemption, and (with the
       // headroom blend) keeps cordillera summits ≤ ~0.95.
+      // Angular constants — no RADIUS scaling needed (uniform-scale-invariant).
       const baseRadius      = (0.054 + (0.070 - 0.054) * convStrength) * rJitter  // floor raised 0.024->0.054: gentler cone flanks keep 120 m step < 0.10 even where a breaching cone sits on the coast shelf
       const height          = (0.37  + (0.62  - 0.37)  * convStrength) * hJitter  // [was 0.55..0.95] de-saturation — ocean cones still breach, land cones modest
       const craterRadiusFrac = 0.12 + cfJitter
@@ -2717,6 +2917,9 @@ export class Tectonics {
     volCraterFrac: number[],
   ): void {
     if (hotspotCount === 0) return
+
+    // Volcano constants are ANGULAR (radians) — scale-invariant under uniform planet scale.
+    // No volScaleFactor needed.
 
     // Seeded RNG streams — created ONCE before the per-hotspot loop (determinism).
     const posRng = makeRng(deriveSeed(seed, 16))
@@ -3184,7 +3387,35 @@ export class Tectonics {
     const gradStrength = _ss(1e-6, 5e-6, gLen * gLen)
     out.otherCrustDist = out.crustDist + gradStrength * (mirroredCrustDist - out.crustDist)
 
+    // rockHardness: C1 bilinear sample from baked grid using domain-warped direction w
+    out.rockHardness = this._sampleC1(this._rockHardness, w)
+
     return out
+  }
+
+  /**
+   * Query substrate rock hardness at direction `dir`.
+   * Returns [0,1]: 1=hard fresh igneous/volcanic, 0=soft sediment/basin.
+   * Pure baked-grid lookup — identical on main thread and workers (no live noise).
+   * Uses the same domain-warp as query() for spatial continuity.
+   */
+  hardnessAt(dir: { x: number; y: number; z: number }): number {
+    const wn = this._warpNoise
+    const w  = this._warpedDir
+
+    const dx = fbm(wn, dir.x + WARP_O1.x, dir.y + WARP_O1.y, dir.z + WARP_O1.z,
+      { octaves: WARP_OCTAVES, frequency: WARP_FREQ })
+    const dy = fbm(wn, dir.x + WARP_O2.x, dir.y + WARP_O2.y, dir.z + WARP_O2.z,
+      { octaves: WARP_OCTAVES, frequency: WARP_FREQ })
+    const dz = fbm(wn, dir.x + WARP_O3.x, dir.y + WARP_O3.y, dir.z + WARP_O3.z,
+      { octaves: WARP_OCTAVES, frequency: WARP_FREQ })
+    w.set(
+      dir.x + WARP_AMP * dx,
+      dir.y + WARP_AMP * dy,
+      dir.z + WARP_AMP * dz,
+    ).normalize()
+
+    return this._sampleC1(this._rockHardness, w)
   }
 
   // ---------------------------------------------------------------------------
@@ -3295,6 +3526,7 @@ export class Tectonics {
       hotspotPos,
       hotspotIntensityArr,
       hotspotIsChain,
+      rockHardness:     this._rockHardness,
     }
   }
 
@@ -3310,17 +3542,20 @@ export class Tectonics {
     ;(t as any)._arcDensity       = b.arcDensity
     ;(t as any)._hotspotCount     = b.hotspotCount
     ;(t as any)._hotspotIntensity = b.hotspotIntensity
+    // _composition: not in baked (not needed at query time); default to 0.5 for fromBaked instances
+    ;(t as any)._composition      = 0.5
 
     // ---- 1. Baked typed-array fields ----------------------------------------
-    ;(t as any)._compId     = b.compId
-    ;(t as any)._distField  = b.distField
-    ;(t as any)._neighborId = b.neighborId
-    ;(t as any)._crustDist  = b.crustDist
-    ;(t as any)._paleoDist  = b.paleoDist
-    ;(t as any)._convField   = b.convField
-    ;(t as any)._shearField  = b.shearField
-    ;(t as any)._upliftField = b.upliftField
+    ;(t as any)._compId        = b.compId
+    ;(t as any)._distField     = b.distField
+    ;(t as any)._neighborId    = b.neighborId
+    ;(t as any)._crustDist     = b.crustDist
+    ;(t as any)._paleoDist     = b.paleoDist
+    ;(t as any)._convField     = b.convField
+    ;(t as any)._shearField    = b.shearField
+    ;(t as any)._upliftField   = b.upliftField
     ;(t as any)._baseElevField = b.baseElevField
+    ;(t as any)._rockHardness  = b.rockHardness
 
     // ---- 2. Volcano flat arrays and spatial index ---------------------------
     ;(t as any)._volPos        = b.volPos
@@ -3370,11 +3605,15 @@ export class Tectonics {
       color:         [pw.color[0], pw.color[1], pw.color[2]] as [number, number, number],
     }))
 
-    // ---- 4. Rebuild noise closures from seed (streams 5, 13, 18) -----------
+    // ---- 4. Rebuild noise closures from seed (streams 5, 13, 18, 19) -----------
     // Exact derivation mirrors the constructor.
-    ;(t as any)._warpNoise     = createNoise3D(deriveSeed(b.seed, 5))
-    ;(t as any)._fineWarpNoise = createNoise3D(deriveSeed(b.seed, 13))
-    ;(t as any)._volNoise      = createNoise3D(deriveSeed(b.seed, 18))
+    ;(t as any)._warpNoise      = createNoise3D(deriveSeed(b.seed, 5))
+    ;(t as any)._fineWarpNoise  = createNoise3D(deriveSeed(b.seed, 13))
+    ;(t as any)._volNoise       = createNoise3D(deriveSeed(b.seed, 18))
+    // _hardnessNoise is only needed during _bakeHardness (constructor-time),
+    // not at query time (rockHardness is a pure baked-grid lookup). Assign a
+    // stub so the field is defined; it will never be called on fromBaked instances.
+    ;(t as any)._hardnessNoise  = createNoise3D(deriveSeed(b.seed, 19))
 
     // ---- 5. Preallocated scratch — class field initialisers were NOT run ----
     // query() uses: _warpedDir, _smoothScratch, _crustScratch,
@@ -3406,7 +3645,7 @@ export class Tectonics {
     ;(t as any)._volScratchTexel   = { face: 0, x: 0, y: 0 }
     ;(t as any)._bakeQueryScratch  = {
       plateId: 0, neighborId: 0, boundaryDist: 0, convergence: 0,
-      shear: 0, crustDist: 0, paleoDist: 0, otherCrustDist: 0, baseElevation: 0,
+      shear: 0, crustDist: 0, paleoDist: 0, otherCrustDist: 0, baseElevation: 0, rockHardness: 0,
     }
     ;(t as any)._bakeDirScratch    = new Vector3()
 

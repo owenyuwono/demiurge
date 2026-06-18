@@ -5,6 +5,7 @@
 import type { TectonicsBaked } from './tectonics'
 import type { ClimateBaked } from './climate'
 import type { ErosionBaked } from './erosion'
+import type { SubsurfaceBaked } from './subsurface'
 
 /** main → worker, once on startup: everything needed to rebuild the terrain sampler. */
 export interface InitMsg {
@@ -30,6 +31,8 @@ export interface InitMsg {
   climate: ClimateBaked
   /** Baked erosion field (worker reconstructs via Erosion.fromBaked). */
   erosion?: ErosionBaked
+  /** Baked subsurface field (worker reconstructs via Subsurface.fromBaked). */
+  subsurface?: SubsurfaceBaked
   /**
    * Waterline elevation in the same normalized units as heightFn output (~[-1,1]).
    * Computed once on the main thread via Fibonacci-sphere hypsometry and shipped
@@ -76,6 +79,9 @@ export interface DoneMsg {
   colors: ArrayBuffer
   plateColors: ArrayBuffer | null
   climateMoist: ArrayBuffer | null
+  subsurfaceWet: ArrayBuffer | null
+  /** Per-vertex rock hardness scalar in [0,1]. null when tectonics not available. */
+  rockHardness: ArrayBuffer | null
   indices: ArrayBuffer
   originX: number
   originY: number
