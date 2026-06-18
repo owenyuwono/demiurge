@@ -25,7 +25,10 @@ import {
   Loop,
   asin,
   atan,
+  cameraFar,
+  cameraNear,
   cameraPosition,
+  cameraViewMatrix,
   clamp,
   cos,
   dot,
@@ -35,6 +38,7 @@ import {
   instanceIndex,
   interleavedGradientNoise,
   length,
+  logarithmicDepthToViewZ,
   max,
   min,
   mix,
@@ -56,6 +60,7 @@ import {
   uniform,
   uvec3,
   vec2,
+  viewportDepthTexture,
   vec3,
   vec4,
 } from 'three/tsl'
@@ -227,6 +232,14 @@ export class VolumetricClouds {
    * so the unused path costs nothing at runtime). Default 0 (off) for safety.
    */
   private readonly _uUseCache = uniform(0.0)
+
+  /**
+   * Depth-occlusion toggle (0 = clouds always in front; 1 = clamp the march to the scene
+   * depth so terrain occludes clouds behind it). Reads the LOG-encoded scene depth and decodes
+   * it with logarithmicDepthToViewZ. Default 0 (off): a broken/empty depth read would clamp the
+   * march to ~near and erase all clouds, so it ships off until visually verified.
+   */
+  private readonly _uDepthOcclude = uniform(0.0)
 
   /**
    * Debug "cloud map" mode (0 = volumetric raymarch; 1 = flat coverage heatmap + contour
@@ -426,6 +439,8 @@ export class VolumetricClouds {
   setAmbient(v: number):      void { this._uAmbient.value      = v }
   /** Convective cloud-type strength (0 = uniform; 1 = full stratus↔cumulonimbus variety). */
   setTypeStrength(v: number): void { this._uTypeStrength.value = v }
+  /** Depth occlusion: clamp the march to scene depth so terrain occludes clouds behind it. */
+  setDepthOcclude(v: boolean): void { this._uDepthOcclude.value = v ? 1 : 0 }
 
   /**
    * Thin alias for setCloudBase — kept for Planet API compatibility.
@@ -721,6 +736,7 @@ export class VolumetricClouds {
     const uCloudBase    = this._uCloudBase
     const uCloudThick   = this._uCloudThick
     const uUseCache     = this._uUseCache
+    const uDepthOcclude = this._uDepthOcclude
     const uDebugMode    = this._uDebugMode
     const windTex       = this._windTex!
     const favTex        = this._favTex!
@@ -1112,14 +1128,20 @@ export class VolumetricClouds {
         .and(inInnerSphere.not())
       const tExit0 = select(useInnerExit, innerT0, outerT1)
 
-      // Depth occlusion: skip the viewportLinearDepth clamp.
-      // The renderer uses logarithmicDepthBuffer:true, so terrain writes log-encoded
-      // depth. viewportLinearDepth decodes via the standard perspective inverse —
-      // the two don't compose, making tScene garbage and erasing most clouds.
-      // We use tExit0 directly. This is correct: cloudBase >= heightScale*1.2 (~14.4 km)
-      // sits above all terrain relief (~12 km), so clouds-always-in-front is right
-      // from orbit and from the surface looking up.
-      const tExit = tExit0
+      // Depth occlusion (toggleable, default OFF via uDepthOcclude). The renderer uses
+      // logarithmicDepthBuffer, so terrain writes LOG-encoded depth — viewportLinearDepth
+      // (perspective inverse) is WRONG for it; logarithmicDepthToViewZ is the matching decode
+      // (three r182). Read the scene depth at this pixel, convert to a distance along the view
+      // ray, and clamp the march to it so terrain correctly OCCLUDES clouds behind it (fixes
+      // the surface-view "clouds drawn on top of a nearer mountain" bug). Off by default: a
+      // broken/empty depth read decodes to ~near and would clamp the march to nothing, erasing
+      // all clouds — enable in the GUI to verify, then flip the default.
+      const sceneViewZ = logarithmicDepthToViewZ(viewportDepthTexture(), cameraNear, cameraFar) // <0
+      const rdViewZ    = cameraViewMatrix.mul(vec4(rd, 0)).z                                     // <0
+      // Along the ray viewZ(t) = t·rdViewZ (camera is the view origin) → tScene = sceneViewZ/rdViewZ.
+      // Guard rdViewZ away from 0 (near-perpendicular rays) so the divide can't blow up.
+      const tScene = sceneViewZ.div(min(rdViewZ, float(-1e-4)))                                  // >0
+      const tExit  = select(uDepthOcclude.greaterThan(0.5), min(tExit0, tScene), tExit0)
 
       // No valid annulus segment: outer sphere not hit, or segment is degenerate
       const noHit = discOuter.lessThanEqual(float(0)).or(tExit.lessThanEqual(tEnter))

@@ -1067,6 +1067,8 @@ export class Planet extends Group {
   setCloudAmbient(v: number): void     { this.cloudShell.setAmbient(v) }
   /** Live — mutates convective cloud-type strength uniform, no rebuild. */
   setCloudType(v: number): void        { this.cloudShell.setTypeStrength(v) }
+  /** Live — toggles cloud depth occlusion (terrain occludes clouds behind it), no rebuild. */
+  setCloudDepthOcclude(v: boolean): void { this.cloudShell.setDepthOcclude(v) }
 
   // ---------------------------------------------------------------------------
   // Atmosphere public API

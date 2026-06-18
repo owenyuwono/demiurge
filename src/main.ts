@@ -366,6 +366,9 @@ async function main(): Promise<void> {
     cloudType:         0.6,
     // 3D density cache (compute-baked). Off by default (experimental); toggle on to remove grain.
     cloudCache:        false,
+    // Depth occlusion (terrain occludes clouds behind it). Off by default — enable to verify;
+    // a broken depth read would erase the clouds, so it ships off.
+    cloudDepthOcclude: false,
     // Erosion bake parameters — onFinishChange triggers rebake on release.
     // Default matches deriveErosionRes(RADIUS) = 256 so slider and first bake agree.
     erosionRes: deriveErosionRes(RADIUS) as 128 | 256 | 512,
@@ -821,6 +824,9 @@ async function main(): Promise<void> {
   cloudFolder.add(ui, 'cloudCache').name('density cache (experimental — blocky)').onChange((v: boolean) => {
     planet.setCloudUseCache(v)
   })
+  cloudFolder.add(ui, 'cloudDepthOcclude').name('depth occlusion (terrain in front)').onChange((v: boolean) => {
+    planet.setCloudDepthOcclude(v)
+  })
 
   // Atmosphere shell — always-on appearance (not a view mode); all sliders are live (no rebake).
   const atmosphereFolder = tabbed.atmosphereGui.addFolder('Atmosphere shell')
@@ -945,6 +951,7 @@ async function main(): Promise<void> {
   // Give the cloud layer the renderer (for its compute bake pass) and apply the cache toggle.
   planet.setCloudRenderer(renderer)
   planet.setCloudUseCache(ui.cloudCache)
+  planet.setCloudDepthOcclude(ui.cloudDepthOcclude)
 
   // Initialise view-gated visibility at startup (cloud shell, wind overlays, debug views).
   // Without this the cloud shell stays hidden on load until the view is changed, because
