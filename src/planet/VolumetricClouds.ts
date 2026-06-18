@@ -3,7 +3,6 @@ import {
   DataTexture,
   DoubleSide,
   FrontSide,
-  HalfFloatType,
   LinearFilter,
   Matrix3,
   Mesh,
@@ -11,13 +10,12 @@ import {
   Object3D,
   Quaternion,
   RGBAFormat,
-  RedFormat,
   RepeatWrapping,
   SphereGeometry,
   UnsignedByteType,
   Vector3,
 } from 'three'
-import { MeshBasicNodeMaterial, Storage3DTexture } from 'three/webgpu'
+import { MeshBasicNodeMaterial } from 'three/webgpu'
 import {
   Break,
   Fn,
@@ -25,20 +23,15 @@ import {
   Loop,
   asin,
   atan,
-  cameraFar,
-  cameraNear,
   cameraPosition,
-  cameraViewMatrix,
   clamp,
   cos,
   dot,
   exp,
   float,
   fwidth,
-  instanceIndex,
   interleavedGradientNoise,
   length,
-  logarithmicDepthToViewZ,
   max,
   min,
   mix,
@@ -55,12 +48,8 @@ import {
   smoothstep,
   sqrt,
   texture,
-  texture3D,
-  textureStore,
   uniform,
-  uvec3,
   vec2,
-  viewportDepthTexture,
   vec3,
   vec4,
 } from 'three/tsl'
@@ -122,13 +111,6 @@ interface _FavScratch {
   wN_pos: WindSample
   wN_neg: WindSample
 }
-
-// 3D density-cache resolution: (longitude × latitude × altitude) over the cloud shell.
-// Anisotropic — the annulus is thin, so altitude needs fewer slices than the lon/lat
-// directions. r16float, so memory = LON·LAT·ALT·2 bytes (256·128·48 ≈ 3 MB).
-const CACHE_LON = 256
-const CACHE_LAT = 128
-const CACHE_ALT = 48
 
 export class VolumetricClouds {
   private readonly _scene: { add: (...o: Object3D[]) => unknown; remove: (...o: Object3D[]) => unknown }
@@ -227,21 +209,6 @@ export class VolumetricClouds {
   private readonly _uTypeStrength = uniform(0.6)
 
   /**
-   * 3D density cache toggle (0 = procedural per-step noise; 1 = sample the compute-baked
-   * 3D density texture). Live uniform — the fragment branches on it (uniform control flow,
-   * so the unused path costs nothing at runtime). Default 0 (off) for safety.
-   */
-  private readonly _uUseCache = uniform(0.0)
-
-  /**
-   * Depth-occlusion toggle (0 = clouds always in front; 1 = clamp the march to the scene
-   * depth so terrain occludes clouds behind it). Reads the LOG-encoded scene depth and decodes
-   * it with logarithmicDepthToViewZ. Default 0 (off): a broken/empty depth read would clamp the
-   * march to ~near and erase all clouds, so it ships off until visually verified.
-   */
-  private readonly _uDepthOcclude = uniform(0.0)
-
-  /**
    * Debug "cloud map" mode (0 = volumetric raymarch; 1 = flat coverage heatmap + contour
    * outlines). Used by the 'cloud' view to study cloud formation/topology cheaply (one
    * density sample per pixel, no march).
@@ -263,16 +230,6 @@ export class VolumetricClouds {
   private _mat:     MeshBasicNodeMaterial | null = null
   private _windTex: DataTexture | null = null
   private _favTex:  DataTexture | null = null
-
-  // 3D density cache (compute-baked). Off by default; toggled via setUseCache().
-  private _cacheTex:    Storage3DTexture | null = null
-  /** Compute node that fills _cacheTex; re-dispatched every _bakeInterval frames. */
-  private _bakeNode:    unknown = null
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  private _renderer:    { compute: (n: any) => unknown } | null = null
-  private _useCache     = false
-  private _bakeCounter  = 0
-  private readonly _bakeInterval = 20   // re-bake every N frames (clouds drift slowly)
 
   private _visible = false
 
@@ -342,44 +299,6 @@ export class VolumetricClouds {
    *  isolate clouds onto their own render layer for the offscreen pass. Null before first build. */
   getMesh(): Mesh | null { return this._mesh }
 
-  // ---------------------------------------------------------------------------
-  // 3D density cache control
-  // ---------------------------------------------------------------------------
-
-  /** Provide the WebGPURenderer so the cloud layer can dispatch its bake compute pass. */
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  setRenderer(r: { compute: (n: any) => unknown }): void { this._renderer = r }
-
-  /**
-   * Toggle the compute-baked 3D density cache. ON → cheap trilinear lookups, dither off,
-   * no grain. Live (a uniform branch) — no rebuild. Resets the bake counter so the next
-   * maybeBake() re-fills the cache immediately (it's stale/empty when first switched on).
-   */
-  setUseCache(v: boolean): void {
-    this._useCache = v
-    this._uUseCache.value = v ? 1 : 0
-    this._bakeCounter = 0
-  }
-
-  /**
-   * Re-dispatch the density bake every _bakeInterval frames (and immediately when first
-   * enabled). Call once per frame from the render loop AFTER update() (so uTime/advection
-   * are current). No-op when the cache is off, hidden, or the renderer isn't set.
-   */
-  maybeBake(): void {
-    if (!this._useCache || !this._visible || this._bakeNode === null || this._renderer === null) return
-    if (this._bakeCounter % this._bakeInterval === 0) {
-      try {
-        this._renderer.compute(this._bakeNode)
-      } catch (e) {
-        // A bad bake must never take down the render loop — fall back to procedural.
-        console.warn('[clouds] density-cache bake failed; disabling cache', e)
-        this.setUseCache(false)
-      }
-    }
-    this._bakeCounter++
-  }
-
   /** Live — mutates uniform, no rebuild. */
   setCoverage(v: number):    void { this._uCoverage.value    = v }
   setScrollSpeed(v: number): void { this._uScrollSpeed.value = v }
@@ -443,8 +362,6 @@ export class VolumetricClouds {
   setAmbient(v: number):      void { this._uAmbient.value      = v }
   /** Convective cloud-type strength (0 = uniform; 1 = full stratus↔cumulonimbus variety). */
   setTypeStrength(v: number): void { this._uTypeStrength.value = v }
-  /** Depth occlusion: clamp the march to scene depth so terrain occludes clouds behind it. */
-  setDepthOcclude(v: boolean): void { this._uDepthOcclude.value = v ? 1 : 0 }
 
   /**
    * Thin alias for setCloudBase — kept for Planet API compatibility.
@@ -739,8 +656,6 @@ export class VolumetricClouds {
     const uOpacity      = this._uOpacity
     const uCloudBase    = this._uCloudBase
     const uCloudThick   = this._uCloudThick
-    const uUseCache     = this._uUseCache
-    const uDepthOcclude = this._uDepthOcclude
     const uDebugMode    = this._uDebugMode
     const windTex       = this._windTex!
     const favTex        = this._favTex!
@@ -958,77 +873,10 @@ export class VolumetricClouds {
       return coverage.mul(profileT).mul(mix(float(0.3), float(1.0), mottle)).mul(typeDensity)
     })
 
-    // ---------------------------------------------------------------------------
-    // 3D density cache (compute-baked). densityCore is expensive (2× Worley/sample);
-    // baking it into a 3D texture lets the march read cheap trilinear lookups, so we can
-    // drop the dither (the cache is smooth) and afford many steps → no grain.
-    // Parameterized as (longitude × latitude × altitude) over the shell, in planet-LOCAL
-    // frame (so it rides the planet spin via uInvRot at sample time — no re-bake for spin).
-    // ---------------------------------------------------------------------------
-    const cacheTex = new Storage3DTexture(CACHE_LON, CACHE_LAT, CACHE_ALT)
-    cacheTex.format    = RedFormat       // single channel
-    cacheTex.type      = HalfFloatType   // → r16float (guaranteed trilinear-filterable)
-    cacheTex.wrapS     = RepeatWrapping        // longitude wraps
-    cacheTex.wrapT     = ClampToEdgeWrapping   // latitude clamps at the poles
-    cacheTex.wrapR     = ClampToEdgeWrapping   // altitude clamps
-    cacheTex.minFilter = LinearFilter
-    cacheTex.magFilter = LinearFilter
-    this._cacheTex = cacheTex
-
-    const TWO_PI_C = float(2 * Math.PI)
-    const PI_C     = float(Math.PI)
-
-    // Bake kernel — one invocation per texel. Decode the 1-D dispatch index into
-    // (lon, lat, alt), reconstruct the planet-local direction + radius (inverting the
-    // densityCore equirect UV convention exactly), evaluate densityCore, store to .r.
-    // Texture sampling inside compute is handled automatically by TSL (textureSampleLevel 0).
-    const bakeFn = Fn(() => {
-      const xi = instanceIndex.mod(CACHE_LON)
-      const yi = instanceIndex.div(CACHE_LON).mod(CACHE_LAT)
-      const zi = instanceIndex.div(CACHE_LON * CACHE_LAT)
-
-      const uu = float(xi).add(0.5).div(CACHE_LON)
-      const vv = float(yi).add(0.5).div(CACHE_LAT)
-      const ww = float(zi).add(0.5).div(CACHE_ALT)
-
-      const lon    = uu.sub(0.5).mul(TWO_PI_C)
-      const lat    = vv.sub(0.5).mul(PI_C)
-      const cosLat = cos(lat)
-      const dLocal = vec3(cosLat.mul(sin(lon)), sin(lat), cosLat.mul(cos(lon)))
-
-      const innerMul_b = min(uCloudBase, float(2.4))
-      const outerMul_b = min(uCloudBase.add(uCloudThick), float(2.45))
-      const innerR_b   = RADIUS_C.add(HEIGHT_SCALE_C.mul(innerMul_b))
-      const outerR_b   = RADIUS_C.add(HEIGHT_SCALE_C.mul(outerMul_b))
-      const pLen       = innerR_b.add(ww.mul(outerR_b.sub(innerR_b)))
-
-      const d = densityCore(dLocal, pLen)
-      textureStore(cacheTex, uvec3(xi, yi, zi), vec4(d, 0, 0, 1))
-    })
-    this._bakeNode = bakeFn().compute(CACHE_LON * CACHE_LAT * CACHE_ALT)
-
-    // Cheap cache lookup at a world point: world → local dir + altitude → trilinear tap.
-    const sampleCache = (p: NodeLike): NodeF => {
-      const dLocal = normalize(uInvRot.mul(p))
-      const u = atan(dLocal.x, dLocal.z).mul(INV_2PI).add(0.5)
-      const v = asin(clamp(dLocal.y, -1, 1)).mul(INV_PI).add(0.5)
-      const innerR_c = RADIUS_C.add(HEIGHT_SCALE_C.mul(min(uCloudBase, float(2.4))))
-      const outerR_c = RADIUS_C.add(HEIGHT_SCALE_C.mul(min(uCloudBase.add(uCloudThick), float(2.45))))
-      const w = clamp(length(p).sub(innerR_c).div(outerR_c.sub(innerR_c)), 0, 1)
-      return texture3D(cacheTex, vec3(u, v, w)).r
-    }
-
-    // World-space density used by the march. Branches on the cache toggle (uniform control
-    // flow → the unused branch costs nothing at runtime). Cache off → procedural densityCore.
-    const density = Fn<readonly [NodeLike]>(([p]) => {
-      const out = float(0.0).toVar()
-      If(uUseCache.greaterThan(0.5), () => {
-        out.assign(sampleCache(p))
-      }).Else(() => {
-        out.assign(densityCore(normalize(uInvRot.mul(p)), length(p)))
-      })
-      return out
-    })
+    // World-space density used by the march: world point → planet-LOCAL dir + radius → cloud fraction.
+    const density = Fn<readonly [NodeLike]>(([p]) =>
+      densityCore(normalize(uInvRot.mul(p)), length(p)),
+    )
 
     // ---------------------------------------------------------------------------
     // Ray-vs-sphere intersector — returns vec2(tNear, tFar) for sphere of radius R.
@@ -1130,22 +978,10 @@ export class VolumetricClouds {
       const useInnerExit = discInner.greaterThan(float(0))
         .and(innerT0.greaterThan(tEnter))
         .and(inInnerSphere.not())
-      const tExit0 = select(useInnerExit, innerT0, outerT1)
-
-      // Depth occlusion (toggleable, default OFF via uDepthOcclude). The renderer uses
-      // logarithmicDepthBuffer, so terrain writes LOG-encoded depth — viewportLinearDepth
-      // (perspective inverse) is WRONG for it; logarithmicDepthToViewZ is the matching decode
-      // (three r182). Read the scene depth at this pixel, convert to a distance along the view
-      // ray, and clamp the march to it so terrain correctly OCCLUDES clouds behind it (fixes
-      // the surface-view "clouds drawn on top of a nearer mountain" bug). Off by default: a
-      // broken/empty depth read decodes to ~near and would clamp the march to nothing, erasing
-      // all clouds — enable in the GUI to verify, then flip the default.
-      const sceneViewZ = logarithmicDepthToViewZ(viewportDepthTexture(), cameraNear, cameraFar) // <0
-      const rdViewZ    = cameraViewMatrix.mul(vec4(rd, 0)).z                                     // <0
-      // Along the ray viewZ(t) = t·rdViewZ (camera is the view origin) → tScene = sceneViewZ/rdViewZ.
-      // Guard rdViewZ away from 0 (near-perpendicular rays) so the divide can't blow up.
-      const tScene = sceneViewZ.div(min(rdViewZ, float(-1e-4)))                                  // >0
-      const tExit  = select(uDepthOcclude.greaterThan(0.5), min(tExit0, tScene), tExit0)
+      // No scene-depth clamp: cloudBase ≥ heightScale·1.2 (~14.4 km) sits above all terrain
+      // relief (~12 km), so clouds are always in front — terrain occlusion is a no-op here
+      // (tried it: changed nothing visible) and not worth the log-depth decode.
+      const tExit = select(useInnerExit, innerT0, outerT1)
 
       // No valid annulus segment: outer sphere not hit, or segment is degenerate
       const noHit = discOuter.lessThanEqual(float(0)).or(tExit.lessThanEqual(tEnter))
@@ -1210,13 +1046,12 @@ export class VolumetricClouds {
         const lightStep   = annulusHalf.div(float(uLightSteps))
 
         // Blue-noise (interleaved gradient noise) ray-start dither — breaks step banding.
-        // Amplitude 0.3 normally; ZERO when the cache is on (its trilinear-smooth density
-        // has no high-frequency banding to hide, so the dither would only add grain).
-        // NB: screen-locked/static — it redistributes undersampling error but cannot reduce
-        // it, so a faint stable grain remains. The categorical fix is temporal accumulation
-        // (offscreen history + reproject), which is NOT implemented yet.
+        // Amplitude 0.3. NB: screen-locked/static — it redistributes undersampling error but
+        // cannot reduce it, so a faint stable grain remains. The categorical fix is temporal
+        // accumulation (offscreen history + reproject), which is NOT implemented yet; half-res
+        // (CloudCompositor) softens it cheaply in the meantime.
         const jitter  = interleavedGradientNoise(screenCoordinate.xy)
-        const tCur    = tEnter.add(jitter.mul(float(0.3).sub(uUseCache.mul(0.3))).mul(fineStep)).toVar()
+        const tCur    = tEnter.add(jitter.mul(0.3).mul(fineStep)).toVar()
         const refined = float(0.0).toVar()   // 0 = scouting (big steps), 1 = fine march
 
         Loop(uStepCount, () => {
@@ -1391,11 +1226,6 @@ export class VolumetricClouds {
       this._favTex.dispose()
       this._favTex = null
     }
-    if (this._cacheTex !== null) {
-      this._cacheTex.dispose()
-      this._cacheTex = null
-    }
-    this._bakeNode = null
     this._visible = false
   }
 }

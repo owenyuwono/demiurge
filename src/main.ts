@@ -365,11 +365,6 @@ async function main(): Promise<void> {
     cloudBillowTop:    0.5,
     cloudAmbient:      0.08,
     cloudType:         0.6,
-    // 3D density cache (compute-baked). Off by default (experimental); toggle on to remove grain.
-    cloudCache:        false,
-    // Depth occlusion (terrain occludes clouds behind it). Off by default — enable to verify;
-    // a broken depth read would erase the clouds, so it ships off.
-    cloudDepthOcclude: false,
     // Half-res offscreen cloud pass (Part 2a). Off by default (experimental render-path change).
     cloudHalfRes:      false,
     // Erosion bake parameters — onFinishChange triggers rebake on release.
@@ -824,12 +819,6 @@ async function main(): Promise<void> {
   cloudFolder.add(ui, 'cloudType', 0, 1, 0.01).name('cloud type').onChange((v: number) => {
     planet.setCloudType(v)
   })
-  cloudFolder.add(ui, 'cloudCache').name('density cache (experimental — blocky)').onChange((v: boolean) => {
-    planet.setCloudUseCache(v)
-  })
-  cloudFolder.add(ui, 'cloudDepthOcclude').name('depth occlusion (terrain in front)').onChange((v: boolean) => {
-    planet.setCloudDepthOcclude(v)
-  })
   // Half-res offscreen cloud pass. Bound directly to ui.cloudHalfRes; read in the render loop.
   cloudFolder.add(ui, 'cloudHalfRes').name('half-res (offscreen, exp.)')
 
@@ -953,10 +942,6 @@ async function main(): Promise<void> {
   planet.setCloudBillowTop(ui.cloudBillowTop)
   planet.setCloudAmbient(ui.cloudAmbient)
   planet.setCloudType(ui.cloudType)
-  // Give the cloud layer the renderer (for its compute bake pass) and apply the cache toggle.
-  planet.setCloudRenderer(renderer)
-  planet.setCloudUseCache(ui.cloudCache)
-  planet.setCloudDepthOcclude(ui.cloudDepthOcclude)
 
   // Initialise view-gated visibility at startup (cloud shell, wind overlays, debug views).
   // Without this the cloud shell stays hidden on load until the view is changed, because
@@ -1065,9 +1050,6 @@ async function main(): Promise<void> {
     elapsedS += dt
     planet.setWindTime(elapsedS)
     planet.animateWind(elapsedS, dt)
-    // Re-dispatch the cloud density-cache bake (no-op unless the cache is on). After
-    // animateWind so the advection time uniform the bake reads is current.
-    planet.maybeBakeCloudCache()
 
     // Dispatch input update to whichever controller owns this frame.
     // Only ONE controller's update runs per frame — no double input on the camera.

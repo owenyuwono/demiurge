@@ -1030,11 +1030,6 @@ export class Planet extends Group {
   setCloudCellWeight(v: number): void  { this.cloudShell.setCellWeight(v) }
   /** Debug "cloud map" mode (flat coverage heatmap + contours) for the 'cloud' view. */
   setCloudDebugMode(on: boolean): void { this.cloudShell.setDebugMode(on) }
-  /** 3D density cache: provide the renderer, toggle on/off, and dispatch the periodic bake. */
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  setCloudRenderer(r: { compute: (n: any) => unknown }): void { this.cloudShell.setRenderer(r) }
-  setCloudUseCache(v: boolean): void   { this.cloudShell.setUseCache(v) }
-  maybeBakeCloudCache(): void          { this.cloudShell.maybeBake() }
   /** Live — mutates cloud billow uniform, no rebuild. */
   setCloudBillow(v: number): void      { this.cloudShell.setBillow(v) }
   /** Live — mutates cloud detail uniform, no rebuild. */
@@ -1067,8 +1062,6 @@ export class Planet extends Group {
   setCloudAmbient(v: number): void     { this.cloudShell.setAmbient(v) }
   /** Live — mutates convective cloud-type strength uniform, no rebuild. */
   setCloudType(v: number): void        { this.cloudShell.setTypeStrength(v) }
-  /** Live — toggles cloud depth occlusion (terrain occludes clouds behind it), no rebuild. */
-  setCloudDepthOcclude(v: boolean): void { this.cloudShell.setDepthOcclude(v) }
   /** The cloud shell mesh (for the half-res CloudCompositor's offscreen pass). Null if unbuilt. */
   getCloudMesh(): Mesh | null { return this.cloudShell.getMesh() }
 
