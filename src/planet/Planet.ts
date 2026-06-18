@@ -1069,6 +1069,8 @@ export class Planet extends Group {
   setCloudType(v: number): void        { this.cloudShell.setTypeStrength(v) }
   /** Live — toggles cloud depth occlusion (terrain occludes clouds behind it), no rebuild. */
   setCloudDepthOcclude(v: boolean): void { this.cloudShell.setDepthOcclude(v) }
+  /** The cloud shell mesh (for the half-res CloudCompositor's offscreen pass). Null if unbuilt. */
+  getCloudMesh(): Mesh | null { return this.cloudShell.getMesh() }
 
   // ---------------------------------------------------------------------------
   // Atmosphere public API

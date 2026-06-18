@@ -9,6 +9,7 @@ import { Hud } from './debug/Hud.js'
 import { DEFAULT_INTERIOR } from './planet/interior.js'
 import { TabbedGui } from './debug/TabbedGui.js'
 import { CaveManager } from './planet/CaveManager.js'
+import { CloudCompositor } from './CloudCompositor.js'
 import { RADIUS, HEIGHT_SCALE, HEIGHT_SCALE_REF, deriveErosionRes } from './planet/worldConstants.js'
 
 function getSeedFromUrl(): number {
@@ -369,6 +370,8 @@ async function main(): Promise<void> {
     // Depth occlusion (terrain occludes clouds behind it). Off by default — enable to verify;
     // a broken depth read would erase the clouds, so it ships off.
     cloudDepthOcclude: false,
+    // Half-res offscreen cloud pass (Part 2a). Off by default (experimental render-path change).
+    cloudHalfRes:      false,
     // Erosion bake parameters — onFinishChange triggers rebake on release.
     // Default matches deriveErosionRes(RADIUS) = 256 so slider and first bake agree.
     erosionRes: deriveErosionRes(RADIUS) as 128 | 256 | 512,
@@ -827,6 +830,8 @@ async function main(): Promise<void> {
   cloudFolder.add(ui, 'cloudDepthOcclude').name('depth occlusion (terrain in front)').onChange((v: boolean) => {
     planet.setCloudDepthOcclude(v)
   })
+  // Half-res offscreen cloud pass. Bound directly to ui.cloudHalfRes; read in the render loop.
+  cloudFolder.add(ui, 'cloudHalfRes').name('half-res (offscreen, exp.)')
 
   // Atmosphere shell — always-on appearance (not a view mode); all sliders are live (no rebake).
   const atmosphereFolder = tabbed.atmosphereGui.addFolder('Atmosphere shell')
@@ -1032,11 +1037,15 @@ async function main(): Promise<void> {
     tabbed.controllersRecursive().forEach((c) => c.updateDisplay())
   })
 
+  // --- Half-resolution cloud compositor (Part 2a) — only used when `cloud half-res` is on. ---
+  const cloudCompositor = new CloudCompositor(window.innerWidth, window.innerHeight)
+
   // --- Resize ---
   window.addEventListener('resize', () => {
     camera.aspect = window.innerWidth / window.innerHeight
     camera.updateProjectionMatrix()
     renderer.setSize(window.innerWidth, window.innerHeight)
+    cloudCompositor.setSize(window.innerWidth, window.innerHeight)
   })
 
   // --- Loop ---
@@ -1140,7 +1149,13 @@ async function main(): Promise<void> {
       })
     }
 
-    renderer.render(scene, camera)
+    // Half-res offscreen cloud path (Part 2a) when enabled; otherwise the normal single pass.
+    // The compositor falls back to a plain render when clouds are hidden (non-normal view).
+    if (ui.cloudHalfRes) {
+      cloudCompositor.render(renderer, scene, camera, planet.getCloudMesh())
+    } else {
+      renderer.render(scene, camera)
+    }
 
     // Fade out the loading overlay once a few frames have rendered (by then the WebGPU
     // shader pipelines are compiled and the planet is actually on screen, not black).

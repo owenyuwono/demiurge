@@ -338,6 +338,10 @@ export class VolumetricClouds {
     if (this._mesh !== null) this._mesh.visible = v
   }
 
+  /** The cloud shell mesh (rebuilt on regenerate). Used by the half-res CloudCompositor to
+   *  isolate clouds onto their own render layer for the offscreen pass. Null before first build. */
+  getMesh(): Mesh | null { return this._mesh }
+
   // ---------------------------------------------------------------------------
   // 3D density cache control
   // ---------------------------------------------------------------------------
