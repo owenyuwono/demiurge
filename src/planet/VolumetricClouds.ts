@@ -710,14 +710,15 @@ export class VolumetricClouds {
       // towering, denser, anvil-topped convective cloud; calm dry subtropics → flat thin
       // stratus. Drives DENSITY + an anvil bump only (placement still comes from the weather
       // map below). uTypeStrength=0 → cloudType=0 everywhere = EXACTLY the pre-type behaviour.
-      const convRawT  = favSample.b.mul(2).sub(1)
-      const absYT     = dLocal.y.abs()
-      const itczT     = smoothstep(0.0, 0.22, absYT).oneMinus()
-      const stormT    = saturate(smoothstep(0.55, 0.74, absYT).sub(smoothstep(0.86, 0.96, absYT)))
+      // Shared climate terms — also drive the coverage gate below, so computed once here.
+      const moistTerm = favSample.g
+      const conv      = favSample.b.mul(2).sub(1)
+      const convTerm  = saturate(conv.mul(uConvGain))
+      const absY      = dLocal.y.abs()                                   // |sin(lat)|
+      const itcz      = smoothstep(0.0, 0.22, absY).oneMinus()           // cloudy equator
+      const storm     = saturate(smoothstep(0.55, 0.74, absY).sub(smoothstep(0.86, 0.96, absY))) // ~45-60° tracks
       const cloudType = saturate(
-        saturate(convRawT.mul(uConvGain)).mul(0.55)
-          .add(favSample.g.mul(0.2))
-          .add(max(itczT, stormT).mul(0.35)),
+        convTerm.mul(0.55).add(moistTerm.mul(0.2)).add(max(itcz, storm).mul(0.35)),
       ).mul(uTypeStrength)
 
       // Vertical profile: heightFrac = (|p| - innerR) / (outerR - innerR)
@@ -791,22 +792,14 @@ export class VolumetricClouds {
       // ---------------------------------------------------------------------------
       // Coverage gate using favorability (verbatim from CloudShell)
       // ---------------------------------------------------------------------------
-      // Regional favorability: moisture + wind convergence (negative divergence). Humid /
-      // converging air → cloud; dry / DIVERGING (sinking) air → clear. The sinking branch is
-      // what dries continental interiors → deserts like the Sahara are cloud-free.
-      const moistTerm = favSample.g
-      const conv      = favSample.b.mul(2).sub(1)
-      const convTerm  = saturate(conv.mul(uConvGain))
+      // Regional favorability: moisture + wind convergence (moistTerm/convTerm from the shared
+      // block above). Humid / converging air → cloud; dry / DIVERGING (sinking) air → clear —
+      // the sinking branch dries continental interiors → deserts like the Sahara are cloud-free.
       const fav = saturate(uMoistWeight.mul(moistTerm).add(uConvWeight.mul(convTerm)))
 
-      // Earth-like LATITUDE circulation bands — the DOMINANT large-scale pattern (this is
-      // why real cloud cover is banded, not random). |dLocal.y| = |sin(lat)|: 0=equator,
-      // 0.5≈30°, 0.82≈55°, 1=pole. Cloudy ITCZ (equator) + cloudy mid-latitude storm tracks
-      // (~45-60°); CLEAR subtropical highs (~30°, descending/drying air → the desert belt)
-      // and clear poles. latSigned ∈ [-1,+1]: +1 in the cloud bands, -1 in the clear belts.
-      const absY      = dLocal.y.abs()
-      const itcz      = smoothstep(0.0, 0.22, absY).oneMinus()
-      const storm     = saturate(smoothstep(0.55, 0.74, absY).sub(smoothstep(0.86, 0.96, absY)))
+      // Earth-like LATITUDE circulation bands (absY/itcz/storm from the shared block) — the
+      // DOMINANT large-scale pattern: cloudy ITCZ + mid-lat storm tracks, CLEAR subtropical
+      // desert belts (~30°) and poles. latSigned ∈ [-1,+1]: +1 in cloud bands, -1 in clear belts.
       const latBand   = max(itcz, storm)
       const latSigned = latBand.sub(0.5).mul(2.0)
 

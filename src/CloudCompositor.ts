@@ -124,9 +124,4 @@ export class CloudCompositor {
     cloudMesh.layers.set(0)
     camera.layers.set(0)
   }
-
-  dispose(): void {
-    this._rt.dispose()
-    this._mat.dispose()
-  }
 }
