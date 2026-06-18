@@ -181,7 +181,7 @@ const BUILD_BUDGET_MS = 16        // ms/frame ceiling on meshing
 const LRU_CAPACITY = 8192         // res=32: ~38 KB/chunk × 8192 ≈ 311 MB geometry cache ceiling
 const HYSTERESIS = 0.15 // 15% — SSE merge fires at threshold * (1 + HYSTERESIS)
 const EPS_DIST = 0.1    // minimum camera-to-node distance (prevents div-by-zero at contact)
-const DEBUG_TIMING = false        // set true to log bake timings (erosion etc.) to the console
+const DEBUG_TIMING = true         // set true to log bake timings (erosion etc.) to the console
 
 // ---------------------------------------------------------------------------
 // Planet
@@ -1593,6 +1593,7 @@ export class Planet extends Group {
     // Keep the live climate uniform in sync with the derived surface temperature.
     this._uBaseTemp.value = d.surfaceTemp
 
+    const preT0 = performance.now()
     const tectonics = new Tectonics({
       seed,
       plateCount: d.plateCount,
@@ -1661,6 +1662,7 @@ export class Planet extends Group {
     }
 
     // --- Step 3: bake B (iterated uplift+erode loop) ---------------------------
+    if (DEBUG_TIMING) console.log(`pre-erosion (tectonics+uplift+sampler) ${(performance.now() - preT0).toFixed(1)}ms`)
     const bakeT0 = performance.now()
     const erosion = new Erosion({
       seed,
@@ -1721,6 +1723,7 @@ export class Planet extends Group {
 
     // --- Step 4: rebuild final sampler WITH erosion AND bActive -----------------
     // bActive = true: orogenic stamps are gated off so bDelta owns the elevation budget.
+    const postT0 = performance.now()
     const sampler = makeTerrainSampler({ ...samplerOpts, tectonics, climate, erosion, subsurface, bActive: true })
 
     this.tectonics    = sampler.tectonics
@@ -1775,6 +1778,7 @@ export class Planet extends Group {
       const idx = Math.min(N - 1, Math.floor(d.oceanCoverage * N))
       this._seaLevel = heights[idx]
     }
+    if (DEBUG_TIMING) console.log(`post-erosion (sampler+cave+hypsometry) ${(performance.now() - postT0).toFixed(1)}ms`)
 
     // Tear down any existing pool (handles both constructor first-run and regenerate).
     if (this.pool) {

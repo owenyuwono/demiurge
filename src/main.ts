@@ -85,6 +85,7 @@ async function main(): Promise<void> {
   // uses the same values that main.ts startup code would otherwise set via
   // setInteriorParams / setAxialTilt — those calls become no-ops (identity guard)
   // when the stored values already match, preventing a second full erosion bake.
+  console.time('new Planet (full bake)')
   const planet = new Planet({
     seed,
     radius: RADIUS,
@@ -100,6 +101,7 @@ async function main(): Promise<void> {
     },
     axialTiltDeg: 23.4,   // matches ui.obliquity default
   })
+  console.timeEnd('new Planet (full bake)')
   scene.add(planet)
   setProgress(75, 'Compiling shaders…')
   await nextFrame()
