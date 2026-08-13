@@ -279,7 +279,6 @@ async function main(): Promise<void> {
     targetTriPx: 2.0,
     maxDepth: 18,
     water: true,
-    rivers: true,
     clouds: false,
     // Interior parameters (primary tectonic roots)
     mass: DEFAULT_INTERIOR.mass,
@@ -436,8 +435,6 @@ async function main(): Promise<void> {
     // Cloud shell shows in 'normal' (volumetric) and 'cloud' (flat coverage map + contours).
     planet.setCloudShellVisible((ui.view === 'normal' && ui.clouds) || ui.view === 'cloud')
     planet.setCloudDebugMode(ui.view === 'cloud')
-    // Rivers: overlay only in normal view (hidden in data views), gated by the GUI toggle.
-    planet.setRiversVisible(ui.view === 'normal' && ui.rivers)
   }
 
   function applyWireframe(): void {
@@ -883,7 +880,6 @@ async function main(): Promise<void> {
 
   const waterFolder = tabbed.viewGui.addFolder('Water')
   waterFolder.add(ui, 'water').name('visible').onChange(() => applyWater())
-  waterFolder.add(ui, 'rivers').name('rivers').onChange(() => applyView())
 
   // Apply initial gizmos + water state
   applyGizmos()

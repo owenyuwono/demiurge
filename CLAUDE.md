@@ -52,20 +52,6 @@ Fan/floodplain/delta classifier (`depositEnv` Uint8, ENV_FLOODPLAIN/FAN/DELTA) w
 
 **Caveat — see Known gaps below.** The planet ships on the **B-path** (`bActive:true`; `Planet` always supplies `upliftForcing`), which leaves `depositEnv` all-zero. Fan/floodplain/delta color differentiation is therefore inactive in the rendered planet. Substrate hardness differential erosion IS active.
 
-## Rivers (`RiverNetwork.ts`)
-Rivers are **not a new simulation** — the erosion bake already produces the drainage network as a byproduct of stream-power (`E = K·Q^m·S^n`); `flowAccum`/`flowAt`/`lakeMask` are baked and queryable. Rivers are **two things only**:
-
-1. **The carve (terrain, goes through workers).** `terrainSampler.ts` heightFn subtracts `vIncision = -EROSION_VINCISION_AMP * carveGate * landGate`, `carveGate = _ss3(0.05, 0.45, acc)`. The gate is deliberately **lower-threshold than `chan`** so whole tributary NETWORKS incise, not just a few trunk notches. `flowAccum` is blurred **1 pass** (not 4) in both erosion paths so channels stay sharp enough to reach the gate; `accAt` is C1-sampled so 1 pass still suppresses MFD grid streaks.
-2. **The water (`RiverNetwork.ts`, render-only).** Great-circle streamlines of `erosion.flowAt()` on a `gridRes` cube grid, one pass per reach via a `visited` grid, Catmull-Rom subdivided, swept into a ribbon of width `widthBase + widthScale·√acc`, draped through `heightFn` at `drapeLevel = maxDepth`. Seeds from **channel HEADS** (one step upstream is below threshold) + **aquifer springs** (`waterTableAt > terrain`) — seeding every channel cell makes adjacent traces collide on the `visited` grid and fragments into dashes. Discrete 8-neighbour downstream stepping guarantees converging tributaries share one path. Built main-thread from baked Erosion/Subsurface, added to the Planet group; does NOT touch meshing/workers/`toBaked`. Visible in `normal` view, GUI toggle Water→rivers.
-
-**No river vertex tint, no riparian corridor tint — both were deleted, don't re-add them.** They painted from `accAt` on the 256² bake grid (~3 km/texel at RADIUS=500 km), so a "river" was a several-km-wide colour smear that could never line up with the 0.1–4 km water ribbons, and the riparian green haloed it even wider. Three river representations at three resolutions is what made rivers look bad. Lakes ARE still tinted (`#3a5e7a`) — they have no ribbon geometry.
-
-**Depth is width-limited, not taste-limited.** `EROSION_VINCISION_AMP = 0.03` (≈360 m at `HEIGHT_SCALE`=12 km). The carve gate reads the 256² grid, so the trough is ~6–9 km wide *whatever* the amplitude; 0.08 (≈960 m) gave a 1:8 chasm instead of a valley. To get deeper AND narrower, raise the erosion bake res — don't just raise the amp.
-
-**Open tension — float vs clip.** `RiverParams.fillFraction` (0.7) floats the water surface that fraction of the carve depth above the channel floor, because the traced centerline samples `heightFn` only every `gridRes` texel (~6 km) while the drape is full-detail — terrain between samples pokes through and chops the ribbon into apparent dashes. With the amp back at 0.03 there is less headroom. If dashes return, **raise `fillFraction` toward 0.9, do not raise the amp**; the real fix is re-draping the Catmull-Rom-smoothed points through `heightFn` (≈4× more heightFn calls at bake time), not inflating the valley.
-
-Other knobs: `RiverParams.threshold`/`gridRes`/`widthBase`/`widthScale`/`smoothSub`. Related: per-vertex `subsurfaceWet` (lake + seep) drives `normalMaterial.roughnessNode` → wet specular; `wetness` view (hotkey `8`) shows it on a dry-brown→teal→cyan ramp.
-
 ## Wind system (`climate.ts`)
 `bakeWind()` produces a baked cube-map field (windX/Y/Z + windSpeed) consumed by `windAt(dir, out)` and `windSpeedAt(dir)`.
 
@@ -148,11 +134,12 @@ Never reuse a stream id. All streams are reserved permanently — add new ones a
 - **EROSION_RES:** fixed at 256, not scaled with RADIUS (`deriveErosionRes()` = 256). Scaling to 512+ caused main-thread freeze before first render.
 - **B-path MinHeap / mfdNeighbors allocations:** hoisted out of the per-step loop (byte-identical output).
 - **Wind field is intentionally a static climatological mean for terrain:** `windAt()` / the baked arrays are the millennia-average used by aeolian dunes and `terrainSampler`. The transient animated layer (`windAtTime`) is visualization-only — it never touches terrain, workers, or baked state.
+- **Rivers: removed entirely (2026-08-13, commit "Remove rivers entirely").** Built over 2026-06-19 as four layers, deleted as four layers. **Root cause: the erosion bake is 256² ≈ 3 km/texel at RADIUS=500 km, and a river is ~100 m wide.** Every representation was therefore fighting the grid — an `accAt` vertex tint painted kilometres-wide blue smears, a riparian corridor haloed them wider, the `vIncision` carve could only cut a 6–9 km trough (pushed to 960 m deep chasing visibility → a 1:8 chasm), and `RiverNetwork.ts`'s traced water ribbons registered with none of it. **Don't re-propose rivers until `deriveErosionRes()` can afford ≥1024 (see EROSION_RES above — 512 already froze the main thread), or until drainage is traced analytically at query time instead of sampled off the bake grid.** More paint or a fifth layer will not fix a resolution problem. Full history preserved: checkpoint `4e645dd` (all four layers, working), cut-down `b4d6cca`.
 
 ## Known gaps / caveats
 - **Deposition classifier (fan/floodplain/delta)** lives in the frozen-flow path. The planet always ships on the B-path → `depositEnv` all-zero → fan/floodplain/delta color tints inactive. Open follow-up to route classifier output into the B-path or merge paths.
 - **Erosion `bUpliftRate` fallback:** `erosion.ts` has an internal fallback of `60 * (HEIGHT_SCALE / HEIGHT_SCALE_REF)` if `opts.bUpliftRate` is missing. `Planet.ts` always supplies it as `40 * (heightScale / HEIGHT_SCALE_REF)`, so the fallback is not hit in normal use — but don't silently drop `opts.bUpliftRate`.
-- **HUD `KEYMAP_HELP`** in `Hud.ts` is stale — references only hotkeys 1–4, f, g; missing 5 (climate), 6 (wind), 7 (materials), c (cave). Update it when touching `Hud.ts`.
+- **HUD `KEYMAP_HELP`** in `Hud.ts` is stale — references only hotkeys 1–4, f, g; missing 5 (climate), 6 (wind), 7 (materials), 8 (wetness), c (cave). Update it when touching `Hud.ts`.
 
 ## Navigation
 Globe/orbit camera (`GlobeControls.ts`) + first-person walk (`FirstPersonController.ts`, `controls/NavMode.ts`, `SurfacePicker.ts`, `debug/NavControlsBar.ts`). "Walk here" → click the planet → camera spawns at eye height (1.7 m) above the surface, gravity-aligned, mouse-look + WASD. Spin auto-pauses in walk mode. 'c' key spawns at a cave mouth.

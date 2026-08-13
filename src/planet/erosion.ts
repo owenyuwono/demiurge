@@ -790,11 +790,7 @@ export class Erosion {
       // l. Seam blur (same passes as existing path)
       // -----------------------------------------------------------------------
       erosionDelta = blurField(erosionDelta, 3)
-      // 1-pass (was 4): keep flowAccum SHARP so real channels reach high acc and
-      // both the heightFn V-incision carve and the river overlay engage on thin
-      // threads instead of a broad smeared haze. accAt is C1-sampled so 1 pass
-      // still suppresses MFD grid streaks without dissolving the network.
-      const flowAccumBlurredB = blurField(flowAccum, 1)
+      const flowAccumBlurredB = blurField(flowAccum, 4)
       for (let c = 0; c < N; c++) flowAccum[c] = flowAccumBlurredB[c]
 
       // Blur flowDir components to de-grid warp direction (Fix 3).
@@ -1472,7 +1468,7 @@ export class Erosion {
       // -----------------------------------------------------------------------
 
       erosionDelta = blurField(erosionDelta, 3)
-      const flowAccumBlurred = blurField(flowAccum, 1)  // 1-pass: keep channels sharp (see B-path note)
+      const flowAccumBlurred = blurField(flowAccum, 4)
       for (let c = 0; c < N; c++) flowAccum[c] = flowAccumBlurred[c]
 
       const flowDirXBlurred = blurField(flowDirX, 4)

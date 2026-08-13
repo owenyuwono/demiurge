@@ -32,8 +32,7 @@ export interface ChunkParams {
   /**
    * optional erosion sampler (pipeline step 9, Phase 3).
    * When present, land vertices inside lake basins receive a still-water tint
-   * blended over the base biome/elevation color. Rivers are NOT tinted here —
-   * they are swept as water geometry by RiverNetwork.ts.
+   * blended over the base biome/elevation color.
    */
   erosion?: {
     /**
@@ -491,11 +490,10 @@ export function biomeColor(
 // Lake:  still-water blue #3a5e7a. Applied when lakeMaskAt > 0.5 (clean 0/1 mask,
 //   bilinear-safe). Tint scales by mask value for a soft shoreline fade.
 //
-// There is deliberately NO river tint and NO riparian corridor tint here. Both
-// were painted from `erosion.accAt` on the 256² bake grid (~3 km/texel at
-// RADIUS=500 km), so a "river" read as a several-km-wide colour smear that could
-// never line up with the ~0.1–4 km water ribbons `RiverNetwork.ts` sweeps. Rivers
-// are geometry now; the terrain only paints standing water (lakes).
+// There is deliberately NO river tint here. It was painted from `erosion.accAt`
+// on the 256² bake grid (~3 km/texel at RADIUS=500 km), so a "river" read as a
+// several-km-wide colour smear — a stripe of blue paint with no channel under it.
+// The rivers feature was removed entirely; see CLAUDE.md "Decisions".
 // ---------------------------------------------------------------------------
 
 const LAKE_BLEND           = 0.72;
@@ -631,7 +629,7 @@ export function computeChunkArrays(p: ChunkParams, seaLevel: number): ChunkMeshA
   const colors       = new Float32Array(totalVerts * 3);
   const plateColors    = hasPlateColor  ? new Float32Array(totalVerts * 3) : null;
   const climateMoist   = hasClimate     ? new Float32Array(totalVerts)     : null;
-  // Surface-wetness channel (legacy name): open-water (river/lake) + subsurface seep.
+  // Surface-wetness channel (legacy name): open water (lakes) + subsurface seep.
   // Drives the normal material's roughness so water reads as wet (specular). Allocated
   // whenever erosion OR subsurface is present.
   const subsurfaceWet  = (hasSubsurface || (erosion !== null && erosion !== undefined))
@@ -836,7 +834,6 @@ export function computeChunkArrays(p: ChunkParams, seaLevel: number): ChunkMeshA
       // Compositing order:
       //   1. Lake
       //   2. Spring / ice-seep / ore (subsurface only — skipped when absent)
-      // Rivers are NOT painted here — RiverNetwork.ts sweeps them as water geometry.
       if (erosion !== null && erosion !== undefined && h >= seaLevel) {
         const base3 = vi * 3;
 

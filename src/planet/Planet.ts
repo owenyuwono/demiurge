@@ -47,7 +47,6 @@ import { QuadtreeNode } from './QuadtreeNode'
 import { TectonicsDebug } from './TectonicsDebug'
 import { WindDebug } from './WindDebug'
 import { WindFlow } from './WindFlow'
-import { RiverNetwork } from './RiverNetwork'
 import { VolumetricClouds } from './VolumetricClouds'
 import { Atmosphere } from './Atmosphere'
 import { PlanetGizmos } from './PlanetGizmos'
@@ -388,7 +387,6 @@ export class Planet extends Group {
 
   /** WindFlow overlay — advected particle streaklines, coexists with arrows. */
   private windFlow!: WindFlow
-  private riverNet: RiverNetwork | null = null
 
   /** VolumetricClouds overlay — raymarched cloud layer, independent toggle. */
   cloudShell!: VolumetricClouds
@@ -493,7 +491,7 @@ export class Planet extends Group {
 
     // Shared normal-view material — one instance for all terrain chunks.
     // Node material so the per-vertex 'subsurfaceWet' scalar can drop roughness on
-    // water (rivers/lakes/seeps) → PBR-Fresnel sun glint; dry land stays matte
+    // water (lakes/seeps) → PBR-Fresnel sun glint; dry land stays matte
     // (wet=0 → roughness 1, identical to before). wet=1 → roughness 0.15 (≈ ocean shell).
     this.normalMaterial = new MeshStandardNodeMaterial({ vertexColors: true, roughness: 1, metalness: 0 })
     this.normalMaterial.roughnessNode = saturate(attribute('subsurfaceWet', 'float')).mul(-0.85).add(1.0)
@@ -569,7 +567,6 @@ export class Planet extends Group {
     this.buildWindFlow()
     this.buildCloudShell()
     this.buildAtmosphere()
-    this.buildRiverNet()
 
     // Gizmos are seed-independent — built once, never rebuilt on regenerate().
     this.gizmos = new PlanetGizmos({ radius: this.radius })
@@ -859,7 +856,7 @@ export class Planet extends Group {
 
   /**
    * Enable or disable the soil-wetness / aquifer debug view.
-   * Shows the per-vertex surface-wetness scalar (rivers + lakes + groundwater seeps)
+   * Shows the per-vertex surface-wetness scalar (lakes + groundwater seeps)
    * on a dry-brown → teal → cyan ramp. Mutually exclusive with other debug views.
    */
   setWetnessView(on: boolean): void {
@@ -1516,7 +1513,6 @@ export class Planet extends Group {
     // Restore cloud-shell visibility: shell was only on in normal view, so restoring the
     // saved flag is safe. applyView in main.ts will re-assert the correct state next frame.
     this.setCloudShellVisible(cloudsWasVisible)
-    this.buildRiverNet()
     this.buildAtmosphere()
     // Restore atmosphere visibility (always-on, but respect any explicit toggle).
     this.setAtmosphereVisible(atmWasVisible)
@@ -1613,7 +1609,6 @@ export class Planet extends Group {
     this.windDebug.dispose()
     this.windFlow.dispose()
     this.cloudShell.dispose()
-    this.riverNet?.dispose()
     this.atmosphereShell.dispose()
     this.gizmos.dispose()
     this.climateSim.dispose()
@@ -1931,25 +1926,6 @@ export class Planet extends Group {
     // WindFlow adds its LineSegments directly to the scene passed in constructor,
     // which is `this` (the Planet Group). No explicit this.add() needed.
   }
-
-  /** Build (or rebuild) the river-network overlay from the baked erosion flow field. */
-  private buildRiverNet(): void {
-    if (this.riverNet === null) {
-      this.riverNet = new RiverNetwork(this, {
-        radius: this.radius,
-        heightScale: this.heightScale,
-        // Drape at the finest LOD so the water surface matches walk-mode terrain (no float).
-        params: { drapeLevel: this.maxDepth },
-      })
-    }
-    if (this._erosion !== null) {
-      this.riverNet.build(this._erosion, this.heightFn, this._seaLevel, this._subsurface)
-    }
-  }
-
-  /** Show/hide the river overlay (main.ts gates this to the normal view). */
-  setRiversVisible(on: boolean): void { this.riverNet?.setVisible(on) }
-  get riversVisible(): boolean { return this.riverNet?.visible ?? false }
 
   /** Build (or rebuild) VolumetricClouds and add its sphere mesh as a child. */
   private buildCloudShell(): void {
