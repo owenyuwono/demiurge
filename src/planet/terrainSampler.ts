@@ -111,10 +111,13 @@ export const EROSION_WARP_STR         = 0.10
 //   1.0 = no discharge deepening (pre-erosion behaviour), 0.0 = fully suppressed.
 export const EROSION_RIDGED_FLOOR     = 0.35
 // EROSION_VINCISION_AMP: peak V-channel depth at full discharge (acc≈1, land).
-//   [0.008→0.03→0.05→0.08: deepened so rivers visibly carve their VALLEYS. Pairs with
-//    the de-blurred (1-pass) flowAccum + a dedicated low-threshold carve gate (see
-//    vIncision) so whole channel networks incise, not just a few trunk notches.]
-export const EROSION_VINCISION_AMP    = 0.08
+//   0.03 ≈ 360 m at HEIGHT_SCALE=12 km. Held at 0.03 on purpose: the carve gate reads
+//   the 256² erosion bake (~3 km/texel at RADIUS=500 km), so the trough is ~6–9 km WIDE
+//   no matter what. It was pushed to 0.08 (≈960 m) to make rivers readable and that gave
+//   a 1:8 aspect gash — a chasm, not a valley. Depth belongs at ~1:20 of the width the
+//   grid can actually resolve. Want deeper/narrower? Raise the erosion bake res first.
+//   [0.008 → 0.03 → 0.05 → 0.08 → 0.03]
+export const EROSION_VINCISION_AMP    = 0.03
 
 // ---------------------------------------------------------------------------
 // Process-palette noise stream IDs (reserved, clear of all existing streams)

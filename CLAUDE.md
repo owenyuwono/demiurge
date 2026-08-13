@@ -52,6 +52,20 @@ Fan/floodplain/delta classifier (`depositEnv` Uint8, ENV_FLOODPLAIN/FAN/DELTA) w
 
 **Caveat — see Known gaps below.** The planet ships on the **B-path** (`bActive:true`; `Planet` always supplies `upliftForcing`), which leaves `depositEnv` all-zero. Fan/floodplain/delta color differentiation is therefore inactive in the rendered planet. Substrate hardness differential erosion IS active.
 
+## Rivers (`RiverNetwork.ts`)
+Rivers are **not a new simulation** — the erosion bake already produces the drainage network as a byproduct of stream-power (`E = K·Q^m·S^n`); `flowAccum`/`flowAt`/`lakeMask` are baked and queryable. Rivers are **two things only**:
+
+1. **The carve (terrain, goes through workers).** `terrainSampler.ts` heightFn subtracts `vIncision = -EROSION_VINCISION_AMP * carveGate * landGate`, `carveGate = _ss3(0.05, 0.45, acc)`. The gate is deliberately **lower-threshold than `chan`** so whole tributary NETWORKS incise, not just a few trunk notches. `flowAccum` is blurred **1 pass** (not 4) in both erosion paths so channels stay sharp enough to reach the gate; `accAt` is C1-sampled so 1 pass still suppresses MFD grid streaks.
+2. **The water (`RiverNetwork.ts`, render-only).** Great-circle streamlines of `erosion.flowAt()` on a `gridRes` cube grid, one pass per reach via a `visited` grid, Catmull-Rom subdivided, swept into a ribbon of width `widthBase + widthScale·√acc`, draped through `heightFn` at `drapeLevel = maxDepth`. Seeds from **channel HEADS** (one step upstream is below threshold) + **aquifer springs** (`waterTableAt > terrain`) — seeding every channel cell makes adjacent traces collide on the `visited` grid and fragments into dashes. Discrete 8-neighbour downstream stepping guarantees converging tributaries share one path. Built main-thread from baked Erosion/Subsurface, added to the Planet group; does NOT touch meshing/workers/`toBaked`. Visible in `normal` view, GUI toggle Water→rivers.
+
+**No river vertex tint, no riparian corridor tint — both were deleted, don't re-add them.** They painted from `accAt` on the 256² bake grid (~3 km/texel at RADIUS=500 km), so a "river" was a several-km-wide colour smear that could never line up with the 0.1–4 km water ribbons, and the riparian green haloed it even wider. Three river representations at three resolutions is what made rivers look bad. Lakes ARE still tinted (`#3a5e7a`) — they have no ribbon geometry.
+
+**Depth is width-limited, not taste-limited.** `EROSION_VINCISION_AMP = 0.03` (≈360 m at `HEIGHT_SCALE`=12 km). The carve gate reads the 256² grid, so the trough is ~6–9 km wide *whatever* the amplitude; 0.08 (≈960 m) gave a 1:8 chasm instead of a valley. To get deeper AND narrower, raise the erosion bake res — don't just raise the amp.
+
+**Open tension — float vs clip.** `RiverParams.fillFraction` (0.7) floats the water surface that fraction of the carve depth above the channel floor, because the traced centerline samples `heightFn` only every `gridRes` texel (~6 km) while the drape is full-detail — terrain between samples pokes through and chops the ribbon into apparent dashes. With the amp back at 0.03 there is less headroom. If dashes return, **raise `fillFraction` toward 0.9, do not raise the amp**; the real fix is re-draping the Catmull-Rom-smoothed points through `heightFn` (≈4× more heightFn calls at bake time), not inflating the valley.
+
+Other knobs: `RiverParams.threshold`/`gridRes`/`widthBase`/`widthScale`/`smoothSub`. Related: per-vertex `subsurfaceWet` (lake + seep) drives `normalMaterial.roughnessNode` → wet specular; `wetness` view (hotkey `8`) shows it on a dry-brown→teal→cyan ramp.
+
 ## Wind system (`climate.ts`)
 `bakeWind()` produces a baked cube-map field (windX/Y/Z + windSpeed) consumed by `windAt(dir, out)` and `windSpeedAt(dir)`.
 
@@ -157,11 +171,12 @@ HUD fields: `mode`, `lod` (visible level range), `lod cap`, `seed`, `regime`, `p
 | 5   | Toggle climate view |
 | 6   | Toggle wind view (arrows + flow particles; each independently toggleable in GUI) |
 | 7   | Toggle materials view (rockHardness; indigo→cyan→lime→orange→crimson = soft→hard) |
+| 8   | Toggle wetness view (`subsurfaceWet`: lake + seep; dry-brown→teal→cyan) |
 | f   | Freeze LOD |
 | g   | New random seed |
 | c   | Spawn at cave mouth |
 
-View modes (8 total): `normal`, `lod`, `tectonics`, `heightmap`, `climate`, `wind`, `cloud`, `materials`. `heightmap`/`cloud` are GUI-dropdown only (no hotkey). The cloud shell renders volumetric in `normal`; in `cloud` view it renders a **flat "cloud map" debug mode** (`_uDebugMode`=1 via `setCloudDebugMode`): one density sample at the annulus midpoint per pixel (no raymarch → cheap) → a coverage heatmap (dark navy clear → light cloudy) + yellow iso-contour outlines (cloud silhouette at 0.5 + faint 0.2/0.8 levels) for studying cloud formation/topology. `setDebugMode` flips the material to opaque/FrontSide/depthWrite so the map renders cleanly (vs the translucent DoubleSide volumetric shell). Hidden in all other views. (The wind view's arrows show `windAtTime` and are only loosely correlated with the clouds — the `cloud` view is the tool for reading cloud structure.)
+View modes (9 total): `normal`, `lod`, `tectonics`, `heightmap`, `climate`, `wind`, `cloud`, `materials`, `wetness`. `heightmap`/`cloud` are GUI-dropdown only (no hotkey). The cloud shell renders volumetric in `normal`; in `cloud` view it renders a **flat "cloud map" debug mode** (`_uDebugMode`=1 via `setCloudDebugMode`): one density sample at the annulus midpoint per pixel (no raymarch → cheap) → a coverage heatmap (dark navy clear → light cloudy) + yellow iso-contour outlines (cloud silhouette at 0.5 + faint 0.2/0.8 levels) for studying cloud formation/topology. `setDebugMode` flips the material to opaque/FrontSide/depthWrite so the map renders cleanly (vs the translucent DoubleSide volumetric shell). Hidden in all other views. (The wind view's arrows show `windAtTime` and are only loosely correlated with the clouds — the `cloud` view is the tool for reading cloud structure.)
 
 lil-gui panel: LOD tuning (`tri px target` 0.5–8 default 2.0, `max depth` 8–20 default 10), `wireframe`, `freeze LOD`, `lod diag` (toggleable on-screen LOD readout — OFF by default), view dropdown, spin, new seed, erosion sliders. **Atmosphere tab** contains two folders:
 

@@ -31,12 +31,11 @@ export interface ChunkParams {
   climateFn?: (dir: Vector3, height: number) => { temperature: number; moisture: number };
   /**
    * optional erosion sampler (pipeline step 9, Phase 3).
-   * When present, land vertices near rivers or inside lake basins receive a
-   * water tint blended over the base biome/elevation color.
+   * When present, land vertices inside lake basins receive a still-water tint
+   * blended over the base biome/elevation color. Rivers are NOT tinted here —
+   * they are swept as water geometry by RiverNetwork.ts.
    */
   erosion?: {
-    /** 0..1 normalized discharge (river-ness) for a unit sphere direction */
-    accAt(dir: Vector3): number;
     /**
      * Lake spill elevation for a unit sphere direction.
      * Returns a SENTINEL value (~-999) where the vertex is NOT inside a lake basin.
@@ -489,34 +488,20 @@ export function biomeColor(
 // ---------------------------------------------------------------------------
 // Erosion tint constants (tunable by the user).
 //
-// River: muted flowing-water blue #4a6e8a. Kicks in above RIVER_THRESHOLD
-//   (0..1 discharge). Only trunk channels exceed the threshold; RIVER_MAX_BLEND
-//   caps the opacity so the underlying biome still reads through.
 // Lake:  still-water blue #3a5e7a. Applied when lakeMaskAt > 0.5 (clean 0/1 mask,
 //   bilinear-safe). Tint scales by mask value for a soft shoreline fade.
+//
+// There is deliberately NO river tint and NO riparian corridor tint here. Both
+// were painted from `erosion.accAt` on the 256² bake grid (~3 km/texel at
+// RADIUS=500 km), so a "river" read as a several-km-wide colour smear that could
+// never line up with the ~0.1–4 km water ribbons `RiverNetwork.ts` sweeps. Rivers
+// are geometry now; the terrain only paints standing water (lakes).
 // ---------------------------------------------------------------------------
-
-const RIVER_THRESHOLD      = 0.50;
-const RIVER_MAX_BLEND      = 0.65;
-const RIVER_R = 0x4a / 255;   // #4a6e8a
-const RIVER_G = 0x6e / 255;
-const RIVER_B = 0x8a / 255;
 
 const LAKE_BLEND           = 0.72;
 const LAKE_R = 0x3a / 255;   // #3a5e7a
 const LAKE_G = 0x5e / 255;
 const LAKE_B = 0x7a / 255;
-
-// Riparian corridor: lush vegetation green #4e7a34 flanking channels (the discharge
-// band just below the river itself). Even desert rivers carry green corridors (the
-// Nile), so this is intentionally NOT moisture-gated. Applied UNDER the river tint,
-// which overwrites the channel centre.
-const RIPARIAN_LO    = 0.08;
-const RIPARIAN_HI    = 0.22;
-const RIPARIAN_BLEND = 0.55;
-const RIPARIAN_R = 0x4e / 255;  // #4e7a34
-const RIPARIAN_G = 0x7a / 255;
-const RIPARIAN_B = 0x34 / 255;
 
 // ---------------------------------------------------------------------------
 // Subsurface emergence overlay constants.
@@ -525,8 +510,6 @@ const RIPARIAN_B = 0x34 / 255;
 //   WT_WET_BAND      — normalized-height band over which spring emergence ramps
 //                      to full blend (water table this far above surface = fully wet).
 //   SPRING_BLEND     — max color-blend weight toward the spring tint.
-//   SPRING_DISCHARGE — synthetic discharge injected into the river formula at
-//                      spring vertices so a short stream appears downhill.
 //
 // ICE SEEP: permafrost top at or above the terrain surface → pale blue film.
 //   ICE_BLEND — blend weight toward the ice-seep tint.
@@ -538,7 +521,6 @@ const RIPARIAN_B = 0x34 / 255;
 
 const WT_WET_BAND        = 0.01;
 const SPRING_BLEND       = 0.60;
-const SPRING_DISCHARGE   = 0.90;  // synthetic acc injected at spring heads
 const ICE_BLEND          = 0.50;
 const ORE_OUTCROP_THRESH = 0.60;
 const ORE_BLEND          = 0.45;
@@ -851,52 +833,22 @@ export function computeChunkArrays(p: ChunkParams, seaLevel: number): ChunkMeshA
       }
 
       // -- Erosion + subsurface tinting (land only) --------------------------------
-      // Compositing order (matches HEAD for the no-subsurface path):
-      //   1. River(effAcc) — effAcc === acc when subsurface absent
-      //   2. Lake
-      //   3. Spring / ice-seep / ore (subsurface only — skipped when absent)
-      // This preserves the exact River-then-Lake order from HEAD while still
-      // allowing a spring to boost acc → effAcc before the river tint fires.
+      // Compositing order:
+      //   1. Lake
+      //   2. Spring / ice-seep / ore (subsurface only — skipped when absent)
+      // Rivers are NOT painted here — RiverNetwork.ts sweeps them as water geometry.
       if (erosion !== null && erosion !== undefined && h >= seaLevel) {
         const base3 = vi * 3;
-        const acc = erosion.accAt(dir);
 
-        // Step 1a: compute effAcc (spring boost when subsurface present).
-        // When subsurface is absent the block is skipped → effAcc === acc.
-        let effAcc = acc;
         let springEmergence = 0;
-        let surfWet = 0; // surface wetness [0,1] → roughness (river/lake/seep)
+        let surfWet = 0; // surface wetness [0,1] → roughness (lake / seep)
         if (hasSubsurface && subsurface !== null && subsurface !== undefined) {
           const wt = subsurface.waterTableAt(dir);
           springEmergence = clamp01((wt - h) / WT_WET_BAND);
-          if (springEmergence > 0) {
-            effAcc = Math.max(acc, springEmergence * SPRING_DISCHARGE);
-          }
         }
 
-        // Step 1a.5: Riparian corridor — lush green flanking the channel. The river
-        // tint below overwrites the channel centre, leaving green ribbons either side.
-        const ripar = smoothstepM(RIPARIAN_LO, RIPARIAN_HI, effAcc) * RIPARIAN_BLEND;
-        if (ripar > 0.01) {
-          colors[base3    ] = lerp(colors[base3    ], RIPARIAN_R, ripar);
-          colors[base3 + 1] = lerp(colors[base3 + 1], RIPARIAN_G, ripar);
-          colors[base3 + 2] = lerp(colors[base3 + 2], RIPARIAN_B, ripar);
-        }
-
-        // Step 1b: River tint using effAcc (muted flowing-water blue #4a6e8a).
-        // Threshold 0.78 — only strong trunk channels read as water; streams fade.
-        // subsurface-absent ⇒ effAcc === acc ⇒ identical to HEAD.
-        if (effAcc > RIVER_THRESHOLD) {
-          const riverT = clamp01((effAcc - RIVER_THRESHOLD) / (1.0 - RIVER_THRESHOLD)) * RIVER_MAX_BLEND;
-          colors[base3    ] = lerp(colors[base3    ], RIVER_R, riverT);
-          colors[base3 + 1] = lerp(colors[base3 + 1], RIVER_G, riverT);
-          colors[base3 + 2] = lerp(colors[base3 + 2], RIVER_B, riverT);
-          surfWet = Math.max(surfWet, riverT / RIVER_MAX_BLEND);
-        }
-
-        // Step 2: Lake tint (still-water blue #3a5e7a).
+        // Step 1: Lake tint (still-water blue #3a5e7a).
         // Keys off the clean 0/1 lake mask; 0.5 isocontour is the shoreline.
-        // Identical position to HEAD (after river, before any subsurface tints).
         const lkMask = erosion.lakeMaskAt(dir);
         if (lkMask > 0.5) {
           const lakeT = LAKE_BLEND * lkMask;
@@ -906,9 +858,8 @@ export function computeChunkArrays(p: ChunkParams, seaLevel: number): ChunkMeshA
           surfWet = Math.max(surfWet, lkMask);
         }
 
-        // Step 3: Subsurface-only overlays — spring, ice seep, ore outcrop.
-        // Entire block is skipped when subsurface is absent, so the no-subsurface
-        // path above (steps 1b + 2) is byte-identical to HEAD.
+        // Step 2: Subsurface-only overlays — spring, ice seep, ore outcrop.
+        // Entire block is skipped when subsurface is absent.
         if (hasSubsurface && subsurface !== null && subsurface !== undefined) {
           let wet = 0;
 
@@ -947,7 +898,7 @@ export function computeChunkArrays(p: ChunkParams, seaLevel: number): ChunkMeshA
         if (subsurfaceWet !== null) subsurfaceWet[vi] = surfWet;
       } else if (hasSubsurface && subsurface !== null && subsurface !== undefined && h >= seaLevel) {
         // Subsurface present but no erosion: spring/ice/ore still apply.
-        // River and lake tints are skipped (no acc available).
+        // Lake tint is skipped (no lake mask available).
         const base3 = vi * 3;
         let wet = 0;
 
