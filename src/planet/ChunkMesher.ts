@@ -496,7 +496,7 @@ export function biomeColor(
 //   bilinear-safe). Tint scales by mask value for a soft shoreline fade.
 // ---------------------------------------------------------------------------
 
-const RIVER_THRESHOLD      = 0.78;
+const RIVER_THRESHOLD      = 0.50;
 const RIVER_MAX_BLEND      = 0.65;
 const RIVER_R = 0x4a / 255;   // #4a6e8a
 const RIVER_G = 0x6e / 255;
@@ -506,6 +506,17 @@ const LAKE_BLEND           = 0.72;
 const LAKE_R = 0x3a / 255;   // #3a5e7a
 const LAKE_G = 0x5e / 255;
 const LAKE_B = 0x7a / 255;
+
+// Riparian corridor: lush vegetation green #4e7a34 flanking channels (the discharge
+// band just below the river itself). Even desert rivers carry green corridors (the
+// Nile), so this is intentionally NOT moisture-gated. Applied UNDER the river tint,
+// which overwrites the channel centre.
+const RIPARIAN_LO    = 0.08;
+const RIPARIAN_HI    = 0.22;
+const RIPARIAN_BLEND = 0.55;
+const RIPARIAN_R = 0x4e / 255;  // #4e7a34
+const RIPARIAN_G = 0x7a / 255;
+const RIPARIAN_B = 0x34 / 255;
 
 // ---------------------------------------------------------------------------
 // Subsurface emergence overlay constants.
@@ -638,7 +649,11 @@ export function computeChunkArrays(p: ChunkParams, seaLevel: number): ChunkMeshA
   const colors       = new Float32Array(totalVerts * 3);
   const plateColors    = hasPlateColor  ? new Float32Array(totalVerts * 3) : null;
   const climateMoist   = hasClimate     ? new Float32Array(totalVerts)     : null;
-  const subsurfaceWet  = hasSubsurface  ? new Float32Array(totalVerts)     : null;
+  // Surface-wetness channel (legacy name): open-water (river/lake) + subsurface seep.
+  // Drives the normal material's roughness so water reads as wet (specular). Allocated
+  // whenever erosion OR subsurface is present.
+  const subsurfaceWet  = (hasSubsurface || (erosion !== null && erosion !== undefined))
+    ? new Float32Array(totalVerts) : null;
   const rockHardness   = hasHardness    ? new Float32Array(totalVerts)     : null;
   const indices        = new Uint32Array(totalIndices);
 
@@ -850,12 +865,22 @@ export function computeChunkArrays(p: ChunkParams, seaLevel: number): ChunkMeshA
         // When subsurface is absent the block is skipped → effAcc === acc.
         let effAcc = acc;
         let springEmergence = 0;
+        let surfWet = 0; // surface wetness [0,1] → roughness (river/lake/seep)
         if (hasSubsurface && subsurface !== null && subsurface !== undefined) {
           const wt = subsurface.waterTableAt(dir);
           springEmergence = clamp01((wt - h) / WT_WET_BAND);
           if (springEmergence > 0) {
             effAcc = Math.max(acc, springEmergence * SPRING_DISCHARGE);
           }
+        }
+
+        // Step 1a.5: Riparian corridor — lush green flanking the channel. The river
+        // tint below overwrites the channel centre, leaving green ribbons either side.
+        const ripar = smoothstepM(RIPARIAN_LO, RIPARIAN_HI, effAcc) * RIPARIAN_BLEND;
+        if (ripar > 0.01) {
+          colors[base3    ] = lerp(colors[base3    ], RIPARIAN_R, ripar);
+          colors[base3 + 1] = lerp(colors[base3 + 1], RIPARIAN_G, ripar);
+          colors[base3 + 2] = lerp(colors[base3 + 2], RIPARIAN_B, ripar);
         }
 
         // Step 1b: River tint using effAcc (muted flowing-water blue #4a6e8a).
@@ -866,6 +891,7 @@ export function computeChunkArrays(p: ChunkParams, seaLevel: number): ChunkMeshA
           colors[base3    ] = lerp(colors[base3    ], RIVER_R, riverT);
           colors[base3 + 1] = lerp(colors[base3 + 1], RIVER_G, riverT);
           colors[base3 + 2] = lerp(colors[base3 + 2], RIVER_B, riverT);
+          surfWet = Math.max(surfWet, riverT / RIVER_MAX_BLEND);
         }
 
         // Step 2: Lake tint (still-water blue #3a5e7a).
@@ -877,6 +903,7 @@ export function computeChunkArrays(p: ChunkParams, seaLevel: number): ChunkMeshA
           colors[base3    ] = lerp(colors[base3    ], LAKE_R, lakeT);
           colors[base3 + 1] = lerp(colors[base3 + 1], LAKE_G, lakeT);
           colors[base3 + 2] = lerp(colors[base3 + 2], LAKE_B, lakeT);
+          surfWet = Math.max(surfWet, lkMask);
         }
 
         // Step 3: Subsurface-only overlays — spring, ice seep, ore outcrop.
@@ -914,8 +941,10 @@ export function computeChunkArrays(p: ChunkParams, seaLevel: number): ChunkMeshA
             colors[base3 + 2] = lerp(colors[base3 + 2], ORE_B, ORE_BLEND);
           }
 
-          subsurfaceWet![vi] = wet;
+          surfWet = Math.max(surfWet, wet);
         }
+
+        if (subsurfaceWet !== null) subsurfaceWet[vi] = surfWet;
       } else if (hasSubsurface && subsurface !== null && subsurface !== undefined && h >= seaLevel) {
         // Subsurface present but no erosion: spring/ice/ore still apply.
         // River and lake tints are skipped (no acc available).
@@ -1068,8 +1097,8 @@ export function computeChunkArrays(p: ChunkParams, seaLevel: number): ChunkMeshA
       climateMoist[vi] = climateMoist[borderVI];
     }
 
-    // Copy subsurfaceWet from border vertex
-    if (hasSubsurface && subsurfaceWet !== null) {
+    // Copy surface-wetness from border vertex
+    if (subsurfaceWet !== null) {
       subsurfaceWet[vi] = subsurfaceWet[borderVI];
     }
 

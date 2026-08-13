@@ -3,12 +3,12 @@
  *
  * Imports the pure-compute planet modules (noise, tectonics, terrainSampler)
  * and dumps a deterministic golden JSON to:
- *   ../enki/enki-planet/tests/goldens/golden.json
+ *   ../minos/minos-planet/tests/goldens/golden.json
  *
  * Run from the demiurge directory:
  *   cd ~/Work/Prototypes/demiurge && npx tsx tools/dump-golden.mjs
  *
- * Fixed params (documented — must match enki's determinism test construction):
+ * Fixed params (documented — must match minos's determinism test construction):
  *   seed          = 42
  *   plate_count   = 12
  *   arc_density   = 1.0
@@ -28,7 +28,7 @@ import { dirname } from 'path'
 import { fileURLToPath } from 'url'
 
 // ---------------------------------------------------------------------------
-// Fixed params — must match enki's determinism test exactly
+// Fixed params — must match minos's determinism test exactly
 // ---------------------------------------------------------------------------
 
 const PARAMS = {
@@ -196,7 +196,7 @@ const golden = {
 // ---------------------------------------------------------------------------
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
-const outPath = `${__dirname}/../../enki/enki-planet/tests/goldens/golden.json`
+const outPath = `${__dirname}/../../minos/minos-planet/tests/goldens/golden.json`
 
 mkdirSync(dirname(outPath), { recursive: true })
 writeFileSync(outPath, JSON.stringify(golden, null, 2), 'utf8')

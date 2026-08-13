@@ -268,7 +268,7 @@ async function main(): Promise<void> {
 
   // --- UI state (single source of truth for GUI + hotkeys) ---
   const ui = {
-    view: 'normal' as 'normal' | 'lod' | 'tectonics' | 'heightmap' | 'climate' | 'wind' | 'cloud' | 'materials',
+    view: 'normal' as 'normal' | 'lod' | 'tectonics' | 'heightmap' | 'climate' | 'wind' | 'cloud' | 'materials' | 'wetness',
     wireframe: false,
     vertices: false,
     freezeLod: false,
@@ -279,6 +279,8 @@ async function main(): Promise<void> {
     targetTriPx: 2.0,
     maxDepth: 18,
     water: true,
+    rivers: true,
+    clouds: false,
     // Interior parameters (primary tectonic roots)
     mass: DEFAULT_INTERIOR.mass,
     composition: DEFAULT_INTERIOR.composition,
@@ -333,9 +335,9 @@ async function main(): Promise<void> {
     // Wind flow overlay parameters
     showWindArrows:     true,
     showWindFlow:       true,
-    windFlowDensity:    2000,
-    windFlowSpeed:      0.15,
-    windFlowTrail:      8,
+    windFlowDensity:    8000,
+    windFlowSpeed:      0.6,
+    windFlowTrail:      12,
     windFlowLifetime:   4.0,
     // Cloud shell parameters (all live via setters — no rebake)
     cloudCoverage:     0.65,
@@ -429,10 +431,13 @@ async function main(): Promise<void> {
     planet.setClimateView(ui.view === 'climate')
     planet.setWindView(ui.view === 'wind')
     planet.setMaterialsView(ui.view === 'materials')
+    planet.setWetnessView(ui.view === 'wetness')
     planet.setWindOverlaysVisible(ui.view === 'wind')
     // Cloud shell shows in 'normal' (volumetric) and 'cloud' (flat coverage map + contours).
-    planet.setCloudShellVisible(ui.view === 'normal' || ui.view === 'cloud')
+    planet.setCloudShellVisible((ui.view === 'normal' && ui.clouds) || ui.view === 'cloud')
     planet.setCloudDebugMode(ui.view === 'cloud')
+    // Rivers: overlay only in normal view (hidden in data views), gated by the GUI toggle.
+    planet.setRiversVisible(ui.view === 'normal' && ui.rivers)
   }
 
   function applyWireframe(): void {
@@ -722,13 +727,13 @@ async function main(): Promise<void> {
   windFolder.add(ui, 'showWindFlow').name('wind flow').onChange((v: boolean) => {
     planet.setWindFlowVisible(v)
   })
-  windFolder.add(ui, 'windFlowDensity', 200, 6000, 100).name('flow density').onFinishChange((v: number) => {
+  windFolder.add(ui, 'windFlowDensity', 1000, 30000, 500).name('flow density').onFinishChange((v: number) => {
     planet.setWindFlowDensity(v)
   })
-  windFolder.add(ui, 'windFlowSpeed', 0, 0.5, 0.01).name('flow speed').onChange((v: number) => {
+  windFolder.add(ui, 'windFlowSpeed', 0, 3.0, 0.05).name('flow speed').onChange((v: number) => {
     planet.setWindFlowSpeed(v)
   })
-  windFolder.add(ui, 'windFlowTrail', 2, 16, 1).name('trail length').onFinishChange((v: number) => {
+  windFolder.add(ui, 'windFlowTrail', 2, 24, 1).name('trail length').onFinishChange((v: number) => {
     planet.setWindFlowTrail(v)
   })
   windFolder.add(ui, 'windFlowLifetime', 1, 10, 0.5).name('particle life').onChange((v: number) => {
@@ -737,6 +742,7 @@ async function main(): Promise<void> {
 
   // Cloud shell overlay — always visible in normal view; all sliders are live (no rebake).
   const cloudFolder = tabbed.atmosphereGui.addFolder('Clouds')
+  cloudFolder.add(ui, 'clouds').name('visible (off by default)').onChange(() => applyView())
   cloudFolder.add(ui, 'cloudCoverage', 0, 1, 0.01).name('coverage').onChange((v: number) => {
     planet.setCloudCoverage(v)
   })
@@ -857,7 +863,7 @@ async function main(): Promise<void> {
 
   // === Tab 3: View ===
   const viewFolder = tabbed.viewGui.addFolder('View')
-  viewFolder.add(ui, 'view', ['normal', 'lod', 'tectonics', 'heightmap', 'climate', 'wind', 'cloud', 'materials']).name('mode').onChange(() => applyView())
+  viewFolder.add(ui, 'view', ['normal', 'lod', 'tectonics', 'heightmap', 'climate', 'wind', 'cloud', 'materials', 'wetness']).name('mode').onChange(() => applyView())
   viewFolder.add(ui, 'wireframe').name('wireframe').onChange(() => applyWireframe())
   viewFolder.add(ui, 'vertices').name('vertices').onChange(() => applyVertices())
   viewFolder.add(ui, 'freezeLod').name('freeze LOD').onChange(() => applyFreeze())
@@ -877,6 +883,7 @@ async function main(): Promise<void> {
 
   const waterFolder = tabbed.viewGui.addFolder('Water')
   waterFolder.add(ui, 'water').name('visible').onChange(() => applyWater())
+  waterFolder.add(ui, 'rivers').name('rivers').onChange(() => applyView())
 
   // Apply initial gizmos + water state
   applyGizmos()
@@ -985,6 +992,10 @@ async function main(): Promise<void> {
         ui.view = ui.view === 'materials' ? 'normal' : 'materials'
         applyView()
         break
+      case '8':
+        ui.view = ui.view === 'wetness' ? 'normal' : 'wetness'
+        applyView()
+        break
       case 'f':
         ui.freezeLod = !ui.freezeLod
         applyFreeze()
@@ -1051,7 +1062,7 @@ async function main(): Promise<void> {
     const dt = Math.min(clock.getDelta(), 0.1)
     elapsedS += dt
     planet.setWindTime(elapsedS)
-    planet.animateWind(elapsedS, dt)
+    planet.animateWind(elapsedS, dt, camera.position)
 
     // Dispatch input update to whichever controller owns this frame.
     // Only ONE controller's update runs per frame — no double input on the camera.

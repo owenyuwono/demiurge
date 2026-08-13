@@ -11,21 +11,34 @@ import { LineBasicNodeMaterial } from 'three/webgpu'
 import { Climate, WindSample } from './climate'
 
 // ---------------------------------------------------------------------------
-// WindFlow — advected particle streakline overlay for the wind field.
+// WindFlow — advected particle streakline overlay (earth.nullschool "living
+// wind map" look). Coexists with WindDebug (arrow overlay).
 //
-// Coexists with WindDebug (arrow overlay). Renders batched THREE.LineSegments
-// with per-vertex RGB color fading from bearing-hue (head) to black (tail),
-// producing a head-to-tail brightness fade WITHOUT relying on per-vertex alpha.
+// Dynamic-LOD via a visible-cap budget: every frame all particles are kept
+// inside the camera-facing spherical cap (≈ the visible hemisphere, shrinking
+// as you zoom in). Particles that advect past the cap edge (off-screen, behind
+// a small horizon margin) are teleported back into the cap. So the whole fixed
+// particle budget is always spent on what's on screen → density concentrates
+// as you approach the surface, and the hidden hemisphere costs nothing.
 //
-// Material: LineBasicNodeMaterial (three/webgpu), vertexColors true, additive
-// blending, depthWrite false — glows over the planet surface.
+// Field: the static climatological mean `windAt()` (≈10× cheaper than the
+// transient `windAtTime` — that funds the higher density). Streaklines still
+// curve through every zonal band and vortex; only the slow in-place eddy
+// wobble is dropped (invisible in fast-moving streaks). The arrows (WindDebug)
+// keep windAtTime for the transient read.
 //
-// Shell radius: constant = radius + heightScale * 2.0 (clears tallest terrain;
-// no per-frame surfaceRadiusAt calls).
+// Colour: uniform cyan; additive blending brightens where lines converge
+// (the reference's bright knots) and a per-vertex head→tail fade gives the
+// streak. Render: ONE batched LineSegments draw call.
 //
-// Hot path: zero allocations. All scratch promoted to instance fields.
-// Local mulberry32 PRNG (fixed seed 0x9E3779B9) — no reserved stream consumed.
+// Hot path: zero allocations. Local mulberry32 PRNG (fixed seed) — no reserved
+// RNG stream consumed.
 // ---------------------------------------------------------------------------
+
+/** Cyan streak colour (additive; convergence brightens toward white). */
+const CYAN_R = 0.35
+const CYAN_G = 0.75
+const CYAN_B = 1.0
 
 /** mulberry32 PRNG factory. Returns a () => number in [0,1). */
 function mulberry32(seed: number): () => number {
@@ -57,6 +70,8 @@ export class WindFlow {
   private _age!: Float32Array
   /** Per-particle jittered lifetime in seconds. */
   private _life!: Float32Array
+  /** Per-particle wind speed [0,1] from the last advect — drives streak brightness. */
+  private _speed!: Float32Array
   /**
    * Trail ring buffer: K world positions per particle stored flat.
    * Layout: particle i, slot k → base index (i * K + k) * 3.
@@ -65,12 +80,6 @@ export class WindFlow {
   private _trail!: Float32Array
   /** Ring-buffer head index (0..K-1) per particle. */
   private _head!: Int32Array
-  /**
-   * Per-particle cached bearing-hue RGB, computed once in the advect loop from
-   * the already-sampled wind vector. Layout: (r,g,b) per particle = 3*N floats.
-   * Consumed by _writeBuffers without calling windAtTime a second time.
-   */
-  private _color!: Float32Array
 
   // Render primitive
   private _mesh: LineSegments | null = null
@@ -86,8 +95,11 @@ export class WindFlow {
   private readonly _w  = new Vector3()
   private readonly _pN = new Vector3()
   private readonly _wind: WindSample = { x: 0, y: 0, z: 0, speed: 0 }
-  /** Reusable 3-float scratch for hslToRgb output — avoids per-call heap allocation. */
-  private readonly _rgb = new Float32Array(3)
+  // Visible-cap frame state (set at the top of animate(), read by _respawnInCap)
+  private readonly _capAxis = new Vector3()  // camera direction in planet-local frame
+  private readonly _capE1   = new Vector3()  // orthonormal tangent basis ⟂ axis
+  private readonly _capE2   = new Vector3()
+  private _capCos = -1  // cos(cap half-angle): particles with dir·axis < this are off-screen
 
   // PRNG — local fixed seed, not a reserved tectonics/climate stream
   private _rng: () => number
@@ -98,7 +110,7 @@ export class WindFlow {
     opts: {
       radius:      number
       heightScale: number
-      /** Initial particle count (default 2000). */
+      /** Initial particle count (default 8000). */
       density?:    number
     },
   ) {
@@ -106,9 +118,12 @@ export class WindFlow {
     this._climate    = climate
     this._radius     = opts.radius
     this._heightScale = opts.heightScale
-    this._density    = opts.density ?? 2000
-    this._flowSpeed  = 0.15
-    this._trailLen   = 8
+    this._density    = opts.density ?? 8000
+    // flowSpeed is an angular advection rate (arc = flowSpeed·speed·dt). It must be
+    // high enough that the head visibly translates and the trail spans a readable arc
+    // — otherwise the streak degenerates to a point that just re-orients in place.
+    this._flowSpeed  = 0.6
+    this._trailLen   = 12
     this._lifeBase   = 4.0
     this._visible    = false
     this._rng        = mulberry32(0x9E3779B9)
@@ -159,54 +174,64 @@ export class WindFlow {
 
   /**
    * Advance all particles by dt seconds, then rebuild the LineSegments buffers.
-   * Returns immediately when not visible (zero cost).
+   * `camDir` is the camera direction in the PLANET-LOCAL frame (unit); `altitude`
+   * is camera height above the surface (world units). Both drive the visible-cap
+   * LOD. Returns immediately when not visible (zero cost).
    */
-  animate(t: number, dt: number): void {
+  animate(dt: number, camDir: Vector3, altitude: number): void {
     if (!this._visible) return
 
     const N   = this._density
     const K   = this._trailLen
-    const rng = this._rng
     const shellR = this._radius + this._heightScale * 2.0
+
+    // Visible spherical cap: a point is above the horizon when dir·camDir ≥ R/(R+h).
+    // Extend the cap slightly past the horizon (−0.04) so the respawn churn at the
+    // cap edge lands just off-screen. Clamp the half-angle to ≥ ~11° (capCos ≤ 0.98)
+    // so the cap never collapses to a point at very low altitude.
+    const R = this._radius
+    let capCos = R / (R + Math.max(1, altitude)) - 0.04
+    if (capCos > 0.98) capCos = 0.98
+    else if (capCos < -0.999) capCos = -0.999
+    this._capCos = capCos
+
+    // Cap basis: axis = camDir, plus an orthonormal tangent pair (e1, e2).
+    this._capAxis.copy(camDir)
+    const ax = this._capAxis.x, ay = this._capAxis.y, az = this._capAxis.z
+    // Reference up not parallel to axis.
+    const ux = Math.abs(ay) < 0.99 ? 0 : 1
+    const uy = Math.abs(ay) < 0.99 ? 1 : 0
+    // e1 = normalize(up × axis)
+    let e1x = uy * az - 0 * ay
+    let e1y = 0 * ax - ux * az
+    let e1z = ux * ay - uy * ax
+    const e1Len = Math.hypot(e1x, e1y, e1z) || 1
+    e1x /= e1Len; e1y /= e1Len; e1z /= e1Len
+    this._capE1.set(e1x, e1y, e1z)
+    // e2 = axis × e1
+    this._capE2.set(
+      ay * e1z - az * e1y,
+      az * e1x - ax * e1z,
+      ax * e1y - ay * e1x,
+    )
 
     for (let i = 0; i < N; i++) {
       const di = i * 3
       this._p.set(this._dirs[di], this._dirs[di + 1], this._dirs[di + 2])
 
-      this._climate.windAtTime(this._p, t, this._wind)
+      // Off-screen (past the cap edge) → teleport back into the visible cap.
+      const dotCam = this._p.x * ax + this._p.y * ay + this._p.z * az
+      if (dotCam < capCos) {
+        this._respawnInCap(i, shellR)
+        continue
+      }
+
+      this._climate.windAt(this._p, this._wind)
       const s = this._wind.speed
 
       this._age[i] += dt
-      const doRespawn = this._age[i] > this._life[i] || s < 0.02
-
-      if (doRespawn) {
-        // Uniform random sphere direction via PRNG
-        const u1 = rng()
-        const u2 = rng()
-        const z = 2 * u1 - 1
-        const r = Math.sqrt(Math.max(0, 1 - z * z))
-        const theta = 2 * Math.PI * u2
-        this._p.set(r * Math.cos(theta), z, r * Math.sin(theta))
-
-        this._age[i]  = 0
-        this._life[i] = this._lifeBase * (0.5 + rng())
-
-        // Store new direction
-        this._dirs[di]     = this._p.x
-        this._dirs[di + 1] = this._p.y
-        this._dirs[di + 2] = this._p.z
-
-        // Reset entire trail ring to the lifted start position
-        const wx = this._p.x * shellR
-        const wy = this._p.y * shellR
-        const wz = this._p.z * shellR
-        for (let k = 0; k < K; k++) {
-          const ti = (i * K + k) * 3
-          this._trail[ti]     = wx
-          this._trail[ti + 1] = wy
-          this._trail[ti + 2] = wz
-        }
-        this._head[i] = 0
+      if (this._age[i] > this._life[i] || s < 0.02) {
+        this._respawnInCap(i, shellR)
         continue
       }
 
@@ -224,40 +249,11 @@ export class WindFlow {
         this._p.z * cosA + this._w.z * sinA,
       ).normalize()
 
-      // Store new direction
+      // Store new direction + speed (for brightness).
       this._dirs[di]     = this._pN.x
       this._dirs[di + 1] = this._pN.y
       this._dirs[di + 2] = this._pN.z
-
-      // Compute bearing-hue RGB once from the wind already sampled above.
-      // Written into _color[i*3..] so _writeBuffers can read it without
-      // calling windAtTime a second time.
-      {
-        const px = this._pN.x, py = this._pN.y, pz = this._pN.z
-        const ex = pz, ez = -px
-        const eLen = Math.sqrt(ex * ex + ez * ez)
-        const ci = i * 3
-        if (eLen < 1e-6) {
-          // Near-pole: white
-          this._color[ci]     = 1
-          this._color[ci + 1] = 1
-          this._color[ci + 2] = 1
-        } else {
-          const eNx = ex / eLen, eNz = ez / eLen
-          const nx  =  py * eNz
-          const ny  =  pz * eNx - px * eNz
-          const nz  = -py * eNx
-          const wx = this._wind.x, wy = this._wind.y, wz = this._wind.z
-          const eDot = wx * eNx + wz * eNz
-          const nDot = wx * nx + wy * ny + wz * nz
-          const bearing = Math.atan2(eDot, nDot)
-          const hue     = ((bearing / (2 * Math.PI)) % 1 + 1) % 1
-          hslToRgb(hue, 0.95, 0.55, this._rgb)
-          this._color[ci]     = this._rgb[0]
-          this._color[ci + 1] = this._rgb[1]
-          this._color[ci + 2] = this._rgb[2]
-        }
-      }
+      this._speed[i] = s
 
       // Push lifted world position into ring buffer at new head
       const newHead = (this._head[i] + 1) % K
@@ -280,15 +276,54 @@ export class WindFlow {
   // Internal helpers
   // ---------------------------------------------------------------------------
 
+  /**
+   * Teleport particle i to a uniform-random direction inside the current visible
+   * cap and collapse its trail to that point (so no streak is drawn across the
+   * sphere). Uses the cap basis set at the top of animate(). Zero-alloc.
+   */
+  private _respawnInCap(i: number, shellR: number): void {
+    const rng = this._rng
+    const K = this._trailLen
+
+    // Uniform in cap: cosθ ∈ [capCos, 1], azimuth ∈ [0, 2π).
+    const z = this._capCos + rng() * (1 - this._capCos)
+    const r = Math.sqrt(Math.max(0, 1 - z * z))
+    const phi = 2 * Math.PI * rng()
+    const cphi = Math.cos(phi), sphi = Math.sin(phi)
+    const a = this._capAxis, e1 = this._capE1, e2 = this._capE2
+    let dx = a.x * z + (e1.x * cphi + e2.x * sphi) * r
+    let dy = a.y * z + (e1.y * cphi + e2.y * sphi) * r
+    let dz = a.z * z + (e1.z * cphi + e2.z * sphi) * r
+    const len = Math.hypot(dx, dy, dz) || 1
+    dx /= len; dy /= len; dz /= len
+
+    const di = i * 3
+    this._dirs[di]     = dx
+    this._dirs[di + 1] = dy
+    this._dirs[di + 2] = dz
+    this._age[i]   = 0
+    this._life[i]  = this._lifeBase * (0.5 + rng())
+    this._speed[i] = 0
+
+    const wx = dx * shellR, wy = dy * shellR, wz = dz * shellR
+    for (let k = 0; k < K; k++) {
+      const ti = (i * K + k) * 3
+      this._trail[ti]     = wx
+      this._trail[ti + 1] = wy
+      this._trail[ti + 2] = wz
+    }
+    this._head[i] = 0
+  }
+
   private _allocate(): void {
     const N = this._density
     const K = this._trailLen
     this._dirs  = new Float32Array(N * 3)
     this._age   = new Float32Array(N)
     this._life  = new Float32Array(N)
+    this._speed = new Float32Array(N)
     this._trail = new Float32Array(N * K * 3)
     this._head  = new Int32Array(N)
-    this._color = new Float32Array(N * 3)  // r,g,b per particle; zeroed by default (white=0 is invisible, fine for fresh respawn)
     // (K-1) segments per particle, 2 endpoints per segment, 3 floats per position/color
     const vertCount = N * (K - 1) * 2
     this._posBuf = new Float32Array(vertCount * 3)
@@ -327,7 +362,8 @@ export class WindFlow {
     const shellR = this._radius + this._heightScale * 2.0
 
     for (let i = 0; i < N; i++) {
-      // Uniform random sphere
+      // Uniform random sphere (camDir unknown at construction; animate() teleports
+      // any off-screen particles into the cap on the first visible frame).
       const u1 = rng()
       const u2 = rng()
       const z = 2 * u1 - 1
@@ -343,8 +379,9 @@ export class WindFlow {
       this._dirs[di + 2] = dz
 
       // Stagger initial age across [0, life) so trails don't all blink together
-      this._life[i] = this._lifeBase * (0.5 + rng())
-      this._age[i]  = rng() * this._life[i]
+      this._life[i]  = this._lifeBase * (0.5 + rng())
+      this._age[i]   = rng() * this._life[i]
+      this._speed[i] = 0
 
       // Init entire trail ring to the lifted start position
       const wx = dx * shellR
@@ -390,25 +427,22 @@ export class WindFlow {
 
   /**
    * Write position + color arrays into the LineSegments geometry attributes.
-   * Per-vertex brightness fades from 1.0 at the head pair to 0.0 at the tail pair.
-   * Color = bearing-hue (cached in _color from the advect loop) * brightness (RGB, no alpha).
-   *
-   * Called once per animate() call — no allocations, no windAtTime calls.
+   * Colour = cyan × head→tail brightness × per-particle speed brightness (RGB,
+   * no alpha; additive blending brightens convergent knots toward white).
+   * Just-respawned particles have a collapsed trail → zero-length segments →
+   * draw nothing. One pass over all particles, no allocations, no wind samples.
    */
   private _writeBuffers(): void {
     const N = this._density
     const K = this._trailLen
     const pos = this._posBuf
     const col = this._colBuf
-    let vi = 0  // vertex index (each vertex = 2 floats[3])
+    let vi = 0  // vertex index (each vertex = 3 floats)
 
     for (let i = 0; i < N; i++) {
-      // Read cached bearing-hue RGB computed during the advect loop.
-      // windAtTime is NOT called here — zero additional wind samples per frame.
-      const ci = i * 3
-      const hr = this._color[ci]
-      const hg = this._color[ci + 1]
-      const hb = this._color[ci + 2]
+      // Faster wind → brighter streak (the reference's bright jets).
+      const sb = 0.35 + 0.65 * this._speed[i]
+      const cr = CYAN_R * sb, cg = CYAN_G * sb, cb = CYAN_B * sb
 
       const head = this._head[i]
 
@@ -429,9 +463,9 @@ export class WindFlow {
         pos[vBase]     = this._trail[tA]
         pos[vBase + 1] = this._trail[tA + 1]
         pos[vBase + 2] = this._trail[tA + 2]
-        col[vBase]     = hr * brightness
-        col[vBase + 1] = hg * brightness
-        col[vBase + 2] = hb * brightness
+        col[vBase]     = cr * brightness
+        col[vBase + 1] = cg * brightness
+        col[vBase + 2] = cb * brightness
         vi++
 
         const vBase2 = vi * 3
@@ -440,9 +474,9 @@ export class WindFlow {
         pos[vBase2]     = this._trail[tB]
         pos[vBase2 + 1] = this._trail[tB + 1]
         pos[vBase2 + 2] = this._trail[tB + 2]
-        col[vBase2]     = hr * brightnessB
-        col[vBase2 + 1] = hg * brightnessB
-        col[vBase2 + 2] = hb * brightnessB
+        col[vBase2]     = cr * brightnessB
+        col[vBase2 + 1] = cg * brightnessB
+        col[vBase2 + 2] = cb * brightnessB
         vi++
       }
     }
@@ -452,28 +486,4 @@ export class WindFlow {
     geoPosAttr.needsUpdate = true
     geoColAttr.needsUpdate = true
   }
-}
-
-// ---------------------------------------------------------------------------
-// HSL → RGB helper (pure function, no allocations, inline-able)
-// ---------------------------------------------------------------------------
-
-/** Alloc-free HSL → RGB: writes result into out[0..2] instead of returning a new array. */
-function hslToRgb(h: number, s: number, l: number, out: Float32Array): void {
-  const c = (1 - Math.abs(2 * l - 1)) * s
-  const x = c * (1 - Math.abs((h * 6) % 2 - 1))
-  const m = l - c / 2
-  let r = 0, g = 0, b = 0
-  const hi = Math.floor(h * 6)
-  switch (hi) {
-    case 0: r = c; g = x; break
-    case 1: r = x; g = c; break
-    case 2: g = c; b = x; break
-    case 3: g = x; b = c; break
-    case 4: r = x; b = c; break
-    default: r = c; b = x; break
-  }
-  out[0] = r + m
-  out[1] = g + m
-  out[2] = b + m
 }

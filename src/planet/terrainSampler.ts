@@ -110,9 +110,11 @@ export const EROSION_WARP_STR         = 0.10
 // EROSION_RIDGED_FLOOR: minimum ridged amplitude fraction on low-discharge interfluves.
 //   1.0 = no discharge deepening (pre-erosion behaviour), 0.0 = fully suppressed.
 export const EROSION_RIDGED_FLOOR     = 0.35
-// EROSION_VINCISION_AMP: peak V-channel depth at full discharge (acc=1, land).
-//   [was 0.008 ≈ 10m — invisible vs ±660m bDelta; raised to 0.03 ≈ 36m for readable channel incision]
-export const EROSION_VINCISION_AMP    = 0.03
+// EROSION_VINCISION_AMP: peak V-channel depth at full discharge (acc≈1, land).
+//   [0.008→0.03→0.05→0.08: deepened so rivers visibly carve their VALLEYS. Pairs with
+//    the de-blurred (1-pass) flowAccum + a dedicated low-threshold carve gate (see
+//    vIncision) so whole channel networks incise, not just a few trunk notches.]
+export const EROSION_VINCISION_AMP    = 0.08
 
 // ---------------------------------------------------------------------------
 // Process-palette noise stream IDs (reserved, clear of all existing streams)
@@ -824,8 +826,12 @@ export function makeTerrainSampler(opts: TerrainSamplerOpts): TerrainSampler {
     // A small negative term that carves a sharp channel floor proportional to
     // drainage discharge. Only active where acc > 0 and land (landGate).
     // Pure fn of `dir` (acc is fixed-resolution, level-independent).
+    // Dedicated carve gate (lower thresholds than `chan`) so tributaries — not only
+    // high-discharge trunks — incise; this is what makes rivers read as carved VALLEY
+    // NETWORKS rather than a few faint notches. Smoothstepped → C1, no axis banding.
+    const carveGate = _ss3(0.05, 0.45, acc)
     const vIncision = erosion
-      ? -EROSION_VINCISION_AMP * chan * landGate
+      ? -EROSION_VINCISION_AMP * carveGate * landGate
       : 0
 
     // karstAdd: small negative depression pits (karst process; see process palette above)

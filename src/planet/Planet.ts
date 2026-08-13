@@ -5,7 +5,6 @@ import {
   Group,
   Mesh,
   MeshBasicMaterial,
-  MeshStandardMaterial,
   Points,
   PointsMaterial,
   Sphere,
@@ -13,7 +12,7 @@ import {
   Matrix4,
   Quaternion,
 } from 'three'
-import { MeshBasicNodeMaterial } from 'three/webgpu'
+import { MeshBasicNodeMaterial, MeshStandardNodeMaterial } from 'three/webgpu'
 import {
   attribute,
   positionWorld,
@@ -48,6 +47,7 @@ import { QuadtreeNode } from './QuadtreeNode'
 import { TectonicsDebug } from './TectonicsDebug'
 import { WindDebug } from './WindDebug'
 import { WindFlow } from './WindFlow'
+import { RiverNetwork } from './RiverNetwork'
 import { VolumetricClouds } from './VolumetricClouds'
 import { Atmosphere } from './Atmosphere'
 import { PlanetGizmos } from './PlanetGizmos'
@@ -335,7 +335,7 @@ export class Planet extends Group {
 
   // Materials
   /** Shared lit material for normal view — one instance, never disposed per-mesh. */
-  private readonly normalMaterial: MeshStandardMaterial
+  private readonly normalMaterial: MeshStandardNodeMaterial
   private readonly debugMaterials: MeshBasicMaterial[]
   /** Plate-color node material (flat, unlit, reads 'plateColor' attribute). Created once. */
   private readonly plateColorMaterial: MeshBasicNodeMaterial
@@ -368,6 +368,10 @@ export class Planet extends Group {
   private readonly hardnessMaterial: MeshBasicNodeMaterial
   private materialsViewActive = false
 
+  /** Wetness/aquifer node material — built once in constructor, disposed in dispose(). */
+  private readonly wetnessMaterial: MeshBasicNodeMaterial
+  private wetnessViewActive = false
+
   // Wind bake parameters — stored on Planet so regenerate() can rebuild Climate with them.
   // These affect only the baked wind field (not the sampler), so fromBaked stays unchanged.
   private _windSwirlStrength  = 0.6   // blend weight of vortex swirls vs zonal base (default 0.6)
@@ -384,6 +388,7 @@ export class Planet extends Group {
 
   /** WindFlow overlay — advected particle streaklines, coexists with arrows. */
   private windFlow!: WindFlow
+  private riverNet: RiverNetwork | null = null
 
   /** VolumetricClouds overlay — raymarched cloud layer, independent toggle. */
   cloudShell!: VolumetricClouds
@@ -423,6 +428,8 @@ export class Planet extends Group {
   // Scratch vectors — preallocated, zero allocations in hot paths
   private readonly _camLocalScratch = new Vector3()
   private readonly _dirLocalScratch = new Vector3()
+  // Camera direction in the planet-local frame, for WindFlow's visible-cap LOD.
+  private readonly _windCamDir = new Vector3()
   // SSE scratch: holds (camPos - nodeCenter) for nearest-point distance computation.
   private readonly _sseScratch = new Vector3()
   // Frustum culling — built once per frame in update(), used in collect()
@@ -485,7 +492,11 @@ export class Planet extends Group {
     this._screenHeightPx = 1080
 
     // Shared normal-view material — one instance for all terrain chunks.
-    this.normalMaterial = new MeshStandardMaterial({ vertexColors: true, roughness: 1, metalness: 0 })
+    // Node material so the per-vertex 'subsurfaceWet' scalar can drop roughness on
+    // water (rivers/lakes/seeps) → PBR-Fresnel sun glint; dry land stays matte
+    // (wet=0 → roughness 1, identical to before). wet=1 → roughness 0.15 (≈ ocean shell).
+    this.normalMaterial = new MeshStandardNodeMaterial({ vertexColors: true, roughness: 1, metalness: 0 })
+    this.normalMaterial.roughnessNode = saturate(attribute('subsurfaceWet', 'float')).mul(-0.85).add(1.0)
 
     // Pre-build per-level debug materials with a distinct hue per level
     this.debugMaterials = Array.from({ length: this.maxDepth + 1 }, (_, i) => {
@@ -530,6 +541,7 @@ export class Planet extends Group {
     // Hardness debug material: reads the baked per-vertex 'rockHardness' float attribute
     // and maps it to a clear dark-to-bright ramp for the materials view.
     this.hardnessMaterial = this._buildHardnessMaterial()
+    this.wetnessMaterial = this._buildWetnessMaterial()
 
     // Pure unlit wireframe: white edges only, no fill, no lighting.
     // When wireframe mode is on, every chunk renders with this material regardless of view mode.
@@ -557,6 +569,7 @@ export class Planet extends Group {
     this.buildWindFlow()
     this.buildCloudShell()
     this.buildAtmosphere()
+    this.buildRiverNet()
 
     // Gizmos are seed-independent — built once, never rebuilt on regenerate().
     this.gizmos = new PlanetGizmos({ radius: this.radius })
@@ -835,12 +848,50 @@ export class Planet extends Group {
       this.tectonicsViewActive = false
       this.tectonicsDebug.visible = false
       this.heightmapViewActive = false
+      this.wetnessViewActive   = false
     }
     if (!this.wireframeActive) {
       for (const [, mesh] of this.visibleMeshes) {
         mesh.material = this.materialFor(this.levelFromKey(mesh.userData.key as string))
       }
     }
+  }
+
+  /**
+   * Enable or disable the soil-wetness / aquifer debug view.
+   * Shows the per-vertex surface-wetness scalar (rivers + lakes + groundwater seeps)
+   * on a dry-brown → teal → cyan ramp. Mutually exclusive with other debug views.
+   */
+  setWetnessView(on: boolean): void {
+    this.wetnessViewActive = on
+    if (on) {
+      this.materialsViewActive = false
+      this.windViewActive      = false
+      this.climateViewActive   = false
+      this.debugColorsActive   = false
+      this.tectonicsViewActive = false
+      this.tectonicsDebug.visible = false
+      this.heightmapViewActive = false
+    }
+    if (!this.wireframeActive) {
+      for (const [, mesh] of this.visibleMeshes) {
+        mesh.material = this.materialFor(this.levelFromKey(mesh.userData.key as string))
+      }
+    }
+  }
+
+  /** Soil-wetness ramp material: reads per-vertex 'subsurfaceWet' [0,1]. */
+  private _buildWetnessMaterial(): MeshBasicNodeMaterial {
+    const w = saturate(attribute('subsurfaceWet', 'float'))
+    const dry = vec3(0x3a / 255, 0x2a / 255, 0x18 / 255) // dry brown
+    const mid = vec3(0x1f / 255, 0x9e / 255, 0x8a / 255) // damp teal
+    const wet = vec3(0x2f / 255, 0xd0 / 255, 0xff / 255) // saturated cyan
+    const t0 = saturate(w.mul(2))
+    const t1 = saturate(w.sub(0.5).mul(2))
+    const mat = new MeshBasicNodeMaterial()
+    mat.colorNode = mix(mix(dry, mid, t0), wet, t1)
+    mat.vertexColors = false
+    return mat
   }
 
   /** Global wind speed multiplier. Live — updates uniform immediately. */
@@ -934,9 +985,16 @@ export class Planet extends Group {
    * each overlay returns immediately when not visible (zero cost off-screen).
    * Call once per frame after planet.setWindTime(t).
    */
-  animateWind(t: number, dt: number): void {
+  animateWind(t: number, dt: number, camWorldPos: Vector3): void {
     if (this.windDebug.visible)   this.windDebug.animate(t)
-    if (this.windFlow.visible)    this.windFlow.animate(t, dt)
+    if (this.windFlow.visible) {
+      // Camera into the planet-local frame (the wind field's frame). _invWorldQuat is
+      // from the previous update() — a 1-frame-stale rotation is invisible on an overlay.
+      // Planet sits at the world origin (only spun), so altitude = |camPos| − radius.
+      const altitude = camWorldPos.length() - this.radius
+      this._windCamDir.copy(camWorldPos).applyQuaternion(this._invWorldQuat).normalize()
+      this.windFlow.animate(dt, this._windCamDir, altitude)
+    }
     // Cloud update (time + fresh _invWorldQuat + cameraWorldPos) is pushed in update(),
     // which runs after animateWind so the rotation quaternion is from the current frame.
   }
@@ -1458,6 +1516,7 @@ export class Planet extends Group {
     // Restore cloud-shell visibility: shell was only on in normal view, so restoring the
     // saved flag is safe. applyView in main.ts will re-assert the correct state next frame.
     this.setCloudShellVisible(cloudsWasVisible)
+    this.buildRiverNet()
     this.buildAtmosphere()
     // Restore atmosphere visibility (always-on, but respect any explicit toggle).
     this.setAtmosphereVisible(atmWasVisible)
@@ -1547,12 +1606,14 @@ export class Planet extends Group {
     this.climateMaterial.dispose()
     this.windMaterial.dispose()
     this.hardnessMaterial.dispose()
+    this.wetnessMaterial.dispose()
     this.wireMaterial.dispose()
     this.pointsMaterial.dispose()
     this.tectonicsDebug.dispose()
     this.windDebug.dispose()
     this.windFlow.dispose()
     this.cloudShell.dispose()
+    this.riverNet?.dispose()
     this.atmosphereShell.dispose()
     this.gizmos.dispose()
     this.climateSim.dispose()
@@ -1864,12 +1925,31 @@ export class Planet extends Group {
     this.windFlow = new WindFlow(this, this.climateSim, {
       radius:      this.radius,
       heightScale: this.heightScale,
-      density:     2000,
+      density:     8000,
     })
     this.windFlow.setVisible(false)  // starts hidden
     // WindFlow adds its LineSegments directly to the scene passed in constructor,
     // which is `this` (the Planet Group). No explicit this.add() needed.
   }
+
+  /** Build (or rebuild) the river-network overlay from the baked erosion flow field. */
+  private buildRiverNet(): void {
+    if (this.riverNet === null) {
+      this.riverNet = new RiverNetwork(this, {
+        radius: this.radius,
+        heightScale: this.heightScale,
+        // Drape at the finest LOD so the water surface matches walk-mode terrain (no float).
+        params: { drapeLevel: this.maxDepth },
+      })
+    }
+    if (this._erosion !== null) {
+      this.riverNet.build(this._erosion, this.heightFn, this._seaLevel, this._subsurface)
+    }
+  }
+
+  /** Show/hide the river overlay (main.ts gates this to the normal view). */
+  setRiversVisible(on: boolean): void { this.riverNet?.setVisible(on) }
+  get riversVisible(): boolean { return this.riverNet?.visible ?? false }
 
   /** Build (or rebuild) VolumetricClouds and add its sphere mesh as a child. */
   private buildCloudShell(): void {
@@ -2734,7 +2814,7 @@ export class Planet extends Group {
    * View mode priority: materials → climate → heightmap → tectonics → lodColors → normal.
    * Wind view uses the windDebug arrow overlay over normal terrain — no special mesh material.
    */
-  private materialFor(level: number): MeshStandardMaterial | MeshBasicMaterial | MeshBasicNodeMaterial {
+  private materialFor(level: number): MeshStandardNodeMaterial | MeshBasicMaterial | MeshBasicNodeMaterial {
     if (this.materialsViewActive) {
       return this.hardnessMaterial
     }
@@ -2749,6 +2829,9 @@ export class Planet extends Group {
     }
     if (this.debugColorsActive) {
       return this.debugMaterials[Math.min(level, this.debugMaterials.length - 1)]
+    }
+    if (this.wetnessViewActive) {
+      return this.wetnessMaterial
     }
     return this.normalMaterial
   }
